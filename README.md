@@ -1,8 +1,10 @@
 # Windows向けGStreamer ProRes GPUデコーダー
 
-通常のProResをFFmpegのVulkanデコーダーで処理する、独立したGStreamerプラグイン `proresvkdec` と検証プログラムです。利用先アプリのコードは変更していません。LTC・プレイリスト・Spout・管理UIは含めません。
+**最終目標は、純粋なDirect3D 11で通常のProResをGPUデコードし、復号画像をGPUメモリのままGStreamerへ出力する独立プラグインです。** DX11デコードとGPUメモリ出力の両方を必須の完成条件とします。利用先アプリのコードは変更せず、LTC・プレイリスト・Spout・管理UIは含めません。
 
-**実験版プラグインが動作しています。製品採用は未判定です。** 初版はprogressive ProRes 422（Proxy/LT/Standard/HQ）をGPUで復号し、system memoryの `I422_10LE` を出力します。1080p/4K、EOS、再起動、seek、色メタデータ、バッファ寿命を実機検査しました。4444・アルファ・インターレース・ProRes RAWは初版対象外です。
+完成形は `video/x-prores → DX11 Compute Shaderによる復号 → video/x-raw(memory:D3D11Memory)`。復号画像をCPUへ読み戻さず、Vulkanに依存しない経路を目指します。現在の `proresvkdec` はFFmpeg Vulkanを使う比較・検証用の中間成果で、最終成果物ではありません。以後の主実装はDX11ネイティブ復号とD3D11Memory出力に置きます。
+
+**中間成果のVulkan実験版が動作しています。最終目標は未達です。** この実験版はprogressive ProRes 422（Proxy/LT/Standard/HQ）をGPUで復号し、system memoryの `I422_10LE` を出力します。1080p/4K、EOS、再起動、seek、色メタデータ、バッファ寿命を実機検査しました。4444・アルファ・インターレース・ProRes RAWは初版対象外です。
 
 ```powershell
 ./scripts/bootstrap.ps1
