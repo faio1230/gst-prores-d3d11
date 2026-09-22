@@ -37,10 +37,69 @@ if(BUILD_GSTREAMER_PLUGIN)
   if(MSVC)
     target_compile_options(plugin_smoke PRIVATE /W4 /utf-8)
   endif()
+
+  add_library(gstproresd3d11 MODULE src/gstproresd3d11dec.cpp src/prores_parser.cpp)
+  target_include_directories(gstproresd3d11 PRIVATE "${CMAKE_SOURCE_DIR}/src"
+    "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
+    "${GSTREAMER_ROOT}/lib/glib-2.0/include" "${GSTREAMER_ROOT}/lib/gstreamer-1.0/include")
+  target_link_directories(gstproresd3d11 PRIVATE "${GSTREAMER_ROOT}/lib")
+  target_link_libraries(gstproresd3d11 PRIVATE gstd3d11-1.0 gstvideo-1.0 gstbase-1.0
+    gstreamer-1.0 gobject-2.0 glib-2.0 d3d11 dxgi d3dcompiler)
+  target_compile_definitions(gstproresd3d11 PRIVATE PACKAGE="prores-gpu-lab"
+    GST_USE_UNSTABLE_API NOMINMAX WIN32_LEAN_AND_MEAN)
+  set_target_properties(gstproresd3d11 PROPERTIES PREFIX ""
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins")
+  add_custom_command(TARGET gstproresd3d11 POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/src/prores_vld.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_vld.hlsl"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/src/prores_idct.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_idct.hlsl"
+    COMMENT "DX11 ProRes shaderをプラグイン出力先へ配置")
+  if(MSVC)
+    target_compile_options(gstproresd3d11 PRIVATE /W4 /utf-8)
+  endif()
+
+  add_executable(d3d11_plugin_smoke tests/d3d11_plugin_smoke.cpp)
+  target_include_directories(d3d11_plugin_smoke PRIVATE
+    "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
+    "${GSTREAMER_ROOT}/lib/glib-2.0/include" "${GSTREAMER_ROOT}/lib/gstreamer-1.0/include")
+  target_link_directories(d3d11_plugin_smoke PRIVATE "${GSTREAMER_ROOT}/lib")
+  target_link_libraries(d3d11_plugin_smoke PRIVATE gstd3d11-1.0 gstapp-1.0 gstvideo-1.0
+    gstbase-1.0 gstreamer-1.0 gobject-2.0 glib-2.0 d3d11 dxgi)
+  target_compile_definitions(d3d11_plugin_smoke PRIVATE
+    GST_USE_UNSTABLE_API NOMINMAX WIN32_LEAN_AND_MEAN)
+  if(MSVC)
+    target_compile_options(d3d11_plugin_smoke PRIVATE /W4 /utf-8)
+  endif()
 endif()
 add_executable(dx11_primitives src/dx11_primitives.cpp)
 target_link_libraries(dx11_primitives PRIVATE d3d11 d3dcompiler)
 target_compile_definitions(dx11_primitives PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
   target_compile_options(dx11_primitives PRIVATE /W4 /utf-8)
+endif()
+
+# 実ProResフレームのCPU参照とDX11 VLD/逆スキャン結果を全係数比較する。
+add_executable(prores_dx11_coeff tests/prores_dx11_coeff.cpp src/prores_parser.cpp)
+target_include_directories(prores_dx11_coeff PRIVATE "${CMAKE_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
+target_link_directories(prores_dx11_coeff PRIVATE "${FFMPEG_ROOT}/lib")
+target_link_libraries(prores_dx11_coeff PRIVATE avformat avcodec avutil d3d11 dxgi d3dcompiler)
+target_compile_definitions(prores_dx11_coeff PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+  target_compile_options(prores_dx11_coeff PRIVATE /W4 /utf-8)
+endif()
+
+if(BUILD_GSTREAMER_PLUGIN)
+  add_executable(d3d11_memory_probe tests/d3d11_memory_probe.cpp)
+  target_include_directories(d3d11_memory_probe PRIVATE
+    "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
+    "${GSTREAMER_ROOT}/lib/glib-2.0/include" "${GSTREAMER_ROOT}/lib/gstreamer-1.0/include")
+  target_link_directories(d3d11_memory_probe PRIVATE "${GSTREAMER_ROOT}/lib")
+  target_link_libraries(d3d11_memory_probe PRIVATE gstd3d11-1.0 gstvideo-1.0 gstbase-1.0
+    gstreamer-1.0 gobject-2.0 glib-2.0 d3d11 dxgi)
+  target_compile_definitions(d3d11_memory_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN GST_USE_UNSTABLE_API)
+  if(MSVC)
+    target_compile_options(d3d11_memory_probe PRIVATE /W4 /utf-8)
+  endif()
 endif()
