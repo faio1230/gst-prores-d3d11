@@ -4,19 +4,19 @@
 
 完成形は `video/x-prores → DX11 Compute Shaderによる復号 → video/x-raw(memory:D3D11Memory)`。復号画像をCPUへ読み戻さず、Vulkanに依存しない経路を目指します。現在の `proresvkdec` はFFmpeg Vulkanを使う比較・検証用の中間成果で、最終成果物ではありません。以後の主実装はDX11ネイティブ復号とD3D11Memory出力に置きます。
 
-**progressive ProRes 422 HQ / 10bitに限定した最初の純粋DX11経路が動作していますが、採用完了ではありません。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTを行い、GStreamerの3面D3D11Memoryへ直接出力します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodec、画像のGPU内コピーはありません。RTX 3070で1080p/4Kの全係数がCPU参照と完全一致し、FFmpeg CPU画素との差は最大1でした。EOS、seek、再起動、バッファ寿命も検査済みです。実素材、長時間・複数instance、表示／合成、他GPUは未検証なのでgoal全体は継続します。
+**progressive ProRes 422 HQ / 10bitに限定した最初の純粋DX11経路が動作していますが、採用完了ではありません。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTを行い、GStreamerの3面D3D11Memoryへ直接出力します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodec、画像のGPU内コピーはありません。RTX 3070で1080p/4Kの全係数がCPU参照と完全一致し、FFmpeg CPU画素との差は最大1でした。EOS、seek、再起動、バッファ寿命、4K 30分、複数instance、D3D11変換・合成も検査済みです。実素材、実表示、RGB変換後の色精度、他GPUは未検証です。
 
 ```powershell
 ./scripts/bootstrap.ps1
 ./scripts/build.ps1
 ./scripts/generate-media.ps1
-. ./scripts/use-plugin.ps1
+. ./scripts/use-d3d11-plugin.ps1
 gst-launch-1.0 -e filesrc location=media/synthetic-1080p60-hq.mov ! qtdemux ! proresd3d11dec ! fakesink sync=false
 ```
 
 GStreamer MSVC x64ランタイムと開発SDKが必要です。[プラグインの実行手順・対応範囲](docs/GStreamerプラグイン.md)を参照してください。比較用の `proresvkdec` はVulkan復号後にCPUへ読み戻しますが、最終経路の `proresd3d11dec` はD3D11Memoryを出力します。
 
-合成素材180フレームの起動・終了込みwall throughputはD3D11Memory直結で1080pが139.1 fps、4Kが88.2 fpsでした。正式な定常性能や実運用性能ではなく、CPU/GPU負荷、p99、複数入力、実素材、表示を含む測定は残っています。Vulkan経路の既知の画素差・初回停止とDX11経路の結果は分けて扱います。
+6周×3試行の定常D3D11Memory供給は1080p 293.8 fps、4K 133.1 fps。検査用downloadでGPU完了まで含めても255.7/102.2 fps、p99は4.49/11.63 msでした。4Kの30分・182,520フレーム、起動100回、seek 1000回、2同時decodeに加え、RGB10A2 D3D11Memoryへの変換と2入力d3d11compositorも成功しています。実素材、実表示、RGB変換後の色精度、他GPUは未検証です。Vulkan経路の既知の画素差・初回停止とDX11経路の結果は分けて扱います。
 
 - [調査・方式比較](docs/調査と方式比較.md)
 - [ビルド・実行](docs/ビルドと実行.md)

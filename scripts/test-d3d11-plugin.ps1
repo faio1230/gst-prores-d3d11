@@ -17,8 +17,8 @@ $input2160 = Join-Path $root 'media/synthetic-2160p60-hq.mov'
 $out = Join-Path $root $OutDir
 foreach ($required in @($launcher, $smoke, $input1080, $input2160,
     (Join-Path $pluginDirectory 'gstproresd3d11.dll'),
-    (Join-Path $pluginDirectory 'prores_vld.hlsl'),
-    (Join-Path $pluginDirectory 'prores_idct.hlsl'))) {
+    (Join-Path $pluginDirectory 'prores_vld.cso'),
+    (Join-Path $pluginDirectory 'prores_idct_unorm.cso'))) {
     if (!(Test-Path -LiteralPath $required)) { throw "必要なファイルがありません: $required" }
 }
 New-Item -ItemType Directory -Force $out | Out-Null

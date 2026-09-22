@@ -20,16 +20,18 @@ filesrc → qtdemux → proresd3d11dec → video/x-raw(memory:D3D11Memory)
 
 ```powershell
 ./scripts/build.ps1
-. ./scripts/use-plugin.ps1
+. ./scripts/use-d3d11-plugin.ps1
 gst-inspect-1.0 proresd3d11dec
 gst-launch-1.0 -e filesrc location=media/synthetic-1080p60-hq.mov ! qtdemux ! proresd3d11dec ! fakesink sync=false
 ./scripts/test-dx11.ps1
 ./scripts/test-d3d11-plugin.ps1
 ```
 
-成果物は `build/vs18/plugins/Release/gstproresd3d11.dll` と同じディレクトリの `prores_vld.hlsl`、`prores_idct.hlsl`。shaderは実行時に `cs_5_0` へコンパイルする。既定ではDLL隣を読み、`shader-directory` propertyまたは `PRORES_DX11_SHADER_DIR` で上書きできる。`adapter=-1` は既定adapter。`rank=NONE` のため要素名を明示する。
+成果物は `build/vs18/plugins/Release/gstproresd3d11.dll` と同じディレクトリの `prores_vld.cso`、`prores_idct_unorm.cso`。Windows SDKのfxcでビルド時に `cs_5_0` へ固定し、起動時はbytecodeを読むだけにする。既定ではDLL隣を読み、`shader-directory` propertyまたは `PRORES_DX11_SHADER_DIR` で上書きできる。HLSL sourceも同じ出力先へライセンス確認用に配置する。`adapter=-1` は既定adapter。`rank=NONE` のため要素名を明示する。
 
-DLLの直接依存はGStreamer D3D11、D3DCompiler、MSVC/Windows runtimeで、FFmpeg/Vulkan DLLはない。`test-d3d11-plugin.ps1` はプロジェクトのFFmpegをPATHへ追加せず検査する。D3D11 deviceはGStreamer context query/set_contextで共有し、poolの各memoryに作ったUAVをmemory寿命へ結び付けて再利用する。
+DLLの直接依存はGStreamer D3D11とMSVC/Windows runtimeで、FFmpeg/Vulkan/D3DCompiler DLLはない。`use-d3d11-plugin.ps1` と `test-d3d11-plugin.ps1` はプロジェクトのFFmpegをPATHへ追加しない。D3D11 deviceはGStreamer context query/set_contextで共有し、poolの各memoryに作ったUAVをmemory寿命へ結び付けて再利用する。
+
+parserとVLD shaderのFFmpeg由来部分はSPDXでLGPL-2.1-or-laterを明記し、plugin metadataもLGPLとする。GStreamerはLGPL、fxc／D3D11はWindows SDKのビルド・実行依存。リポジトリ全体の独自コードの公開ライセンスは未決定なので、外部配布前にライセンス本文、著作権表示、対応ソースの提供方法を確定する。ProResの商標・特許・認証はOSSライセンスと別に確認する。
 
 実機結果は次のとおり。
 
@@ -43,9 +45,16 @@ DLLの直接依存はGStreamer D3D11、D3DCompiler、MSVC/Windows runtimeで、F
 | stop／pipeline破棄後に下流がbufferを保持 | 3面D3D11Memoryが有効 |
 | header/capsの既知BT.709 | 出力colorimetry一致 |
 | 破損signature、隠れたalpha/interlace、4444 caps、存在しないadapter/file | 全てエラー終了 |
-| 180フレームwall throughput、D3D11Memory直結 | 1080p 139.1 fps、4K 88.2 fps |
+| 定常D3D11Memory供給、6周×3試行中央値 | 1080p 293.8 fps、4K 133.1 fps |
+| 検査用downloadでGPU完了を含む定常値 | 1080p 255.7 fps、4K 102.2 fps、p99 4.49/11.63 ms |
+| 4K長時間、GPU完了込み | 30分、182,520フレーム、p99 11.42 ms、エラーなし |
+| 2プロセス同時4K、GPU完了込み | 各91.08/91.86 fps、両方成功 |
+| d3d11convert→RGB10A2 D3D11Memory→検査download | 1080p 152.6 fps、4K 68.0 fps、EOS成功 |
+| 2入力decode→convert→d3d11compositor→検査download | 1080p 118.4 fps、EOS成功 |
 
-wall throughputはshader compile、起動、demux、終了を含む単回の疎通値で、正式な定常性能ではない。VLDを1-bit反復loadから32-bit windowへ変更する前の検査用download込み保存記録は1080p 4.22 fpsであり、現在値はそのボトルネックを除いた後の結果。p99、CPU/GPU負荷、30分以上、起動100回、seek1000回、複数instance、実際のD3D11合成・表示は未測定。
+VLDを1-bit反復loadから32-bit windowへ変更する前の検査用download込み保存記録は1080p 4.22 fpsだった。最終値はそのボトルネックを除き、shaderをビルド時CSOへ変更した後の値。D3D11Memory直結の初回bufferは1080p 229 ms、4K 232 msで、実行時compile版の約0.5〜0.9秒から改善した。同一プロセス内の起動100回はp95 31.08 ms、seek 1000回はp95 3.84 msで全て成功。同一deviceの2instanceも成功。実表示、実素材、他GPUは未測定。
+
+D3D11下流検査ではdecoderの3面I422_10LEからd3d11convertのRGB10A2_LE、d3d11compositor出力まで `memory:D3D11Memory` を維持した。RGB10A2は10bit channelを保持するが、YUV→RGB変換後の全画素比較やdisplay色管理はまだ行っていない。compositor内部のrender/copy回数も未計測なので、この下流全体をゼロコピーとは呼ばない。保存ログは `results/proresd3d11-compositor-caps.log`。
 
 ## 比較用Vulkan版：proresvkdec
 

@@ -15,13 +15,13 @@
 #include <gst/d3d11/gstd3d11utils.h>
 
 #include <d3d11.h>
-#include <d3dcompiler.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -70,21 +70,16 @@ ComPtr<ID3D11Buffer> structured_buffer(ID3D11Device* device, UINT elements,
         bind_flags ? stride : 0, usage, cpu_access);
 }
 
-ComPtr<ID3DBlob> compile_shader(const std::filesystem::path& path,
-                                const D3D_SHADER_MACRO* macros = nullptr) {
-    ComPtr<ID3DBlob> bytecode;
-    ComPtr<ID3DBlob> diagnostics;
-    const auto result = D3DCompileFromFile(
-        path.c_str(), macros, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
-        D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-        &bytecode, &diagnostics);
-    if (FAILED(result)) {
-        std::string message = "cannot compile " + path.u8string();
-        if (diagnostics)
-            message += ": " + std::string(static_cast<const char*>(diagnostics->GetBufferPointer()),
-                                           diagnostics->GetBufferSize());
-        throw std::runtime_error(message);
-    }
+std::vector<std::uint8_t> read_shader(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) throw std::runtime_error("cannot open shader bytecode " + path.u8string());
+    const auto size = stream.tellg();
+    if (size <= 0 || size > 16 * 1024 * 1024)
+        throw std::runtime_error("invalid shader bytecode size " + path.u8string());
+    std::vector<std::uint8_t> bytecode(static_cast<std::size_t>(size));
+    stream.seekg(0);
+    stream.read(reinterpret_cast<char*>(bytecode.data()), static_cast<std::streamsize>(size));
+    if (!stream) throw std::runtime_error("cannot read shader bytecode " + path.u8string());
     return bytecode;
 }
 
@@ -143,14 +138,13 @@ public:
           context_(gst_d3d11_device_get_device_context_handle(gst_device)),
           token_(gst_d3d11_create_user_token()) {
         if (!device_ || !context_) throw std::runtime_error("GstD3D11Device has no native handles");
-        auto vld_bytecode = compile_shader(shader_directory / L"prores_vld.hlsl");
-        check_hr(device_->CreateComputeShader(vld_bytecode->GetBufferPointer(),
-                                              vld_bytecode->GetBufferSize(), nullptr, &vld_),
+        const auto vld_bytecode = read_shader(shader_directory / L"prores_vld.cso");
+        check_hr(device_->CreateComputeShader(vld_bytecode.data(), vld_bytecode.size(),
+                                              nullptr, &vld_),
                  "Create VLD shader");
-        const D3D_SHADER_MACRO macros[] = {{"PRORES_OUTPUT_UNORM", "1"}, {nullptr, nullptr}};
-        auto idct_bytecode = compile_shader(shader_directory / L"prores_idct.hlsl", macros);
-        check_hr(device_->CreateComputeShader(idct_bytecode->GetBufferPointer(),
-                                              idct_bytecode->GetBufferSize(), nullptr, &idct_),
+        const auto idct_bytecode = read_shader(shader_directory / L"prores_idct_unorm.cso");
+        check_hr(device_->CreateComputeShader(idct_bytecode.data(), idct_bytecode.size(),
+                                              nullptr, &idct_),
                  "Create IDCT shader");
     }
 
@@ -677,7 +671,7 @@ static void gst_prores_d3d11_dec_class_init(GstProresD3D11DecClass* klass) {
                          -1, G_MAXINT, -1, flags));
     g_object_class_install_property(object, PROP_SHADER_DIRECTORY,
         g_param_spec_string("shader-directory", "Shader directory",
-            "Override directory containing prores_vld.hlsl and prores_idct.hlsl", nullptr, flags));
+            "Override directory containing prores_vld.cso and prores_idct_unorm.cso", nullptr, flags));
     auto* element = GST_ELEMENT_CLASS(klass);
     element->set_context = set_context;
     gst_element_class_set_static_metadata(element, "Native D3D11 ProRes decoder",

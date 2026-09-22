@@ -73,26 +73,29 @@ uint load_be32(uint offset) {
 }
 
 uint show_bits(BitReader reader, uint count) {
+    uint safe_count = min(count, 32u);
     uint remaining = reader.bit_size - min(reader.position, reader.bit_size);
-    if (remaining >= 32 && count != 0) {
+    uint value = 0u;
+    if (remaining >= 32 && safe_count != 0) {
         uint byte_offset = reader.byte_offset + (reader.position >> 3);
         uint bit_offset = reader.position & 7u;
         uint window = load_be32(byte_offset);
         if (bit_offset != 0)
             window = (window << bit_offset) |
                      (load_byte(byte_offset + 4) >> (8 - bit_offset));
-        return count == 32 ? window : window >> (32 - count);
-    }
-
-    // A short tail is uncommon and is kept bounded and explicit so no raw
-    // buffer load can cross the padded packet allocation.
-    uint value = 0;
-    [loop] for (uint i = 0; i < count; ++i) {
-        value <<= 1;
-        uint position = reader.position + i;
-        if (position < reader.bit_size) {
-            uint byte_value = load_byte(reader.byte_offset + (position >> 3));
-            value |= (byte_value >> (7 - (position & 7))) & 1;
+        value = safe_count == 32 ? window : window >> (32 - safe_count);
+    } else {
+        // A short tail is uncommon and is kept bounded and explicit so no raw
+        // buffer load can cross the padded packet allocation.
+        [unroll] for (uint i = 0; i < 32; ++i) {
+            if (i < safe_count) {
+                value <<= 1;
+                uint position = reader.position + i;
+                if (position < reader.bit_size) {
+                    uint byte_value = load_byte(reader.byte_offset + (position >> 3));
+                    value |= (byte_value >> (7 - (position & 7))) & 1u;
+                }
+            }
         }
     }
     return value;

@@ -6,6 +6,8 @@ $pluginDirectory = Join-Path $pluginRoot 'build/vs18/plugins/Release'
 $pluginFFmpeg = Join-Path $pluginRoot 'tools/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1/bin'
 foreach ($required in @((Join-Path $pluginDirectory 'gstproresvk.dll'),
     (Join-Path $pluginDirectory 'gstproresd3d11.dll'),
+    (Join-Path $pluginDirectory 'prores_vld.cso'),
+    (Join-Path $pluginDirectory 'prores_idct_unorm.cso'),
     (Join-Path $pluginFFmpeg 'avcodec-62.dll'), (Join-Path $GStreamerRoot 'bin/gst-launch-1.0.exe'))) {
     if (!(Test-Path -LiteralPath $required)) { throw "必要なファイルがありません: $required" }
 }

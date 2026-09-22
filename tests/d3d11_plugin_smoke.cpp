@@ -1,7 +1,9 @@
 // 純粋DX11 GStreamer要素のD3D11Memory、時刻、seek、寿命、失敗入力を検証する。
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/d3d11/gstd3d11device.h>
 #include <gst/d3d11/gstd3d11memory.h>
+#include <gst/d3d11/gstd3d11utils.h>
 #include <gst/gst.h>
 #include <gst/video/video.h>
 
@@ -223,6 +225,58 @@ static void known_color(GstSample* compressed, bool from_caps) {
     require(pipeline.pull() == nullptr, "extra color frame");
 }
 
+static void shared_device_instances(const char* path) {
+    auto* pipeline = gst_pipeline_new("shared-device-test");
+    auto* device = gst_d3d11_device_new(0, 0);
+    require(pipeline && device, "shared D3D11 test setup failed");
+    auto* context = gst_d3d11_context_new(device);
+    gst_element_set_context(pipeline, context);
+    gst_context_unref(context);
+    GstElement* sinks[2]{};
+    for (int index = 0; index < 2; ++index) {
+        auto* source = gst_element_factory_make("filesrc", nullptr);
+        auto* demux = gst_element_factory_make("qtdemux", nullptr);
+        auto* decoder = gst_element_factory_make("proresd3d11dec", nullptr);
+        sinks[index] = gst_element_factory_make("appsink", nullptr);
+        require(source && demux && decoder && sinks[index], "shared-device element missing");
+        g_object_set(source, "location", path, nullptr);
+        g_object_set(sinks[index], "sync", FALSE, "max-buffers", 4u, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline), source, demux, decoder, sinks[index], nullptr);
+        require(gst_element_link(source, demux) && gst_element_link(decoder, sinks[index]),
+                "shared-device static link failed");
+        g_signal_connect(demux, "pad-added", G_CALLBACK(+[](GstElement*, GstPad* pad,
+                                                              gpointer target) {
+            auto* input = gst_element_get_static_pad(GST_ELEMENT(target), "sink");
+            if (!gst_pad_is_linked(input) && gst_pad_link(pad, input) != GST_PAD_LINK_OK)
+                GST_ELEMENT_ERROR(GST_ELEMENT(target), CORE, PAD,
+                                  ("Shared-device demux link failed"), (nullptr));
+            gst_object_unref(input);
+        }), decoder);
+    }
+    require(gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE,
+            "shared-device PLAYING failed");
+    for (guint64 frame = 0; frame < 180; ++frame) {
+        for (auto* sink : sinks) {
+            auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 10 * GST_SECOND);
+            require(sample != nullptr, "shared-device output missing");
+            check_d3d_sample(sample, gst_util_uint64_scale(frame, GST_SECOND, 60));
+            auto* memory = GST_D3D11_MEMORY_CAST(
+                gst_buffer_peek_memory(gst_sample_get_buffer(sample), 0));
+            require(memory->device == device, "decoder did not honor shared GstD3D11Device");
+            gst_sample_unref(sample);
+        }
+    }
+    for (auto* sink : sinks) {
+        require(gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 10 * GST_SECOND) == nullptr &&
+                gst_app_sink_is_eos(GST_APP_SINK(sink)), "shared-device EOS mismatch");
+    }
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    require(gst_element_get_state(pipeline, nullptr, nullptr, 10 * GST_SECOND) !=
+            GST_STATE_CHANGE_ASYNC, "shared-device NULL timeout");
+    gst_object_unref(pipeline);
+    gst_object_unref(device);
+}
+
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
     require(argc == 2, "d3d11_plugin_smoke 180-frame-60fps-hq.mov");
@@ -275,6 +329,7 @@ int main(int argc, char** argv) try {
     require(retained && gst_buffer_n_memory(retained) == 3,
             "buffer invalid after pipeline destruction");
     gst_buffer_unref(retained);
+    shared_device_instances(argv[1]);
 
     {
         Pipeline pipeline("filesrc name=source ! qtdemux name=demux "
@@ -322,7 +377,8 @@ int main(int argc, char** argv) try {
 
     std::cout << "{\"passed\":true,\"eos_cycles\":3,\"frames_per_cycle\":180,"
                  "\"flushing_seeks\":4,\"known_color_cases\":2,"
-                 "\"retained_buffer_after_destroy\":true,\"error_cases\":6,"
+                 "\"retained_buffer_after_destroy\":true,\"shared_device_instances\":2,"
+                 "\"error_cases\":6,"
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;
