@@ -1,0 +1,7 @@
+/tools/
+/external/
+/build/
+/media/
+__pycache__/
+*.raw
+*.yuv
