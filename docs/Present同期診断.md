@@ -27,3 +27,5 @@ python scripts/summarize-present-control.py results/present-control-testsrc-topm
 変更後に`./scripts/test-d3d11-plugin.ps1`と`./scripts/test-dx11.ps1`を通過。EOS・seek・動的解像度caps・D3D11Memory・RGB要素・係数完全一致・画素最大差1を維持した。記録は`results/verification-present-control-2026-09-24/`。
 
 解釈：DXGI API失敗を原因とする説明は否定され、診断swap chainでは同期値0とOS未表示が同時に現れる。ただし独立`appsink`、CPU時計同期、4K→swap chainコピー、自前ウィンドウを使い、標準`d3d11videosink`の待機・QoS・ウィンドウ処理とは異なる。最前面化も製品既定値へ採用しない。次は標準sinkと同等の条件で同期値だけを変える診断を行い、DWMの個別ラッチ／キュー破棄イベントをPTSへ帰属する。実写4K60のend-to-end欠落と短い最大表示間隔を同時に満たすまでは製品採用を保留する。
+
+後続の標準sink・実写4K60検査では、`Present(0)`成功後のOS未表示32件とDWMのflip消費欠番32件を3試行各1441行へ完全対応づけた。これは独立swap chainの`Present(1)`比較を標準sinkの解決策と認定するものではない。キュー置換とDWM内部の破棄を分けるWin32K/DxgKrnl証拠は未取得で、詳細は[実素材と表示検証](実素材と表示検証.md)に記録した。
