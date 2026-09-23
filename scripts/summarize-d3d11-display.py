@@ -38,6 +38,8 @@ def main():
                        'predecode_queue': record.get('predecode_queue', False),
                        'decoder_no_qos': record.get('decoder_no_qos', False),
                        'trace_sink_return': record.get('trace_sink_return', False),
+                       'trace_window_state': record.get('trace_window_state', False),
+                       'sink_ts_offset_ms': record.get('sink_ts_offset_ms', 0),
                        'injected_sink_stall_ms': record.get('injected_sink_stall_ms', 0),
                        'expected': stages['expected_frames'], 'rendered': record['rendered'],
                        'sink_dropped': record['dropped'], 'qos': record['qos_messages'],
@@ -60,7 +62,7 @@ def main():
     if len({trial['input'] for trial in trials}) != 1:
         parser.error('複数素材は別々に集計する')
     for field in ('rgb_converter', 'predecode_queue', 'decoder_no_qos',
-                  'trace_sink_return',
+                  'trace_sink_return', 'trace_window_state', 'sink_ts_offset_ms',
                   'injected_sink_stall_ms',
                   'lossless_sink_policy'):
         if len({trial[field] for trial in trials}) != 1:
@@ -74,6 +76,8 @@ def main():
                'predecode_queue': trials[0]['predecode_queue'],
                'decoder_no_qos': trials[0]['decoder_no_qos'],
                'trace_sink_return': trials[0]['trace_sink_return'],
+               'trace_window_state': trials[0]['trace_window_state'],
+               'sink_ts_offset_ms': trials[0]['sink_ts_offset_ms'],
                'injected_sink_stall_ms': trials[0]['injected_sink_stall_ms'],
                'lossless_sink_policy': trials[0]['lossless_sink_policy'],
                'repeats': len(trials),

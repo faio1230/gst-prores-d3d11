@@ -1,6 +1,6 @@
 """PresentMonのOS表示記録をGStreamer表示試行のPIDと照合する。"""
 import argparse
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 import csv
 import json
@@ -41,7 +41,24 @@ def rows_for_trial(rows, record, present_csv):
             and lower <= start + busy <= upper]
 
 
-def align_pts(rows, record, present_csv, display_column):
+def load_stages(stage_csv):
+    if not stage_csv.is_file():
+        return {}
+    times = {}
+    previous = {}
+    with stage_csv.open(newline='', encoding='utf-8-sig') as stream:
+        for row in csv.DictReader(stream):
+            if not row.get('pts_ns'):
+                continue
+            stage, pts = row['stage'], int(row['pts_ns'])
+            prior_loop, prior_pts = previous.get(stage, (0, pts))
+            loop = prior_loop + (pts < prior_pts)
+            previous[stage] = (loop, pts)
+            times[(stage, loop, pts)] = float(row['wall_ms'])
+    return times
+
+
+def align_pts(rows, record, present_csv, stage_csv, display_column):
     if ('qpc_origin_ms' not in record or not rows or
             'CPUStartQPCTimeInMs' not in rows[0] or not present_csv.is_file()):
         return None
@@ -52,6 +69,9 @@ def align_pts(rows, record, present_csv, display_column):
     origin = float(record['qpc_origin_ms'])
     signal_times = [origin + float(row['wall_ms']) for row in signals]
     all_frames = {(int(row['loop']), int(row['pts_ns'])) for row in signals}
+    present_wall = {(int(row['loop']), int(row['pts_ns'])): float(row['wall_ms'])
+                    for row in signals}
+    stage_times = load_stages(stage_csv)
     window_states = defaultdict(set)
     if signals[0].get('window_found') not in (None, '', '-1'):
         for row in signals:
@@ -63,6 +83,7 @@ def align_pts(rows, record, present_csv, display_column):
     captured = set()
     displayed = set()
     matched_rows = defaultdict(list)
+    matched_events = []
     deltas = []
     for row in rows:
         start = metric(row, 'CPUStartQPCTimeInMs')
@@ -81,6 +102,7 @@ def align_pts(rows, record, present_csv, display_column):
         key = (int(signals[nearest]['loop']), int(signals[nearest]['pts_ns']))
         captured.add(key)
         matched_rows[key].append(row)
+        matched_events.append((row, key))
         if metric(row, display_column) is not None:
             displayed.add(key)
     bounds = {}
@@ -92,11 +114,73 @@ def align_pts(rows, record, present_csv, display_column):
     missing_display = sorted(captured - displayed)
     window_by_result = {'displayed': Counter(), 'not_displayed': Counter()}
     rows_by_result = {'displayed': [], 'not_displayed': []}
+    stage_latencies = {'displayed': defaultdict(list), 'not_displayed': defaultdict(list)}
     for key in interior & captured:
         result = 'displayed' if key in displayed else 'not_displayed'
         states = window_states.get(key)
         window_by_result[result][' / '.join(sorted(states)) if states else 'not-recorded'] += 1
         rows_by_result[result].extend(matched_rows[key])
+        loop, pts = key
+        for before, after in (('compressed', 'decoded'), ('decoded', 'rgb'),
+                              ('rgb', 'sink_push'), ('sink_push', 'sink_return')):
+            start, end = stage_times.get((before, loop, pts)), stage_times.get((after, loop, pts))
+            if start is not None and end is not None:
+                stage_latencies[result][before + '_to_' + after + '_ms'].append(end - start)
+        push_time = stage_times.get(('sink_push', loop, pts))
+        if push_time is not None:
+            stage_latencies[result]['sink_push_to_present_signal_ms'].append(
+                present_wall[key] - push_time)
+    display_events = sorted(
+        (start + busy + delay, key)
+        for row, key in matched_events
+        if (start := metric(row, 'CPUStartQPCTimeInMs')) is not None
+        and (busy := metric(row, 'MsCPUBusy')) is not None
+        and (delay := metric(row, display_column)) is not None)
+    display_times = [time for time, _ in display_events]
+    event_position = {id(row): i for i, (row, _) in enumerate(matched_events)}
+    headroom = []
+    first_refresh_delay = []
+    next_present_before_refresh = 0
+    next_present_observed = 0
+    missing_with_gpu_completion = 0
+    next_display_position = Counter()
+    cadence_examples = []
+    for key in sorted(interior & captured - displayed):
+        row = matched_rows[key][0]
+        present_ms = metric(row, 'CPUStartQPCTimeInMs') + metric(row, 'MsCPUBusy')
+        position = bisect_right(display_times, present_ms)
+        if position == len(display_times):
+            continue
+        refresh_ms, refresh_key = display_events[position]
+        if refresh_key[0] != key[0]:
+            next_display_position['different_loop'] += 1
+        elif refresh_key[1] < key[1]:
+            next_display_position['earlier_pts'] += 1
+        elif refresh_key[1] > key[1]:
+            next_display_position['later_pts'] += 1
+        else:
+            next_display_position['same_pts'] += 1
+        first_refresh_delay.append(refresh_ms - present_ms)
+        gpu_delay = metric(row, 'MsRenderPresentLatency')
+        gpu_headroom = None
+        if gpu_delay is not None:
+            missing_with_gpu_completion += 1
+            gpu_headroom = refresh_ms - (present_ms + gpu_delay)
+            headroom.append(gpu_headroom)
+        next_present_ms = None
+        for later, later_key in matched_events[event_position[id(row)] + 1:]:
+            if later_key != key:
+                next_present_ms = metric(later, 'CPUStartQPCTimeInMs') + metric(later, 'MsCPUBusy')
+                break
+        if next_present_ms is not None:
+            next_present_observed += 1
+            if next_present_ms <= refresh_ms:
+                next_present_before_refresh += 1
+        if len(cadence_examples) < 12:
+            cadence_examples.append({'loop': key[0], 'pts_ns': key[1],
+                                     'gpu_headroom_to_next_display_ms': gpu_headroom,
+                                     'next_present_before_next_display':
+                                     next_present_ms <= refresh_ms if next_present_ms is not None else None})
     return {'method': 'QPC + MsCPUBusy とpresent通知を1ms以内で照合',
             'matched_presentmon_rows': len(used),
             'unmatched_presentmon_rows': len(rows) - len(used),
@@ -115,8 +199,27 @@ def align_pts(rows, record, present_csv, display_column):
             'interior_presentmon_metrics_by_display': {
                 key: {'between_presents_ms': percentiles(value, 'MsBetweenPresents'),
                       'present_api_ms': percentiles(value, 'MsInPresentAPI'),
-                      'gpu_busy_ms': percentiles(value, 'MsGPUBusy')}
+                      'gpu_busy_ms': percentiles(value, 'MsGPUBusy'),
+                      'render_present_latency_ms': percentiles(value, 'MsRenderPresentLatency')}
                 for key, value in rows_by_result.items()},
+            'interior_stage_latency_by_display': {
+                result: {name: percentiles([{'value': item} for item in values], 'value')
+                         for name, values in metrics.items()}
+                for result, metrics in stage_latencies.items()},
+            'undisplayed_cadence': {
+                'samples_with_next_display': len(first_refresh_delay),
+                'samples_with_gpu_completion': missing_with_gpu_completion,
+                'gpu_headroom_to_next_display_ms': percentiles(
+                    [{'value': value} for value in headroom], 'value'),
+                'gpu_ready_at_least_2ms_before_next_display': sum(value >= 2 for value in headroom),
+                'gpu_ready_at_least_5ms_before_next_display': sum(value >= 5 for value in headroom),
+                'gpu_completed_after_next_display': sum(value < 0 for value in headroom),
+                'next_display_source_position': dict(next_display_position),
+                'next_present_observed': next_present_observed,
+                'next_present_before_next_display': next_present_before_refresh,
+                'first_next_display_delay_ms': percentiles(
+                    [{'value': value} for value in first_refresh_delay], 'value'),
+                'examples': cadence_examples},
             'not_displayed_first_32': missing_display[:32]}
 
 
@@ -160,6 +263,7 @@ def main():
             'sink_push_to_sink_return_ms', {})
         trials.append({'input': record['input'], 'repeat': record['repeat'],
                        'process_id': pid, 'gstreamer_rendered': record['rendered'],
+                       'sink_ts_offset_ms': record.get('sink_ts_offset_ms', 0),
                        'gstreamer_dropped': record['dropped'],
                        'gstreamer_qos': record['qos_messages'],
                        'gstreamer_present_signals': present_count,
@@ -172,14 +276,18 @@ def main():
                        'present_api_ms': percentiles(rows, 'MsInPresentAPI'),
                        'until_displayed_ms': percentiles(rows, display_column),
                        'pts_alignment': align_pts(rows, record, present_csv,
+                                                  path.with_suffix('.stages.csv'),
                                                   display_column),
                        'max_sink_push_ms': push.get('max')})
     trials.sort(key=lambda trial: trial['repeat'])
     if len({trial['input'] for trial in trials}) != 1:
         parser.error('複数素材は--stemで分ける')
+    if len({trial['sink_ts_offset_ms'] for trial in trials}) != 1:
+        parser.error('同期時刻の異なる試行は別々に集計する')
     covered = [trial for trial in trials if trial['presentmon_coverage_sufficient']]
     aligned = [trial for trial in covered if trial['pts_alignment']]
     summary = {'source': trials[0]['input'], 'presentmon_csv': str(args.presentmon_csv),
+               'sink_ts_offset_ms': trials[0]['sink_ts_offset_ms'],
                'trials': len(trials), 'coverage_sufficient_trials': len(covered),
                'gstreamer_rendered_covered': sum(t['gstreamer_rendered'] for t in covered),
                'presentmon_rows_covered': sum(t['presentmon_rows'] for t in covered),

@@ -116,12 +116,16 @@ def main():
                         help='診断用: RGB出力の下流pushが戻るまでをPTSごとに記録する')
     parser.add_argument('--trace-window-state', action='store_true',
                         help='診断用: present通知時に自プロセスのD3D11ウィンドウ状態を読む')
+    parser.add_argument('--sink-ts-offset-ms', type=int, default=0,
+                        help='診断用: sink同期時刻の相対移動（負値は早い提出、単位ms）')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
         parser.error('loops/repeats must be positive')
     if not 0 <= args.sink_stall_ms <= 1000:
         parser.error('--sink-stall-ms は0～1000を指定する')
+    if not -100 <= args.sink_ts_offset_ms <= 100:
+        parser.error('--sink-ts-offset-ms は-100～100を指定する')
     args.out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env['PATH'] = str(GST) + os.pathsep + env.get('PATH', '')
@@ -164,6 +168,8 @@ def main():
                         command.append('trace-sink-return')
                     if args.trace_window_state:
                         command.append('trace-window-state')
+                    if args.sink_ts_offset_ms:
+                        command.append(f'sink-ts-offset-ms={args.sink_ts_offset_ms}')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:
                         process = subprocess.run(command, env=env, text=True,
                                                  stdout=subprocess.PIPE, stderr=errors,

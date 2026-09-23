@@ -251,8 +251,8 @@ int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
-    if (argc < 4 || argc > 13)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state]]");
+    if (argc < 4 || argc > 14)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [sink-ts-offset-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
@@ -261,6 +261,7 @@ int main(int argc, char** argv) try {
     bool trace_sink_return = false;
     bool trace_window_state = false;
     guint sink_stall_ms = 0;
+    int sink_ts_offset_ms = 0;
     for (int i = 5; i < argc; ++i) {
         const std::string option(argv[i]);
         if (option == "preroll") preroll = true;
@@ -270,11 +271,15 @@ int main(int argc, char** argv) try {
         else if (option == "decoder-no-qos") decoder_no_qos = true;
         else if (option == "trace-sink-return") trace_sink_return = true;
         else if (option == "trace-window-state") trace_window_state = true;
+        else if (option.rfind("sink-ts-offset-ms=", 0) == 0)
+            sink_ts_offset_ms = std::stoi(option.substr(std::string("sink-ts-offset-ms=").size()));
         else if (option.rfind("sink-stall-ms=", 0) == 0)
             sink_stall_ms = static_cast<guint>(std::stoi(option.substr(14)));
         else throw std::runtime_error("unknown display option: " + option);
     }
     if (sink_stall_ms > 1000) throw std::runtime_error("sink stall must be at most 1000ms");
+    if (sink_ts_offset_ms < -100 || sink_ts_offset_ms > 100)
+        throw std::runtime_error("sink ts offset must be between -100 and 100ms");
     const int loops = std::stoi(argv[2]);
     if (loops < 1) throw std::runtime_error("loops must be positive");
     GError* error = nullptr;
@@ -304,6 +309,12 @@ int main(int argc, char** argv) try {
     g_object_set(source, "location", argv[1], nullptr);
     if (decoder_no_qos) g_object_set(decoder, "qos", FALSE, nullptr);
     if (lossless) g_object_set(sink, "qos", FALSE, "max-lateness", gint64(-1), nullptr);
+    if (sink_ts_offset_ms)
+        g_object_set(sink, "ts-offset", static_cast<gint64>(sink_ts_offset_ms) * GST_MSECOND, nullptr);
+    gint64 actual_sink_ts_offset = 0;
+    g_object_get(sink, "ts-offset", &actual_sink_ts_offset, nullptr);
+    if (actual_sink_ts_offset != static_cast<gint64>(sink_ts_offset_ms) * GST_MSECOND)
+        throw std::runtime_error("sink ts-offset was not applied");
     gst_object_unref(source);
     PresentLog presents;
     presents.origin = Clock::now();
@@ -438,6 +449,7 @@ int main(int argc, char** argv) try {
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
               << ",\"trace_sink_return\":" << (trace_sink_return ? "true" : "false")
               << ",\"trace_window_state\":" << (trace_window_state ? "true" : "false")
+              << ",\"sink_ts_offset_ms\":" << sink_ts_offset_ms
               << ",\"injected_sink_stall_ms\":" << sink_stall_ms
               << ",\"injected_stall_start_ms\":" << stall.start_ms
               << ",\"injected_stall_end_ms\":" << stall.end_ms
