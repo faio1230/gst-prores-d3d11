@@ -414,9 +414,13 @@ public:
 
     void drain_errors() {
         std::unique_lock<std::mutex> queue_lock(error_mutex_);
-        if (!error_cv_.wait_for(queue_lock, std::chrono::seconds(10), [&] {
+        draining_errors_ = true;
+        error_cv_.notify_all();
+        const bool completed = error_cv_.wait_for(queue_lock, std::chrono::seconds(10), [&] {
                 return pending_errors_.empty() || !error_failure_.empty();
-            })) {
+            });
+        draining_errors_ = false;
+        if (!completed) {
             queue_lock.unlock();
             check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed during VLD drain");
             throw std::runtime_error("delayed VLD error drain exceeded 10 seconds");
@@ -436,6 +440,7 @@ public:
             std::lock_guard<std::mutex> queue_lock(error_mutex_);
             pending_errors_.clear();
             error_failure_.clear();
+            draining_errors_ = false;
         }
         next_staging_index_ = 0;
     }
@@ -497,7 +502,8 @@ private:
                 std::unique_lock<std::mutex> queue_lock(error_mutex_);
                 error_cv_.wait(queue_lock, [&] {
                     return stop_error_worker_.load(std::memory_order_acquire) ||
-                           !pending_errors_.empty();
+                           pending_errors_.size() >= 2 ||
+                           (draining_errors_ && !pending_errors_.empty());
                 });
                 if (stop_error_worker_.load(std::memory_order_acquire)) return;
                 pending = pending_errors_.front();
@@ -779,6 +785,7 @@ private:
     std::thread error_worker_;
     std::deque<PendingError> pending_errors_;
     std::string error_failure_;
+    bool draining_errors_ = false;
     std::size_t next_staging_index_ = 0;
     std::uint64_t frame_sequence_ = 0;
     std::vector<prores::CoefficientJob> coefficient_jobs_;
