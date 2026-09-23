@@ -112,7 +112,7 @@ struct Pipeline {
         return sample;
     }
 
-    void expect_error() {
+    void expect_error(GQuark expected_domain = 0, int expected_code = -1) {
         auto* message = gst_bus_timed_pop_filtered(bus, 15 * GST_SECOND,
             static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
         require(message != nullptr, "expected error timed out");
@@ -121,9 +121,16 @@ struct Pipeline {
             GError* error = nullptr;
             gchar* debug = nullptr;
             gst_message_parse_error(message, &error, &debug);
+            require(error != nullptr, "error message has no GError");
             std::cerr << "expected_error=" << error->message << '\n';
+            const bool expected_type =
+                (!expected_domain || error->domain == expected_domain) &&
+                (expected_code < 0 || error->code == expected_code);
             g_error_free(error);
             g_free(debug);
+            gst_message_unref(message);
+            require(expected_type, "unexpected error domain or code");
+            return;
         }
         gst_message_unref(message);
         require(is_error, "unexpected successful EOS");
@@ -343,6 +350,56 @@ static void dynamic_color_caps(GstSample* compressed) {
     gst_buffer_unref(retained);
 }
 
+static void dynamic_rejected_input(GstSample* compressed, bool unsupported_caps) {
+    GstSample* retained = nullptr;
+    {
+        Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! "
+                          "appsink name=sink sync=false max-buffers=4");
+        auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+        require(source != nullptr, "dynamic-rejection source missing");
+        gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+        pipeline.state(GST_STATE_PLAYING);
+        auto* first = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+        require(first != nullptr &&
+                gst_app_src_push_buffer(GST_APP_SRC(source), first) == GST_FLOW_OK,
+                "dynamic-rejection first input failed");
+        retained = pipeline.pull();
+        require(retained != nullptr, "dynamic-rejection first output missing");
+        check_d3d_sample(retained, 0);
+
+        if (unsupported_caps) {
+            auto* caps = gst_caps_copy(gst_sample_get_caps(compressed));
+            gst_caps_set_simple(caps, "variant", G_TYPE_STRING, "4444", nullptr);
+            gst_app_src_set_caps(GST_APP_SRC(source), caps);
+            gst_caps_unref(caps);
+        }
+        auto* second = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+        require(second != nullptr, "dynamic-rejection second packet copy failed");
+        if (!unsupported_caps) {
+            const guint8 alpha = 2;
+            require(gst_buffer_fill(second, 25, &alpha, 1) == 1,
+                    "dynamic-rejection alpha tag write failed");
+        }
+        GST_BUFFER_PTS(second) = gst_util_uint64_scale(1, GST_SECOND, 60);
+        GST_BUFFER_DTS(second) = GST_BUFFER_PTS(second);
+        GST_BUFFER_DURATION(second) = gst_util_uint64_scale(1, GST_SECOND, 60);
+        const auto flow = gst_app_src_push_buffer(GST_APP_SRC(source), second);
+        require(flow == GST_FLOW_OK || flow == GST_FLOW_NOT_NEGOTIATED,
+                "dynamic-rejection unexpected push status");
+        gst_object_unref(source);
+        if (unsupported_caps)
+            pipeline.expect_error();
+        else
+            pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT);
+        auto* unexpected = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline.sink),
+                                                        200 * GST_MSECOND);
+        if (unexpected) gst_sample_unref(unexpected);
+        require(unexpected == nullptr, "unsupported frame emitted output");
+    }
+    check_d3d_sample(retained, 0);
+    gst_sample_unref(retained);
+}
+
 static void reject_unsupported_rgb_color(GstSample* compressed) {
     Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! "
                       "proresd3d11rgb ! fakesink");
@@ -545,6 +602,8 @@ int main(int argc, char** argv) try {
     known_color(compressed, false);
     known_color(compressed, true);
     dynamic_color_caps(compressed);
+    dynamic_rejected_input(compressed, false);
+    dynamic_rejected_input(compressed, true);
     reject_unsupported_rgb_color(compressed);
     if (argc == 3) {
         Pipeline demux("filesrc name=source ! qtdemux ! appsink name=sink sync=false max-buffers=1");
@@ -579,11 +638,12 @@ int main(int argc, char** argv) try {
     std::cout << "{\"passed\":true,\"eos_cycles\":3,\"frames_per_cycle\":180,"
                  "\"flushing_seeks\":4,\"known_color_cases\":2,"
                  "\"dynamic_color_caps_changes\":2,"
+                 "\"dynamic_rejected_input_cases\":2,"
                  "\"dynamic_caps_changes\":" << (argc == 3 ? 2 : 0) << ","
                  "\"retained_buffer_after_destroy\":true,\"shared_device_instances\":2,"
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
-                 "\"error_cases\":7,"
+                 "\"error_cases\":9,"
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;

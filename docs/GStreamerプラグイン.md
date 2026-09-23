@@ -48,6 +48,7 @@ parserとVLD shaderのFFmpeg由来部分はSPDXでLGPL-2.1-or-laterを明記し�
 | stop／pipeline破棄後に下流がbufferを保持 | 3面D3D11Memoryが有効 |
 | header/capsの既知BT.709 | 出力colorimetry一致 |
 | 同一pipelineで色のみBT.709→BT.601→BT.709 | 2回の再交渉で出力colorimetry・3面D3D11Memory・PTSが一致。最初と最後の画素も一致 |
+| 正常なHQ出力後に隠れたalpha、または4444 capsへ切替 | alphaは`STREAM/FORMAT`、4444 capsは交渉エラーで停止。追加出力なし、先に出したD3D11Memoryはpipeline停止後も有効 |
 | BT.601出力をBT.709専用`proresd3d11rgb`へ入力 | サイレント変換せずエラー終了 |
 | 破損signature、隠れたalpha/interlace、4444 caps、存在しないadapter/file | 全てエラー終了 |
 | 定常D3D11Memory供給、6周×3試行中央値 | 1080p 293.8 fps、4K 133.1 fps |
