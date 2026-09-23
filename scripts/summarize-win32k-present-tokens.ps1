@@ -49,6 +49,12 @@ $trials = foreach ($trial in $summary.trials) {
         [uint64]$_.Properties[4].Value -eq $surface -and
         [uint64]$_.Properties[5].Value -eq $bind
     })
+    $createdTime = @{}
+    foreach ($event in $created) {
+        $count = [int]$event.Properties[3].Value
+        if ($createdTime.ContainsKey($count)) { throw "重複token作成: count=$count" }
+        $createdTime[$count] = $event.TimeCreated
+    }
     $states = @($statesAll | Where-Object {
         [uint64]$_.Properties[7].Value -eq $surface -and
         [uint64]$_.Properties[8].Value -eq $bind
@@ -92,9 +98,27 @@ $trials = foreach ($trial in $summary.trials) {
     $missingDeltasBySequence = @{}
     $nextConsumedUnavailable = 0
     $adjacentConsumedDeltas = @()
+    $missingNextCreatedDeltas = @{ with_retired = @(); without_retired = @() }
+    $missingNextCreatedBefore = @{ with_retired = 0; without_retired = 0 }
+    $adjacentConsumedNextCreatedDeltas = @()
+    $adjacentConsumedNextCreatedBefore = 0
+    $missingNextTokenOrder = @()
     for ($count = $first; $count -le $last; $count++) {
+        if (!$createdTime.ContainsKey($count + 1)) {
+            throw "次のtoken作成時刻が不足: count=$count"
+        }
+        $nextCreatedDelta = ($createdTime[$count + 1] - $inFrame[$count]).TotalMilliseconds
         if (!$consumed.Contains($count)) {
             $missing += $count
+            $sequence = $sequenceByCount[$count]
+            $class = if ($sequence -match '(^|,)5(,|$)') { 'with_retired' } else { 'without_retired' }
+            $missingNextCreatedDeltas[$class] += $nextCreatedDelta
+            if ($nextCreatedDelta -le 0) { $missingNextCreatedBefore[$class]++ }
+            $missingNextTokenOrder += [ordered]@{
+                present_count = $count
+                state_sequence = $sequence
+                next_token_created_minus_inframe_ms = $nextCreatedDelta
+            }
             $next = $count + 1
             while ($next -le $last -and !$consumed.Contains($next)) { $next++ }
             if ($next -le $last) {
@@ -110,6 +134,8 @@ $trials = foreach ($trial in $summary.trials) {
             }
         } elseif ($count -lt $last -and $consumed.Contains($count + 1)) {
             $adjacentConsumedDeltas += ($inFrame[$count + 1] - $inFrame[$count]).TotalMilliseconds
+            $adjacentConsumedNextCreatedDeltas += $nextCreatedDelta
+            if ($nextCreatedDelta -le 0) { $adjacentConsumedNextCreatedBefore++ }
         }
     }
     if ($missing.Count -ne $trial.dwm_missing_present_counts) {
@@ -138,26 +164,37 @@ $trials = foreach ($trial in $summary.trials) {
         missing_next_consumed_inframe_delta = Measure-Values $nextConsumedDeltas
         missing_inframe_delta_by_sequence = $missingSequenceTimings
         missing_next_consumed_within_0_1_ms = @($nextConsumedDeltas | Where-Object { $_ -ge 0 -and $_ -le 0.1 }).Count
+        missing_next_token_created_minus_inframe_ms = [ordered]@{
+            with_retired = Measure-Values $missingNextCreatedDeltas.with_retired
+            without_retired = Measure-Values $missingNextCreatedDeltas.without_retired
+        }
+        missing_next_token_created_before_inframe = $missingNextCreatedBefore
+        missing_next_token_order = $missingNextTokenOrder
         adjacent_consumed_inframe_delta = Measure-Values $adjacentConsumedDeltas
         adjacent_consumed_within_0_1_ms = @($adjacentConsumedDeltas | Where-Object { $_ -ge 0 -and $_ -le 0.1 }).Count
+        adjacent_consumed_next_token_created_minus_inframe_ms = Measure-Values $adjacentConsumedNextCreatedDeltas
+        adjacent_consumed_next_token_created_before_inframe = $adjacentConsumedNextCreatedBefore
     }
 }
 $result = [ordered]@{
-    method = 'DWM ID467のsurfaceLuid/bindId/presentCountをWin32K ID201/301へ結合。NewState=3の時刻を次の消費tokenと比較。'
+    method = 'DWM ID467のsurfaceLuid/bindId/presentCountをWin32K ID201/301へ結合。NewState=3の時刻を次の消費tokenおよび直後tokenの作成時刻と比較。'
     win32k_sha256 = (Get-FileHash -LiteralPath $Win32kEtl -Algorithm SHA256).Hash.ToLowerInvariant()
     dwm_sha256 = (Get-FileHash -LiteralPath $DwmEtl -Algorithm SHA256).Hash.ToLowerInvariant()
     dwm_summary_sha256 = (Get-FileHash -LiteralPath $DwmSummary -Algorithm SHA256).Hash.ToLowerInvariant()
     token_states = [ordered]@{completed = 2; in_frame = 3; confirmed = 4; retired = 5; discarded = 6}
     trials = @($trials)
-    caveat = 'state 6は表示済みtokenにも出る後片付け状態で、これだけを未表示原因と解釈しない。同時InFrameは合成バッチの近接を示すが、キューでの置換位置を単独では証明しない。'
+    caveat = 'state 6は表示済みtokenにも出る後片付け状態。直後tokenの先行作成は追い越し可能な時系列を示すが、キューでの置換主体や正確な破棄位置を単独では証明しない。'
 }
 $directory = Split-Path -Parent $Out
 if ($directory) { New-Item -ItemType Directory -Force -Path $directory | Out-Null }
 $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Out -Encoding utf8
 foreach ($trial in $trials) {
-    Write-Output ("PID={0} 未消費={1} 次の消費tokenとInFrame 0.1ms内={2} 比較対照0.1ms内={3}/{4}" -f
+    Write-Output ("PID={0} 未消費={1} 次の消費tokenとInFrame 0.1ms内={2} 比較対照0.1ms内={3}/{4} 直後token先行={5}/{6} 対照={7}/{4}" -f
         $trial.process_id, $trial.dwm_missing_present_counts.Count,
         $trial.missing_next_consumed_within_0_1_ms,
         $trial.adjacent_consumed_within_0_1_ms,
-        $trial.adjacent_consumed_inframe_delta.count)
+        $trial.adjacent_consumed_inframe_delta.count,
+        $trial.missing_next_token_created_before_inframe.with_retired,
+        $trial.missing_next_token_created_minus_inframe_ms.with_retired.count,
+        $trial.adjacent_consumed_next_token_created_before_inframe)
 }
