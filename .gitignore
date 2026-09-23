@@ -5,6 +5,7 @@
 __pycache__/
 *.raw
 *.yuv
+/results/**/gst-registry.bin
 # 初期試作の表示計測（seek後のsink統計集計前）。正式値はresults/d3d11-display/。
 /results/display-1080.json
 /results/display-1080-present.csv

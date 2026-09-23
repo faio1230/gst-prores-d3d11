@@ -146,7 +146,8 @@ struct StreamContract {
 };
 
 static StreamContract verify_sample(GstSample* sample, const std::string& mode,
-                                    std::uint64_t frame_index) {
+                                    std::uint64_t frame_index,
+                                    std::uint64_t pts_tolerance_ns = 0) {
     auto* caps = gst_sample_get_caps(sample);
     GstVideoInfo info{};
     require(gst_video_info_from_caps(&info, caps), "invalid output caps");
@@ -165,7 +166,13 @@ static StreamContract verify_sample(GstSample* sample, const std::string& mode,
     if (info.fps_n > 0) {
         const auto expected = gst_util_uint64_scale(frame_index * info.fps_d,
                                                     GST_SECOND, info.fps_n);
-        require(GST_BUFFER_PTS(buffer) == expected, "output PTS mismatch");
+        const auto actual = GST_BUFFER_PTS(buffer);
+        const auto delta = actual >= expected ? actual - expected : expected - actual;
+        require(actual != GST_CLOCK_TIME_NONE && delta <= pts_tolerance_ns,
+                ("output PTS mismatch at frame " + std::to_string(frame_index) +
+                ": actual=" + std::to_string(actual) +
+                ", expected=" + std::to_string(expected) +
+                ", tolerance=" + std::to_string(pts_tolerance_ns)).c_str());
     }
     require(GST_BUFFER_DURATION(buffer) != GST_CLOCK_TIME_NONE &&
             GST_BUFFER_DURATION(buffer) > 0, "output duration missing");
@@ -185,10 +192,10 @@ static double run_startup(const std::string& description, const char* input,
 
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
-    if (argc < 5 || argc > 10)
+    if (argc < 5 || argc > 11)
         throw std::runtime_error("d3d11_plugin_bench input mode frames.csv loops "
                                  "[warmup=30] [frames-per-loop=180] [seeks=4] [startups=3] "
-                                 "[minimum-seconds=0]");
+                                 "[minimum-seconds=0] [pts-tolerance-ns=0]");
     const std::string mode = argv[2];
     const int loops = std::stoi(argv[4]);
     const int warmup = argc > 5 ? std::stoi(argv[5]) : 30;
@@ -196,6 +203,7 @@ int main(int argc, char** argv) try {
     const int seek_count = argc > 7 ? std::stoi(argv[7]) : 4;
     const int startup_count = argc > 8 ? std::stoi(argv[8]) : 3;
     const int minimum_seconds = argc > 9 ? std::stoi(argv[9]) : 0;
+    const auto pts_tolerance_ns = argc > 10 ? std::stoull(argv[10]) : 0;
     require(loops > 0 && warmup >= 0 && frames_per_loop > warmup &&
             seek_count >= 0 && startup_count >= 0 && minimum_seconds >= 0,
             "invalid numeric argument");
@@ -231,7 +239,8 @@ int main(int argc, char** argv) try {
         for (int frame = 0; frame < frames_per_loop; ++frame) {
             auto* sample = pipeline.pull();
             const auto delivered = Clock::now();
-            contract = verify_sample(sample, mode, static_cast<std::uint64_t>(frame));
+            contract = verify_sample(sample, mode, static_cast<std::uint64_t>(frame),
+                                     pts_tolerance_ns);
             const double interval = milliseconds(previous, delivered);
             previous = delivered;
             if (!total_frames) first_buffer_ms = milliseconds(process_begin, delivered);
@@ -257,7 +266,7 @@ int main(int argc, char** argv) try {
         const auto begin = Clock::now();
         pipeline.seek(target);
         auto* sample = pipeline.pull();
-        verify_sample(sample, mode, frame);
+        verify_sample(sample, mode, frame, pts_tolerance_ns);
         seek_times.push_back(milliseconds(begin, Clock::now()));
         gst_sample_unref(sample);
     }
@@ -289,6 +298,7 @@ int main(int argc, char** argv) try {
               << ",\"minimum_seconds\":" << minimum_seconds
               << ",\"frames\":" << total_frames
               << ",\"warmup_per_loop\":" << warmup
+              << ",\"pts_tolerance_ns\":" << pts_tolerance_ns
               << ",\"gpu_completion_wait\":" << gpu_completion_wait
               << ",\"pipeline_create_ms\":" << milliseconds(create_begin, create_end)
               << ",\"state_change_submit_ms\":" << milliseconds(create_end, play_end)

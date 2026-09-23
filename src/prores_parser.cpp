@@ -141,7 +141,12 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
     std::uint32_t code = 0;
     if (!decode_codeword(bits, 0xb8, code))
         return fail(error, "truncated first DC coefficient");
+    if (code > 65535)
+        return fail(error, "first DC coefficient exceeds signed 16-bit range");
     std::int32_t previous_dc = to_signed(code);
+    if (previous_dc < std::numeric_limits<std::int16_t>::min() ||
+        previous_dc > std::numeric_limits<std::int16_t>::max())
+        return fail(error, "first DC coefficient exceeds signed 16-bit range");
     output[0] = previous_dc;
 
     code = 5;
@@ -149,12 +154,18 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
     for (std::uint32_t block = 1; block < block_count; ++block) {
         if (!decode_codeword(bits, kDcCodebook[std::min<std::uint32_t>(code, 6)], code))
             return fail(error, "truncated DC coefficient");
+        // Even the largest difference between two valid int16 DC values is
+        // 65535.  Reject a larger code before converting it to signed int.
+        if (code > 131071)
+            return fail(error, "DC coefficient code exceeds signed 16-bit range");
         if (code) sign ^= -static_cast<std::int32_t>(code & 1);
         else sign = 0;
-        previous_dc += (static_cast<std::int32_t>((code + 1) >> 1) ^ sign) - sign;
-        if (previous_dc < std::numeric_limits<std::int16_t>::min() ||
-            previous_dc > std::numeric_limits<std::int16_t>::max())
+        const auto delta = (static_cast<std::int32_t>((code + 1) >> 1) ^ sign) - sign;
+        const auto next_dc = static_cast<std::int64_t>(previous_dc) + delta;
+        if (next_dc < std::numeric_limits<std::int16_t>::min() ||
+            next_dc > std::numeric_limits<std::int16_t>::max())
             return fail(error, "DC coefficient exceeds signed 16-bit range");
+        previous_dc = static_cast<std::int32_t>(next_dc);
         output[block * 64] = previous_dc;
     }
 
@@ -175,6 +186,8 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
         position += run + 1;
         if (!decode_codeword(bits, kLevelCodebook[std::min<std::uint32_t>(level, 9)], level))
             return fail(error, "truncated AC level");
+        if (level >= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()))
+            return fail(error, "AC coefficient exceeds signed 32-bit range");
         ++level;
         std::uint32_t negative = 0;
         if (!bits.get(1, negative)) return fail(error, "truncated AC sign");

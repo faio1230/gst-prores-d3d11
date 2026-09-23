@@ -84,7 +84,7 @@ if(BUILD_GSTREAMER_PLUGIN)
     target_compile_options(gstproresd3d11 PRIVATE /W4 /utf-8)
   endif()
 
-  add_executable(d3d11_plugin_smoke tests/d3d11_plugin_smoke.cpp)
+  add_executable(d3d11_plugin_smoke tests/d3d11_plugin_smoke.cpp src/prores_parser.cpp)
   target_include_directories(d3d11_plugin_smoke PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
     "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"

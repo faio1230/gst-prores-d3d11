@@ -172,12 +172,25 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     reader.failed = 0;
 
     uint code = decode_codeword(reader, 0xb8);
+    if (code > 65535u || reader.failed) {
+        errors[job_index] = 2;
+        return;
+    }
     int previous_dc = to_signed(code);
+    if (previous_dc < -32768 || previous_dc > 32767) reader.failed = 1;
+    if (reader.failed) {
+        errors[job_index] = 2;
+        return;
+    }
     coefficients[job.output_offset] = previous_dc;
     code = 5;
     int sign = 0;
     [loop] for (uint block = 1; block < job.block_count; ++block) {
         code = decode_codeword(reader, dc_codebook[min(code, 6)]);
+        if (code > 131071u || reader.failed) {
+            reader.failed = 1;
+            break;
+        }
         if (code != 0) sign ^= -int(code & 1);
         else sign = 0;
         previous_dc += (int((code + 1) >> 1) ^ sign) - sign;
@@ -200,7 +213,12 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
             break;
         }
         position += run + 1;
-        level = decode_codeword(reader, level_codebook[min(level, 9)]) + 1;
+        uint decoded_level = decode_codeword(reader, level_codebook[min(level, 9)]);
+        if (decoded_level >= 0x7fffffffu || reader.failed) {
+            reader.failed = 1;
+            break;
+        }
+        level = decoded_level + 1;
         uint negative = get_bits(reader, 1);
         uint block = position & block_mask;
         uint scan_index = position >> log2_block_count;

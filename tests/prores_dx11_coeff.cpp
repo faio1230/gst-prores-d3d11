@@ -324,6 +324,27 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
     return rejected;
 }
 
+std::size_t verify_entropy_rejections(const Packet& packet, const prores::Frame& parsed) {
+    const auto& luma = parsed.slices.front().planes[0];
+    if (luma.size < 4 || luma.offset > packet.bytes.size() - 4)
+        throw std::runtime_error("first luma slice is too short for mutation");
+    auto mutation = packet.bytes;
+    const std::uint8_t oversized_dc[] = {0x00, 0x1f, 0xff, 0xf0};
+    std::copy_n(oversized_dc, sizeof(oversized_dc), mutation.begin() + luma.offset);
+    prores::Frame reparsed;
+    std::string error;
+    if (!prores::parse_frame(mutation.data(), mutation.size(), parsed.width,
+                             parsed.height, reparsed, error))
+        throw std::runtime_error("entropy mutation failed structural parse: " + error);
+    std::vector<prores::CoefficientJob> jobs;
+    std::vector<std::int32_t> coefficients;
+    if (prores::make_coefficient_reference(mutation.data(), mutation.size(),
+                                           reparsed, jobs, coefficients, error) ||
+        error.find("first DC coefficient") == std::string::npos)
+        throw std::runtime_error("oversized first DC was not rejected by CPU reference");
+    return 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
@@ -342,6 +363,7 @@ int main(int argc, char** argv) try {
                                             frame, jobs, reference, parse_error))
         throw std::runtime_error("CPU coefficients: " + parse_error);
     const auto malformed_rejections = verify_parser_rejections(packet, frame);
+    const auto entropy_rejections = verify_entropy_rejections(packet, frame);
     std::vector<prores::IdctBlockJob> idct_jobs;
     prores::make_idct_jobs(frame, jobs, idct_jobs);
     if (idct_jobs.empty()) throw std::runtime_error("IDCT jobs missing");
@@ -600,7 +622,7 @@ int main(int argc, char** argv) try {
     // boundary; coefficients themselves remain bit exact.
     constexpr std::uint32_t pixel_tolerance = 1;
     const bool passed = coefficients_passed && maximum_pixel_difference <= pixel_tolerance &&
-                        malformed_rejections == 12 &&
+                        malformed_rejections == 12 && entropy_rejections == 1 &&
                         (!external_compared || external_difference.maximum <= pixel_tolerance);
     std::cout << "{\"passed\":" << (passed ? "true" : "false")
               << ",\"adapter\":\"" << adapter_name << "\""
@@ -621,6 +643,7 @@ int main(int argc, char** argv) try {
               << ",\"pixel_tolerance\":" << pixel_tolerance
               << ",\"tolerance_basis\":\"floating-point separable IDCT versus FFmpeg integer IDCT final rounding\""
               << ",\"malformed_cases_rejected\":" << malformed_rejections
+              << ",\"entropy_cases_rejected\":" << entropy_rejections
               << ",\"pixel_differences\":[";
     for (unsigned component = 0; component < 3; ++component) {
         if (component) std::cout << ',';

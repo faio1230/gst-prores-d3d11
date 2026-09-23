@@ -1,5 +1,6 @@
 // 純粋DX11 GStreamer要素のD3D11Memory、時刻、seek、寿命、失敗入力を検証する。
 #include "d3d11_hardware_device.hpp"
+#include "prores_parser.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/d3d11/gstd3d11device.h>
@@ -275,11 +276,30 @@ static void injected_error(GstSample* compressed, const char* test) {
         byte |= 4;
         gst_buffer_fill(input, 20, &byte, 1);
     }
+    if (std::string(test) == "oversized-first-dc") {
+        GstMapInfo mapped{};
+        require(gst_buffer_map(input, &mapped, GST_MAP_READ), "cannot map entropy mutation input");
+        prores::Frame parsed;
+        std::string parse_error;
+        const bool valid = prores::parse_frame(mapped.data, mapped.size, 0, 0,
+                                                parsed, parse_error);
+        gst_buffer_unmap(input, &mapped);
+        require(valid && !parsed.slices.empty() && parsed.slices[0].planes[0].size >= 4,
+                "entropy mutation fixture has no first luma plane");
+        const guint8 oversized_dc[] = {0x00, 0x1f, 0xff, 0xf0};
+        require(gst_buffer_fill(input, parsed.slices[0].planes[0].offset,
+                                oversized_dc, sizeof(oversized_dc)) == sizeof(oversized_dc),
+                "cannot write oversized first DC code");
+    }
     pipeline.state(GST_STATE_PLAYING);
     gst_app_src_push_buffer(GST_APP_SRC(source), input);
     gst_app_src_end_of_stream(GST_APP_SRC(source));
     gst_object_unref(source);
-    pipeline.expect_error();
+    if (std::string(test) == "oversized-first-dc")
+        pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE,
+                              "GPU entropy decoder rejected job");
+    else
+        pipeline.expect_error();
 }
 
 static void reject_software_device(GstSample* compressed) {
@@ -702,7 +722,8 @@ int main(int argc, char** argv) try {
         gst_sample_unref(uhd);
     }
     for (const char* test : {"bad-signature", "alpha-hidden-in-caps",
-                             "interlaced-hidden-in-caps", "4444-caps"})
+                             "interlaced-hidden-in-caps", "4444-caps",
+                             "oversized-first-dc"})
         injected_error(compressed, test);
     gst_sample_unref(compressed);
 
@@ -731,7 +752,7 @@ int main(int argc, char** argv) try {
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
                  "\"software_adapter_decoder_rejected\":true,"
-                 "\"software_adapter_rgb_rejected\":true,\"error_cases\":11,"
+                 "\"software_adapter_rgb_rejected\":true,\"error_cases\":12,"
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;

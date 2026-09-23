@@ -57,6 +57,7 @@ parserとVLD shaderのFFmpeg由来部分はSPDXでLGPL-2.1-or-laterを明記し�
 | WARP製I422 D3D11Memoryを専用RGB要素へ直接入力 | RGB出力前に`RESOURCE/FAILED`、追加GPU出力なし |
 | BT.601出力をBT.709専用`proresd3d11rgb`へ入力 | サイレント変換せずエラー終了 |
 | 破損signature、隠れたalpha/interlace、4444 caps、存在しないadapter/file | 全てエラー終了 |
+| 構造は正常だが先頭DCが16bit範囲外のProRes frame | GPU VLDエラーフラグで`STREAM/DECODE`、画像を出さず停止。CPU参照も拒否 |
 | 定常D3D11Memory供給、6周×3試行中央値 | 1080p 293.8 fps、4K 133.1 fps |
 | 検査用downloadでGPU完了を含む定常値 | 1080p 255.7 fps、4K 102.2 fps、p99 4.49/11.63 ms |
 | 4K長時間、GPU完了込み | 30分、182,520フレーム、p99 11.42 ms、エラーなし |
