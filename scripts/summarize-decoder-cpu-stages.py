@@ -65,6 +65,10 @@ def main():
         row.update(seq=int(fields["seq"]), pts_ns=int(fields["pts_ns"]))
         if "copy_ready_wait_ms" in fields:
             row["copy_ready_wait_ms"] = float(fields["copy_ready_wait_ms"])
+        if "retire_wait_ms" in fields:
+            row["retire_wait_ms"] = float(fields["retire_wait_ms"])
+        if "retire_map_attempts" in fields:
+            row["retire_map_attempts"] = int(fields["retire_map_attempts"])
         if "map_attempts" in fields:
             row["map_attempts"] = int(fields["map_attempts"])
         for optional in ("idct_layout_rebuilt", "idct_quant_slices_changed", "idct_gpu_upload"):
@@ -125,6 +129,13 @@ def main():
     if copy_ready_count:
         summary["field_ms"]["copy_ready_wait_ms"] = distribution(
             rows, "copy_ready_wait_ms")
+    retire_count = sum("retire_wait_ms" in row for row in rows)
+    if retire_count not in (0, expected):
+        raise ValueError("非同期VLD回収待ちのCPU記録が一部フレームで欠けています")
+    if retire_count:
+        summary["field_ms"]["retire_wait_ms"] = distribution(rows, "retire_wait_ms")
+        summary["retire_map_attempts"] = sum(row.get("retire_map_attempts", 0)
+                                              for row in rows)
     if all("idct_gpu_upload" in row for row in rows):
         summary["idct_cache"] = {
             "layout_rebuild_frames": sum(row["idct_layout_rebuilt"] for row in rows),

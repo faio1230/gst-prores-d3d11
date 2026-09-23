@@ -20,9 +20,11 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -146,6 +148,8 @@ struct CpuDecodeTiming {
     double copy_ready_wait_ms = 0;
     double vld_map_ms = 0;
     std::uint64_t map_attempts = 0;
+    double retire_wait_ms = 0;
+    std::uint64_t retire_map_attempts = 0;
     double idct_submit_ms = 0;
 };
 
@@ -232,7 +236,15 @@ public:
 
     std::optional<GpuStageTiming> decode(const std::uint8_t* packet, std::size_t packet_size,
                                          const prores::Frame& parsed, GstBuffer* output,
+                                         GstClockTime pts,
                                          CpuDecodeTiming* cpu_timing = nullptr) {
+        if (pending_errors_.size() >= kErrorRingSize) {
+            const auto retire_start = std::chrono::steady_clock::now();
+            retire_one(cpu_timing);
+            if (cpu_timing)
+                cpu_timing->retire_wait_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - retire_start).count();
+        }
         auto phase_start = std::chrono::steady_clock::time_point{};
         if (cpu_timing) phase_start = std::chrono::steady_clock::now();
         const auto mark = [&](double CpuDecodeTiming::*field) {
@@ -298,7 +310,7 @@ public:
         }
         mark(&CpuDecodeTiming::output_uav_ms);
 
-        DeviceLock lock(gst_device_);
+        std::optional<DeviceLock> lock(std::in_place, gst_device_);
         mark(&CpuDecodeTiming::device_lock_ms);
         D3D11_MAPPED_SUBRESOURCE mapped_packet{};
         check_hr(context_->Map(cache_.packet.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_packet),
@@ -348,42 +360,7 @@ public:
         ID3D11ShaderResourceView* null_vld_srvs[] = {nullptr, nullptr};
         context_->CSSetUnorderedAccessViews(0, 2, null_vld_uavs, nullptr);
         context_->CSSetShaderResources(0, 2, null_vld_srvs);
-        if (timing_) context_->End(timing_->copy_begin.Get());
-        context_->CopyResource(cache_.error_staging.Get(), cache_.errors.Get());
-        if (timing_) context_->End(timing_->copy_end.Get());
         mark(&CpuDecodeTiming::vld_submit_ms);
-        // 診断時だけGPU copy完了とCPU Map可能時点を分ける。
-        // GetDataの待機自体が位相を変えるため、通常QoSへ外挿しない。
-        if (timing_ && cpu_timing) {
-            UINT64 copy_end = 0;
-            wait_for_query(timing_->copy_end.Get(), copy_end);
-            mark(&CpuDecodeTiming::copy_ready_wait_ms);
-        }
-        D3D11_MAPPED_SUBRESOURCE mapped_errors{};
-        const auto map_result = prores::bounded_staging_map(
-            [&] {
-                if (cpu_timing) ++cpu_timing->map_attempts;
-                return context_->Map(cache_.error_staging.Get(), 0, D3D11_MAP_READ,
-                                     D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped_errors);
-            },
-            [&] { return device_->GetDeviceRemovedReason(); },
-            [] { return std::chrono::steady_clock::now(); },
-            [] { std::this_thread::yield(); },
-            std::chrono::seconds(10));
-        if (map_result.timed_out)
-            throw std::runtime_error("VLD error readback exceeded 10 seconds");
-        check_hr(map_result.result, "Map VLD error flags");
-        const auto* errors = static_cast<const std::uint32_t*>(mapped_errors.pData);
-        std::size_t failed_job = coefficient_jobs.size();
-        for (std::size_t i = 0; i < coefficient_jobs.size(); ++i) {
-            if (errors[i]) { failed_job = i; break; }
-        }
-        context_->Unmap(cache_.error_staging.Get(), 0);
-        if (failed_job != coefficient_jobs.size()) {
-            if (timing_) context_->End(timing_->disjoint.Get());
-            throw std::runtime_error("GPU entropy decoder rejected job " + std::to_string(failed_job));
-        }
-        mark(&CpuDecodeTiming::vld_map_ms);
 
         ID3D11ShaderResourceView* idct_srvs[] = {
             cache_.coefficient_srv.Get(), cache_.idct_job_srv.Get(), cache_.quant_srv.Get()};
@@ -396,15 +373,19 @@ public:
         context_->CSSetConstantBuffers(0, 1, idct_constants);
         if (timing_) context_->End(timing_->idct_begin.Get());
         context_->Dispatch(static_cast<UINT>(idct_jobs.size()), 1, 1);
-        if (timing_) {
-            context_->End(timing_->idct_end.Get());
-            context_->End(timing_->disjoint.Get());
-        }
+        if (timing_) context_->End(timing_->idct_end.Get());
         ID3D11UnorderedAccessView* null_idct_uavs[] = {nullptr, nullptr, nullptr};
         ID3D11ShaderResourceView* null_idct_srvs[] = {nullptr, nullptr, nullptr};
         context_->CSSetUnorderedAccessViews(0, 3, null_idct_uavs, nullptr);
         context_->CSSetShaderResources(0, 3, null_idct_srvs);
         context_->CSSetShader(nullptr, nullptr, 0);
+        const auto staging = cache_.error_staging[next_staging_index_];
+        if (timing_) context_->End(timing_->copy_begin.Get());
+        context_->CopyResource(staging.Get(), cache_.errors.Get());
+        if (timing_) {
+            context_->End(timing_->copy_end.Get());
+            context_->End(timing_->disjoint.Get());
+        }
         // The pool can recycle these memory objects.  A direct UAV write does
         // not pass through GstD3D11Memory's map path, so invalidate its cached
         // staging copy explicitly before any downstream CPU mapping.
@@ -413,19 +394,97 @@ public:
             GST_MEMORY_FLAG_UNSET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
             GST_MINI_OBJECT_FLAG_SET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
         }
+        pending_errors_.push_back({staging, static_cast<UINT>(coefficient_jobs.size()),
+                                   frame_sequence_++, pts});
+        next_staging_index_ = (next_staging_index_ + 1) % kErrorRingSize;
         mark(&CpuDecodeTiming::idct_submit_ms);
+        lock.reset();
         if (timing_) return collect_timing();
         return std::nullopt;
     }
 
+    void drain_errors() {
+        while (!pending_errors_.empty()) retire_one(nullptr);
+    }
+
+    void discard_errors() {
+        // flushing seekでは旧segmentの検査結果を新segmentへ持ち込まない。
+        // GPU命令は同じimmediate context上で順序付きなので再利用先のcopyより先に完了する。
+        if (!pending_errors_.empty()) {
+            DeviceLock lock(gst_device_);
+            context_->Flush();
+        }
+        pending_errors_.clear();
+        next_staging_index_ = 0;
+    }
+
 private:
+    static constexpr std::size_t kErrorRingSize = 3;
+
+    struct PendingError {
+        ComPtr<ID3D11Buffer> staging;
+        UINT job_count;
+        std::uint64_t frame_sequence;
+        GstClockTime pts;
+    };
+
+    void retire_one(CpuDecodeTiming* cpu_timing) {
+        if (pending_errors_.empty()) return;
+        const auto pending = pending_errors_.front();
+        {
+            DeviceLock lock(gst_device_);
+            context_->Flush();
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::size_t failed_job = pending.job_count;
+        for (;;) {
+            HRESULT result;
+            {
+                DeviceLock lock(gst_device_);
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                result = context_->Map(pending.staging.Get(), 0, D3D11_MAP_READ,
+                                       D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+                if (cpu_timing) ++cpu_timing->retire_map_attempts;
+                if (result == S_OK) {
+                    const auto* errors = static_cast<const std::uint32_t*>(mapped.pData);
+                    for (std::size_t i = 0; i < pending.job_count; ++i) {
+                        if (errors[i]) { failed_job = i; break; }
+                    }
+                    context_->Unmap(pending.staging.Get(), 0);
+                }
+            }
+            if (result == S_OK) break;
+            if (result != DXGI_ERROR_WAS_STILL_DRAWING)
+                check_hr(result, "Map delayed VLD error flags");
+            check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed while retiring VLD errors");
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error("delayed VLD error readback exceeded 10 seconds");
+            std::this_thread::yield();
+        }
+        pending_errors_.pop_front();
+        if (failed_job != pending.job_count)
+            throw std::runtime_error("GPU entropy decoder rejected job " +
+                std::to_string(failed_job) + " frame=" +
+                std::to_string(pending.frame_sequence) + " pts_ns=" +
+                std::to_string(pending.pts));
+    }
+
     template <typename T>
     void wait_for_query(ID3D11Query* query, T& data) {
+        {
+            DeviceLock lock(gst_device_);
+            context_->Flush();
+        }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         for (;;) {
-            const HRESULT result = context_->GetData(query, &data, sizeof(data), 0);
+            HRESULT result;
+            {
+                DeviceLock lock(gst_device_);
+                result = context_->GetData(query, &data, sizeof(data), 0);
+            }
             if (result == S_OK) return;
             check_hr(result, "Get GPU timing query");
+            check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed during GPU timing");
             if (std::chrono::steady_clock::now() >= deadline)
                 throw std::runtime_error("GPU timing query exceeded 10 seconds");
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -445,8 +504,8 @@ private:
         wait_for_query(timing_->copy_end.Get(), copy_end);
         wait_for_query(timing_->idct_begin.Get(), idct_begin);
         wait_for_query(timing_->idct_end.Get(), idct_end);
-        if (vld_begin > vld_end || vld_end > copy_begin || copy_begin > copy_end ||
-            copy_end > idct_begin || idct_begin > idct_end)
+        if (vld_begin > vld_end || vld_end > idct_begin || idct_begin > idct_end ||
+            idct_end > copy_begin || copy_begin > copy_end)
             throw std::runtime_error("GPU timestamp order is invalid");
         const double scale = 1000.0 / static_cast<double>(clock.Frequency);
         return {false, (vld_end - vld_begin) * scale, (idct_end - idct_begin) * scale,
@@ -464,7 +523,7 @@ private:
         ComPtr<ID3D11Buffer> coefficient_jobs;
         ComPtr<ID3D11Buffer> coefficients;
         ComPtr<ID3D11Buffer> errors;
-        ComPtr<ID3D11Buffer> error_staging;
+        std::array<ComPtr<ID3D11Buffer>, kErrorRingSize> error_staging;
         ComPtr<ID3D11Buffer> vld_parameters;
         ComPtr<ID3D11Buffer> idct_jobs;
         ComPtr<ID3D11Buffer> quant_matrices;
@@ -581,8 +640,9 @@ private:
             sizeof(std::int32_t), D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
         replacement.errors = structured_buffer(device_, coefficient_job_count,
             sizeof(std::uint32_t), D3D11_BIND_UNORDERED_ACCESS);
-        replacement.error_staging = structured_buffer(device_, coefficient_job_count,
-            sizeof(std::uint32_t), 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ);
+        for (auto& staging : replacement.error_staging)
+            staging = structured_buffer(device_, coefficient_job_count,
+                sizeof(std::uint32_t), 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ);
         replacement.vld_parameters = make_buffer(device_, sizeof(VldParameters),
                                                    D3D11_BIND_CONSTANT_BUFFER);
         replacement.idct_jobs = structured_buffer(device_, idct_job_count,
@@ -619,6 +679,7 @@ private:
                                                     &replacement.error_uav),
                  "Create VLD error UAV");
         cache_ = std::move(replacement);
+        next_staging_index_ = 0;
         return true;
     }
 
@@ -630,6 +691,9 @@ private:
     ComPtr<ID3D11ComputeShader> idct_;
     std::unique_ptr<GpuTimingQueries> timing_;
     Cache cache_;
+    std::deque<PendingError> pending_errors_;
+    std::size_t next_staging_index_ = 0;
+    std::uint64_t frame_sequence_ = 0;
     std::vector<prores::CoefficientJob> coefficient_jobs_;
     std::vector<prores::IdctBlockJob> idct_jobs_;
     std::vector<IdctLayoutSlice> idct_layout_;
@@ -721,6 +785,7 @@ static gboolean start(GstVideoDecoder* decoder) {
 
 static gboolean stop(GstVideoDecoder* decoder) {
     auto* self = SELF(decoder);
+    if (self->backend) self->backend->discard_errors();
     delete self->backend;
     self->backend = nullptr;
     clear_format(self);
@@ -873,6 +938,7 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
     try {
         const auto timing = self->backend->decode(input.data, input.size, parsed,
                                                   frame->output_buffer,
+                                                  GST_BUFFER_PTS(frame->input_buffer),
                                                   cpu_timing ? &decode_timing : nullptr);
         if (timing) {
             const auto pts = GST_BUFFER_PTS(frame->input_buffer);
@@ -917,6 +983,7 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
                         " upload_ms=%.6f vld_submit_ms=%.6f"
                         " copy_ready_wait_ms=%.6f vld_map_ms=%.6f"
                         " map_attempts=%" G_GUINT64_FORMAT " idct_submit_ms=%.6f"
+                        " retire_wait_ms=%.6f retire_map_attempts=%" G_GUINT64_FORMAT
                         " backend_ms=%.6f finish_ms=%.6f", sequence, pts,
                         parse_ms, negotiate_ms, allocate_ms,
                         decode_timing.coefficient_jobs_ms, decode_timing.idct_jobs_ms,
@@ -928,12 +995,37 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
                         decode_timing.vld_submit_ms, decode_timing.copy_ready_wait_ms,
                         decode_timing.vld_map_ms,
                         decode_timing.map_attempts, decode_timing.idct_submit_ms,
+                        decode_timing.retire_wait_ms, decode_timing.retire_map_attempts,
                         backend_ms, finish_ms);
     return flow;
 }
 
-static gboolean flush(GstVideoDecoder*) { return TRUE; }
-static GstFlowReturn finish(GstVideoDecoder*) { return GST_FLOW_OK; }
+static gboolean flush(GstVideoDecoder* decoder) {
+    auto* self = SELF(decoder);
+    if (self->backend) self->backend->discard_errors();
+    return TRUE;
+}
+
+static GstFlowReturn finish(GstVideoDecoder* decoder) {
+    auto* self = SELF(decoder);
+    if (self->failed || !self->backend) return GST_FLOW_ERROR;
+    try {
+        self->backend->drain_errors();
+        return GST_FLOW_OK;
+    } catch (const std::exception& error) {
+        self->failed = TRUE;
+        auto* native = self->device ? gst_d3d11_device_get_device_handle(self->device) : nullptr;
+        const HRESULT removed = native ? native->GetDeviceRemovedReason() : S_OK;
+        if (FAILED(removed))
+            GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("D3D11 device lost during ProRes drain"),
+                              ("reason=%lu; %s; no fallback was attempted",
+                               static_cast<unsigned long>(removed), error.what()));
+        else
+            GST_ELEMENT_ERROR(self, STREAM, DECODE, ("Native D3D11 ProRes decode failed"),
+                              ("%s; no fallback was attempted", error.what()));
+        return GST_FLOW_ERROR;
+    }
+}
 
 static gboolean sink_event(GstVideoDecoder* decoder, GstEvent* event) {
     auto* self = SELF(decoder);
@@ -992,6 +1084,7 @@ static void get_property(GObject* object, guint id, GValue* value, GParamSpec* s
 
 static void finalize(GObject* object) {
     auto* self = SELF(object);
+    if (self->backend) self->backend->discard_errors();
     delete self->backend;
     clear_format(self);
     if (self->device) gst_clear_object(&self->device);
