@@ -61,6 +61,8 @@ VLDを1-bit反復loadから32-bit windowへ変更する前の検査用download�
 
 D3D11下流検査ではdecoderの3面I422_10LEからd3d11convertのRGB10A2_LE、d3d11compositor出力まで `memory:D3D11Memory` を維持した。RGB10A2の全画素比較は実写1080p/4Kで行ったが、表示機器の色管理と素材のクロマ位置は未確定。compositor内部のrender/copy回数も未計測なので、この下流全体をゼロコピーとは呼ばない。保存ログは `results/proresd3d11-compositor-caps.log`。
 
+別途、`src/prores_rgb.hlsl` と `tests/d3d11_rgb_probe.cpp` でI422_10LE D3D11Memoryの3面からDX11 Compute ShaderでRGB10A2テクスチャへ変換した。公開実写の1080p全50枚／4K全129枚で独立BT.709式とのR/G/B最大差は各1 code。検証器はCPUへ読み戻して照合するが、通常のデコーダー経路には読み戻しを加えない。このRGBテクスチャはまだGStreamerのD3D11Memory bufferとして下流へ出していないため、標準 `d3d11convert` に代わる製品経路とはみなさない。詳細は `docs/実素材と表示検証.md`。
+
 ## 比較用Vulkan版：proresvkdec
 
 ## Vulkan版の構成

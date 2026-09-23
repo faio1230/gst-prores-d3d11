@@ -39,8 +39,9 @@ if(BUILD_GSTREAMER_PLUGIN)
   endif()
 
   add_library(gstproresd3d11 MODULE src/gstproresd3d11dec.cpp src/prores_parser.cpp
-    src/prores_vld.hlsl src/prores_idct.hlsl)
-  set_source_files_properties(src/prores_vld.hlsl src/prores_idct.hlsl PROPERTIES HEADER_FILE_ONLY TRUE)
+    src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl)
+  set_source_files_properties(src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl
+    PROPERTIES HEADER_FILE_ONLY TRUE)
   target_include_directories(gstproresd3d11 PRIVATE "${CMAKE_SOURCE_DIR}/src"
     "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
     "${GSTREAMER_ROOT}/lib/glib-2.0/include" "${GSTREAMER_ROOT}/lib/gstreamer-1.0/include")
@@ -66,12 +67,17 @@ if(BUILD_GSTREAMER_PLUGIN)
       /D PRORES_OUTPUT_UNORM=1
       /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_idct_unorm.cso"
       "${CMAKE_SOURCE_DIR}/src/prores_idct.hlsl"
+    COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
+      /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_rgb.cso"
+      "${CMAKE_SOURCE_DIR}/src/prores_rgb.hlsl"
     COMMENT "DX11 ProRes shaderをcs_5_0 bytecodeへコンパイル")
   add_custom_command(TARGET gstproresd3d11 POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
       "${CMAKE_SOURCE_DIR}/src/prores_vld.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_vld.hlsl"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
       "${CMAKE_SOURCE_DIR}/src/prores_idct.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_idct.hlsl"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/src/prores_rgb.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_rgb.hlsl"
     COMMENT "DX11 ProRes shaderをプラグイン出力先へ配置")
   if(MSVC)
     target_compile_options(gstproresd3d11 PRIVATE /W4 /utf-8)
@@ -88,6 +94,20 @@ if(BUILD_GSTREAMER_PLUGIN)
     GST_USE_UNSTABLE_API NOMINMAX WIN32_LEAN_AND_MEAN)
   if(MSVC)
     target_compile_options(d3d11_plugin_smoke PRIVATE /W4 /utf-8)
+  endif()
+
+  add_executable(d3d11_rgb_probe tests/d3d11_rgb_probe.cpp)
+  target_include_directories(d3d11_rgb_probe PRIVATE
+    "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
+    "${GSTREAMER_ROOT}/lib/glib-2.0/include" "${GSTREAMER_ROOT}/lib/gstreamer-1.0/include")
+  target_link_directories(d3d11_rgb_probe PRIVATE "${GSTREAMER_ROOT}/lib")
+  target_link_libraries(d3d11_rgb_probe PRIVATE gstd3d11-1.0 gstapp-1.0 gstvideo-1.0
+    gstbase-1.0 gstreamer-1.0 gobject-2.0 glib-2.0 d3d11)
+  target_compile_definitions(d3d11_rgb_probe PRIVATE
+    GST_USE_UNSTABLE_API NOMINMAX WIN32_LEAN_AND_MEAN)
+  add_dependencies(d3d11_rgb_probe gstproresd3d11)
+  if(MSVC)
+    target_compile_options(d3d11_rgb_probe PRIVATE /W4 /utf-8)
   endif()
 
   add_executable(d3d11_plugin_bench tests/d3d11_plugin_bench.cpp)

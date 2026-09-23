@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SDK = ROOT / 'tools/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1/bin'
 GST = Path('C:/Program Files/gstreamer/1.0/msvc_x86_64/bin')
 PLUGIN = ROOT / 'build/vs18/plugins/Release'
+RGB_PROBE = ROOT / 'build/vs18/Release/d3d11_rgb_probe.exe'
+RGB_SHADER = PLUGIN / 'prores_rgb.cso'
 RGB_COLORIMETRY = '1:1:5:1'  # full-range RGB, BT.709 transfer and primaries
 
 
@@ -53,7 +55,7 @@ def make_stat(name):
                 samples=0, squared_sum=0, frames_with_difference=0)
 
 
-def update(stat, left, right):
+def update(stat, left, right, count_frame=True):
     difference = left.astype(np.int32) - right.astype(np.int32)
     absolute = np.abs(difference)
     frame_max = int(absolute.max())
@@ -63,7 +65,8 @@ def update(stat, left, right):
     stat['different_samples'] += int(np.count_nonzero(difference))
     stat['samples'] += difference.size
     stat['squared_sum'] += int(np.square(difference.astype(np.int64)).sum(dtype=np.int64))
-    stat['frames_with_difference'] += int(frame_max != 0)
+    if count_frame:
+        stat['frames_with_difference'] += int(frame_max != 0)
     return frame_max
 
 
@@ -115,17 +118,70 @@ def compare(left_path, right_path, width, height, mode, expected_frames):
     return dict(frames=frames, channels=stats, per_frame_maxima=frame_maxima)
 
 
+def compare_formula(yuv_path, rgb_path, width, height, expected_frames):
+    """実際のDX11 I422 codeに独立BT.709式を適用しGPU RGBと照合する。"""
+    pixels = width * height
+    frame_bytes = pixels * 4
+    if (yuv_path.stat().st_size != expected_frames * frame_bytes or
+            rgb_path.stat().st_size != expected_frames * frame_bytes):
+        raise ValueError('BT.709数式比較のrawサイズ・フレーム数が一致しない')
+    stats = [make_stat(name) for name in 'RGBA']
+    frame_maxima = []
+    x = np.arange(width, dtype=np.float32)
+    location = (x - .5) * .5
+    base = np.floor(location).astype(np.int32)
+    low = np.clip(base, 0, width // 2 - 1)
+    high = np.clip(base + 1, 0, width // 2 - 1)
+    fraction = (location - np.floor(location)).astype(np.float32)
+    with yuv_path.open('rb') as yuv_file, rgb_path.open('rb') as rgb_file:
+        for _ in range(expected_frames):
+            raw = np.frombuffer(yuv_file.read(frame_bytes), dtype='<u2')
+            packed = np.frombuffer(rgb_file.read(frame_bytes), dtype='<u4').reshape(height, width)
+            y = raw[:pixels].reshape(height, width)
+            u = raw[pixels:pixels + pixels // 2].reshape(height, width // 2)
+            v = raw[pixels + pixels // 2:].reshape(height, width // 2)
+            maxima = [0, 0, 0, 0]
+            for row in range(0, height, 64):
+                rows = slice(row, min(row + 64, height))
+                yy = (y[rows].astype(np.float32) - 64.0) / 876.0
+                cb = (u[rows][:, low].astype(np.float32) * (1.0 - fraction) +
+                      u[rows][:, high].astype(np.float32) * fraction - 512.0) / 896.0
+                cr = (v[rows][:, low].astype(np.float32) * (1.0 - fraction) +
+                      v[rows][:, high].astype(np.float32) * fraction - 512.0) / 896.0
+                expected = (yy + 1.5748 * cr,
+                            yy - 0.187324 * cb - 0.468124 * cr,
+                            yy + 1.8556 * cb)
+                for index, (stat, predicted) in enumerate(zip(stats, expected)):
+                    reference = np.rint(np.clip(predicted * 1023.0, 0, 1023)).astype(np.int32)
+                    actual = (packed[rows] >> (index * 10)) & 1023
+                    maxima[index] = max(maxima[index],
+                                        update(stat, reference, actual, count_frame=False))
+                maxima[3] = max(maxima[3], update(stats[3],
+                    np.full(packed[rows].shape, 3, dtype=np.int32),
+                    (packed[rows] >> 30) & 3, count_frame=False))
+            for stat, maximum in zip(stats, maxima):
+                stat['frames_with_difference'] += int(maximum != 0)
+            frame_maxima.append(maxima)
+    for stat in stats:
+        stat['mae'] = stat['absolute_sum'] / stat['samples']
+        stat['bias'] = stat['signed_sum'] / stat['samples']
+        mse = stat['squared_sum'] / stat['samples']
+        stat['psnr_db'] = (10 * math.log10((3 if stat['channel'] == 'A' else 1023) ** 2 / mse)
+                           if mse else None)
+    return dict(frames=expected_frames, channels=stats, per_frame_maxima=frame_maxima)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input', type=Path)
-    parser.add_argument('--mode', choices=('yuv', 'rgb'), required=True)
+    parser.add_argument('--mode', choices=('yuv', 'rgb', 'rgb_native', 'rgb_formula'), required=True)
     parser.add_argument('--frames', type=int, help='先頭Nフレーム。省略時は全フレーム')
     parser.add_argument('--diagnostic-dir', type=Path,
                         help='RGB先頭1フレームのI422・CPU RGB・GPU RGB rawを保存')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
-    if args.diagnostic_dir and (args.mode != 'rgb' or args.frames != 1):
-        parser.error('--diagnostic-dir は --mode rgb --frames 1 と併用する')
+    if args.diagnostic_dir and (args.mode not in ('rgb', 'rgb_native') or args.frames != 1):
+        parser.error('--diagnostic-dir は --mode rgb/rgb_native --frames 1 と併用する')
     source = args.input.resolve()
     probe = json.loads(subprocess.check_output([
         str(SDK / 'ffprobe.exe'), '-v', 'error', '-select_streams', 'v:0',
@@ -162,10 +218,14 @@ def main():
             execute(command, args.out.with_suffix('.dx11.log'), env)
             runs.append([str(item) for item in command])
         else:
-            command = gst_command(source, left, 'rgb_cpu', args.frames)
+            command = gst_command(source, left,
+                                  'yuv' if args.mode == 'rgb_formula' else 'rgb_cpu', args.frames)
             execute(command, args.out.with_suffix('.cpu.log'), env)
             runs.append([str(item) for item in command])
-            command = gst_command(source, right, 'rgb_gpu', args.frames)
+            command = ([RGB_PROBE, source, right, RGB_SHADER,
+                        str(expected_frames if args.frames else 0)]
+                       if args.mode in ('rgb_native', 'rgb_formula')
+                       else gst_command(source, right, 'rgb_gpu', args.frames))
             execute(command, args.out.with_suffix('.dx11.log'), env)
             runs.append([str(item) for item in command])
             if args.diagnostic_dir:
@@ -177,20 +237,25 @@ def main():
                 for name, path in (('dx11-i422.raw', yuv), ('cpu-rgb10a2.raw', left),
                                    ('gpu-rgb10a2.raw', right)):
                     shutil.copyfile(path, args.diagnostic_dir / name)
-        result = compare(left, right, width, height, args.mode, expected_frames)
+        result = (compare_formula(left, right, width, height, expected_frames)
+                  if args.mode == 'rgb_formula'
+                  else compare(left, right, width, height,
+                               'yuv' if args.mode == 'yuv' else 'rgb', expected_frames))
     with source.open('rb') as stream:
         source_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
     result.update(input=str(source), source_sha256=source_sha256,
                   mode=args.mode, reference=('fixed FFmpeg 8.1 CPU yuv422p10le' if args.mode == 'yuv'
+                                            else 'same DX11 I422 + independent BT.709 limited-to-full centered chroma formula'
+                                            if args.mode == 'rgb_formula'
                                             else 'D3D11 decoded I422 + CPU videoconvert BT.709, centered 4:2:2 chroma'),
                   probe=probe, commands=runs)
     result['passed'] = (all(channel['max_abs'] <= 1 for channel in result['channels'])
-                        if args.mode == 'yuv' else None)
+                        if args.mode in ('yuv', 'rgb_formula') else None)
     args.out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps({'frames': result['frames'], 'channels': result['channels']},
                      ensure_ascii=False, indent=2))
     if result['passed'] is False:
-        raise SystemExit('YUV全フレーム比較で最大許容差1を超過')
+        raise SystemExit('全フレーム比較で最大許容差1を超過')
 
 
 if __name__ == '__main__':

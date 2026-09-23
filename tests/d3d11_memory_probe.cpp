@@ -52,6 +52,10 @@ int main(int argc, char** argv) try {
             "cannot acquire D3D11 buffer");
 
     auto* handle = gst_d3d11_device_get_device_handle(device);
+    UINT rgb_support = 0;
+    require(SUCCEEDED(handle->CheckFormatSupport(DXGI_FORMAT_R10G10B10A2_UNORM, &rgb_support)),
+            "RGB10A2 DXGI format query failed");
+    const bool rgb_typed_uav = (rgb_support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) != 0;
     const auto memories = gst_buffer_n_memory(buffer);
     require(memories == 3, "I422_10LE must allocate exactly three D3D11 memories");
     bool all_uav = true;
@@ -79,7 +83,8 @@ int main(int argc, char** argv) try {
                   << ",\"bind_flags\":" << desc.BindFlags
                   << ",\"uav_create\":" << (SUCCEEDED(result) ? "true" : "false") << '}';
     }
-    std::cout << "],\"all_planes_uav\":" << (all_uav ? "true" : "false") << "}\n";
+    std::cout << "],\"all_planes_uav\":" << (all_uav ? "true" : "false")
+              << ",\"rgb10a2_typed_uav\":" << (rgb_typed_uav ? "true" : "false") << "}\n";
     require(all_uav, "one or more output planes cannot be bound as UAV");
 
     gst_buffer_unref(buffer);

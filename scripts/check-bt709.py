@@ -24,8 +24,9 @@ def main():
         else:
             x = np.arange(width, dtype=np.float32)
             location = (x - .5) / 2 if sampling == 'centered' else x / 2
-            low = np.clip(np.floor(location).astype(np.int32), 0, width // 2 - 1)
-            high = np.clip(low + 1, 0, width // 2 - 1)
+            base = np.floor(location).astype(np.int32)
+            low = np.clip(base, 0, width // 2 - 1)
+            high = np.clip(base + 1, 0, width // 2 - 1)
             fraction = np.clip(location - np.floor(location), 0, 1)
             cb = u[:, low] * (1 - fraction) + u[:, high] * fraction
             cr = v[:, low] * (1 - fraction) + v[:, high] * fraction
