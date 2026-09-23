@@ -23,6 +23,7 @@ filesrc → qtdemux → proresd3d11dec → video/x-raw(memory:D3D11Memory)
 . ./scripts/use-d3d11-plugin.ps1
 gst-inspect-1.0 proresd3d11dec
 gst-launch-1.0 -e filesrc location=media/synthetic-1080p60-hq.mov ! qtdemux ! proresd3d11dec ! fakesink sync=false
+gst-launch-1.0 -e filesrc location=media/reference-proton-rec709-hq.mov ! qtdemux ! proresd3d11dec ! proresd3d11rgb ! d3d11videosink sync=true
 ./scripts/test-dx11.ps1
 ./scripts/test-d3d11-plugin.ps1
 ```
@@ -61,7 +62,7 @@ VLDを1-bit反復loadから32-bit windowへ変更する前の検査用download�
 
 D3D11下流検査ではdecoderの3面I422_10LEからd3d11convertのRGB10A2_LE、d3d11compositor出力まで `memory:D3D11Memory` を維持した。RGB10A2の全画素比較は実写1080p/4Kで行ったが、表示機器の色管理と素材のクロマ位置は未確定。compositor内部のrender/copy回数も未計測なので、この下流全体をゼロコピーとは呼ばない。保存ログは `results/proresd3d11-compositor-caps.log`。
 
-別途、`src/prores_rgb.hlsl` と `tests/d3d11_rgb_probe.cpp` でI422_10LE D3D11Memoryの3面からDX11 Compute ShaderでRGB10A2テクスチャへ変換した。公開実写の1080p全50枚／4K全129枚で独立BT.709式とのR/G/B最大差は各1 code。検証器はCPUへ読み戻して照合するが、通常のデコーダー経路には読み戻しを加えない。このRGBテクスチャはまだGStreamerのD3D11Memory bufferとして下流へ出していないため、標準 `d3d11convert` に代わる製品経路とはみなさない。詳細は `docs/実素材と表示検証.md`。
+`src/prores_rgb.hlsl` を `proresd3d11rgb` 要素へ統合し、I422_10LE D3D11Memoryの3面から1面RGB10A2_LE D3D11MemoryへCompute Shaderで直接書く。CPU読み戻しは検査経路だけで、通常経路にはない。入力はprogressive・limited BT.709、中央または未指定のクロマ位置に限定し、未指定は中央として扱う。公開実写1080p全50枚／4K全129枚の全画素で独立BT.709式とのR/G/B最大差は各1 code。EOS、seek、停止・破棄後のbuffer寿命も検査した。ただしクロマ位置の物理的正しさ、表示機器の色管理、他GPUのtyped UAV対応までは証明しない。詳細は `docs/実素材と表示検証.md`。
 
 ## 比較用Vulkan版：proresvkdec
 

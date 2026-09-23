@@ -38,7 +38,8 @@ if(BUILD_GSTREAMER_PLUGIN)
     target_compile_options(plugin_smoke PRIVATE /W4 /utf-8)
   endif()
 
-  add_library(gstproresd3d11 MODULE src/gstproresd3d11dec.cpp src/prores_parser.cpp
+  add_library(gstproresd3d11 MODULE src/gstproresd3d11dec.cpp src/gstproresd3d11rgb.cpp
+    src/prores_parser.cpp
     src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl)
   set_source_files_properties(src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl
     PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -108,6 +109,20 @@ if(BUILD_GSTREAMER_PLUGIN)
   add_dependencies(d3d11_rgb_probe gstproresd3d11)
   if(MSVC)
     target_compile_options(d3d11_rgb_probe PRIVATE /W4 /utf-8)
+  endif()
+
+  add_executable(d3d11_rgb_element_smoke tests/d3d11_rgb_element_smoke.cpp)
+  target_include_directories(d3d11_rgb_element_smoke PRIVATE
+    "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
+    "${GSTREAMER_ROOT}/lib/glib-2.0/include" "${GSTREAMER_ROOT}/lib/gstreamer-1.0/include")
+  target_link_directories(d3d11_rgb_element_smoke PRIVATE "${GSTREAMER_ROOT}/lib")
+  target_link_libraries(d3d11_rgb_element_smoke PRIVATE gstd3d11-1.0 gstapp-1.0
+    gstvideo-1.0 gstbase-1.0 gstreamer-1.0 gobject-2.0 glib-2.0 d3d11)
+  target_compile_definitions(d3d11_rgb_element_smoke PRIVATE
+    GST_USE_UNSTABLE_API NOMINMAX WIN32_LEAN_AND_MEAN)
+  add_dependencies(d3d11_rgb_element_smoke gstproresd3d11)
+  if(MSVC)
+    target_compile_options(d3d11_rgb_element_smoke PRIVATE /W4 /utf-8)
   endif()
 
   add_executable(d3d11_plugin_bench tests/d3d11_plugin_bench.cpp)

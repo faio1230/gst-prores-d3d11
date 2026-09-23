@@ -32,8 +32,8 @@ def execute(command, log, env=None):
 def gst_command(source, destination, mode, frames):
     cmd = [GST / 'gst-launch-1.0.exe', '-q', '-e', 'filesrc',
            f'location={source.as_posix()}', '!', 'qtdemux', '!', 'proresd3d11dec', '!']
-    if mode == 'rgb_gpu':
-        cmd += ['d3d11convert', '!',
+    if mode in ('rgb_gpu', 'rgb_element'):
+        cmd += ['d3d11convert' if mode == 'rgb_gpu' else 'proresd3d11rgb', '!',
                 f'video/x-raw(memory:D3D11Memory),format=RGB10A2_LE,colorimetry={RGB_COLORIMETRY}', '!']
     cmd += ['d3d11download', '!']
     if mode == 'rgb_cpu':
@@ -43,7 +43,7 @@ def gst_command(source, destination, mode, frames):
                 'videoconvert', 'dither=none', 'chroma-resampler=linear',
                 'matrix-mode=full', 'gamma-mode=none', 'primaries-mode=none', '!',
                 f'video/x-raw,format=RGB10A2_LE,colorimetry={RGB_COLORIMETRY}', '!']
-    elif mode == 'rgb_gpu':
+    elif mode in ('rgb_gpu', 'rgb_element'):
         cmd += [f'video/x-raw,format=RGB10A2_LE,colorimetry={RGB_COLORIMETRY}', '!']
     if frames:
         cmd += ['identity', f'eos-after={frames + 1}', '!']
@@ -174,14 +174,16 @@ def compare_formula(yuv_path, rgb_path, width, height, expected_frames):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input', type=Path)
-    parser.add_argument('--mode', choices=('yuv', 'rgb', 'rgb_native', 'rgb_formula'), required=True)
+    parser.add_argument('--mode', choices=('yuv', 'rgb', 'rgb_native', 'rgb_formula',
+                                           'rgb_element', 'rgb_element_formula'), required=True)
     parser.add_argument('--frames', type=int, help='先頭Nフレーム。省略時は全フレーム')
     parser.add_argument('--diagnostic-dir', type=Path,
                         help='RGB先頭1フレームのI422・CPU RGB・GPU RGB rawを保存')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
-    if args.diagnostic_dir and (args.mode not in ('rgb', 'rgb_native') or args.frames != 1):
-        parser.error('--diagnostic-dir は --mode rgb/rgb_native --frames 1 と併用する')
+    if args.diagnostic_dir and (args.mode not in ('rgb', 'rgb_native', 'rgb_element')
+                                or args.frames != 1):
+        parser.error('--diagnostic-dir は --mode rgb/rgb_native/rgb_element --frames 1 と併用する')
     source = args.input.resolve()
     probe = json.loads(subprocess.check_output([
         str(SDK / 'ffprobe.exe'), '-v', 'error', '-select_streams', 'v:0',
@@ -219,13 +221,17 @@ def main():
             runs.append([str(item) for item in command])
         else:
             command = gst_command(source, left,
-                                  'yuv' if args.mode == 'rgb_formula' else 'rgb_cpu', args.frames)
+                                  'yuv' if args.mode in ('rgb_formula', 'rgb_element_formula')
+                                  else 'rgb_cpu', args.frames)
             execute(command, args.out.with_suffix('.cpu.log'), env)
             runs.append([str(item) for item in command])
             command = ([RGB_PROBE, source, right, RGB_SHADER,
                         str(expected_frames if args.frames else 0)]
                        if args.mode in ('rgb_native', 'rgb_formula')
-                       else gst_command(source, right, 'rgb_gpu', args.frames))
+                       else gst_command(source, right,
+                                        'rgb_element' if args.mode in ('rgb_element',
+                                                                       'rgb_element_formula')
+                                        else 'rgb_gpu', args.frames))
             execute(command, args.out.with_suffix('.dx11.log'), env)
             runs.append([str(item) for item in command])
             if args.diagnostic_dir:
@@ -238,7 +244,7 @@ def main():
                                    ('gpu-rgb10a2.raw', right)):
                     shutil.copyfile(path, args.diagnostic_dir / name)
         result = (compare_formula(left, right, width, height, expected_frames)
-                  if args.mode == 'rgb_formula'
+                  if args.mode in ('rgb_formula', 'rgb_element_formula')
                   else compare(left, right, width, height,
                                'yuv' if args.mode == 'yuv' else 'rgb', expected_frames))
     with source.open('rb') as stream:
@@ -246,11 +252,11 @@ def main():
     result.update(input=str(source), source_sha256=source_sha256,
                   mode=args.mode, reference=('fixed FFmpeg 8.1 CPU yuv422p10le' if args.mode == 'yuv'
                                             else 'same DX11 I422 + independent BT.709 limited-to-full centered chroma formula'
-                                            if args.mode == 'rgb_formula'
+                                            if args.mode in ('rgb_formula', 'rgb_element_formula')
                                             else 'D3D11 decoded I422 + CPU videoconvert BT.709, centered 4:2:2 chroma'),
                   probe=probe, commands=runs)
     result['passed'] = (all(channel['max_abs'] <= 1 for channel in result['channels'])
-                        if args.mode in ('yuv', 'rgb_formula') else None)
+                        if args.mode in ('yuv', 'rgb_formula', 'rgb_element_formula') else None)
     args.out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps({'frames': result['frames'], 'channels': result['channels']},
                      ensure_ascii=False, indent=2))

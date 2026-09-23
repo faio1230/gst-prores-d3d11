@@ -708,12 +708,14 @@ static void gst_prores_d3d11_dec_init(GstProresD3D11Dec* self) {
 }
 
 static gboolean plugin_init(GstPlugin* plugin) {
+    extern gboolean gst_prores_d3d11_rgb_register(GstPlugin* plugin);
     GST_DEBUG_CATEGORY_INIT(proresd3d11_debug, "proresd3d11dec", 0,
                             "Native D3D11 ProRes decoder");
     return gst_element_register(plugin, "proresd3d11dec", GST_RANK_NONE,
-                                gst_prores_d3d11_dec_get_type());
+                                gst_prores_d3d11_dec_get_type()) &&
+           gst_prores_d3d11_rgb_register(plugin);
 }
 
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, proresd3d11,
-    "Native D3D11 ProRes 422 HQ decoder", plugin_init, "0.1.0", "LGPL",
+    "Native D3D11 ProRes 422 HQ decoder and RGB converter", plugin_init, "0.1.0", "LGPL",
     "prores-gpu-lab", "https://example.invalid/prores-gpu-lab")

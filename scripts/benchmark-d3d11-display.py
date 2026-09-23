@@ -92,6 +92,8 @@ def main():
     parser.add_argument('--preroll', action='store_true', help='先にPAUSED prerollを完了してからPLAYING')
     parser.add_argument('--lossless-sink-policy', action='store_true',
                         help='診断用: sink QoSを止めmax-lateness=-1にする')
+    parser.add_argument('--native-rgb', action='store_true',
+                        help='標準d3d11convertの代わりに専用DX11 RGB要素を表示する')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
@@ -126,6 +128,8 @@ def main():
                         command.append('preroll')
                     if args.lossless_sink_policy:
                         command.append('lossless')
+                    if args.native_rgb:
+                        command.append('native-rgb')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:
                         process = subprocess.run(command, env=env, text=True,
                                                  stdout=subprocess.PIPE, stderr=errors,

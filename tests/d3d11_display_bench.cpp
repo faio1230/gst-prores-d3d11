@@ -103,24 +103,27 @@ static std::uint64_t sink_stat(GstElement* sink, const char* name) {
 
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
-    if (argc < 4 || argc > 7)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless]]");
+    if (argc < 4 || argc > 8)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb]]");
     bool preroll = false;
     bool lossless = false;
+    bool native_rgb = false;
     for (int i = 5; i < argc; ++i) {
         const std::string option(argv[i]);
         if (option == "preroll") preroll = true;
         else if (option == "lossless") lossless = true;
+        else if (option == "native-rgb") native_rgb = true;
         else throw std::runtime_error("unknown display option: " + option);
     }
     const int loops = std::stoi(argv[2]);
     if (loops < 1) throw std::runtime_error("loops must be positive");
     GError* error = nullptr;
-    auto* pipeline = gst_parse_launch(
-        "filesrc name=source ! qtdemux ! proresd3d11dec name=decoder ! "
-        "d3d11convert name=converter ! "
-        "video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! "
-        "d3d11videosink name=sink sync=true emit-present=true qos=true", &error);
+    const std::string description = std::string(
+        "filesrc name=source ! qtdemux ! proresd3d11dec name=decoder ! ") +
+        (native_rgb ? "proresd3d11rgb" : "d3d11convert") +
+        " name=converter ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! "
+        "d3d11videosink name=sink sync=true emit-present=true qos=true";
+    auto* pipeline = gst_parse_launch(description.c_str(), &error);
     if (error || !pipeline) {
         const std::string text = error ? error->message : "cannot construct pipeline";
         if (error) g_error_free(error);
@@ -237,6 +240,7 @@ int main(int argc, char** argv) try {
     GetSystemInfo(&system);
     std::cout << std::fixed << std::setprecision(3)
               << "{\"loops\":" << loops << ",\"preroll_ms\":" << preroll_ms
+              << ",\"rgb_converter\":\"" << (native_rgb ? "proresd3d11rgb" : "d3d11convert") << "\""
               << ",\"lossless_sink_policy\":" << (lossless ? "true" : "false")
               << ",\"present_count\":" << presents.times.size()
               << ",\"rendered\":" << total_rendered << ",\"dropped\":" << total_dropped
