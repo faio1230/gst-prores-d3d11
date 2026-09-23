@@ -43,7 +43,10 @@ struct PresentLog {
     Clock::time_point origin{};
     std::mutex mutex;
     std::vector<double> times;
+    std::vector<GstClockTime> pts;
 };
+
+static thread_local GstClockTime active_sink_pts = GST_CLOCK_TIME_NONE;
 
 struct StageEvent {
     const char* stage;
@@ -87,7 +90,10 @@ static GstFlowReturn timed_push_chain(GstPad*, GstObject* parent, GstBuffer* buf
         std::lock_guard<std::mutex> guard(self->log->mutex);
         self->log->events.push_back({"sink_push", ms(self->log->origin, now), pts});
     }
+    const auto previous_pts = active_sink_pts;
+    active_sink_pts = pts;
     const auto result = gst_pad_push(self->src_pad, buffer);
+    active_sink_pts = previous_pts;
     if (self->log) {
         const auto now = Clock::now();
         std::lock_guard<std::mutex> guard(self->log->mutex);
@@ -159,6 +165,7 @@ static void on_present(GstElement*, GstObject*, gpointer, gpointer data) {
     const auto now = Clock::now();
     std::lock_guard<std::mutex> guard(log->mutex);
     log->times.push_back(ms(log->origin, now));
+    log->pts.push_back(active_sink_pts);
 }
 
 static std::uint64_t sink_stat(GstElement* sink, const char* name) {
@@ -251,6 +258,9 @@ int main(int argc, char** argv) try {
     gst_object_unref(source);
     PresentLog presents;
     presents.origin = Clock::now();
+    LARGE_INTEGER qpc_origin{}, qpc_frequency{};
+    if (!QueryPerformanceFrequency(&qpc_frequency) || !QueryPerformanceCounter(&qpc_origin))
+        throw std::runtime_error("QueryPerformanceCounter failed");
     InjectedStall stall;
     stall.origin = presents.origin;
     stall.delay_ms = sink_stall_ms;
@@ -337,12 +347,14 @@ int main(int argc, char** argv) try {
                               sizeof(memory))) throw std::runtime_error("GetProcessMemoryInfo failed");
     std::ofstream csv(argv[3]);
     if (!csv) throw std::runtime_error("cannot open present CSV");
-    csv << "loop,present_index,wall_ms,interval_ms\n";
+    csv << "loop,present_index,wall_ms,interval_ms,pts_ns\n";
     std::vector<double> intervals;
     for (int loop = 0; loop < loops; ++loop) {
         for (std::size_t i = endpoints[loop]; i < endpoints[loop + 1]; ++i) {
             const double interval = i > endpoints[loop] ? presents.times[i] - presents.times[i - 1] : 0;
-            csv << loop << ',' << i - endpoints[loop] << ',' << presents.times[i] << ',' << interval << '\n';
+            csv << loop << ',' << i - endpoints[loop] << ',' << presents.times[i] << ',' << interval << ',';
+            if (GST_CLOCK_TIME_IS_VALID(presents.pts[i])) csv << presents.pts[i];
+            csv << '\n';
             if (i > endpoints[loop] + 30) intervals.push_back(interval);
         }
     }
@@ -363,7 +375,11 @@ int main(int argc, char** argv) try {
     SYSTEM_INFO system{};
     GetSystemInfo(&system);
     std::cout << std::fixed << std::setprecision(3)
-              << "{\"loops\":" << loops << ",\"preroll_ms\":" << preroll_ms
+              << "{\"process_id\":" << GetCurrentProcessId()
+              << ",\"qpc_origin_ms\":" << std::setprecision(6)
+              << static_cast<double>(qpc_origin.QuadPart) * 1000.0 / qpc_frequency.QuadPart
+              << std::setprecision(3)
+              << ",\"loops\":" << loops << ",\"preroll_ms\":" << preroll_ms
               << ",\"rgb_converter\":\"" << (native_rgb ? "proresd3d11rgb" : "d3d11convert") << "\""
               << ",\"predecode_queue\":" << (predecode_queue ? "true" : "false")
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
