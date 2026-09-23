@@ -45,6 +45,44 @@ struct PresentLog {
     std::vector<double> times;
 };
 
+struct StageEvent {
+    const char* stage;
+    double wall_ms;
+    GstClockTime pts;
+};
+
+struct StageLog {
+    Clock::time_point origin{};
+    std::mutex mutex;
+    std::vector<StageEvent> events;
+};
+
+struct StageTap {
+    StageLog* log;
+    const char* name;
+};
+
+static GstPadProbeReturn on_stage(GstPad*, GstPadProbeInfo* info, gpointer data) {
+    auto* tap = static_cast<StageTap*>(data);
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (buffer) {
+        const auto now = Clock::now();
+        std::lock_guard<std::mutex> guard(tap->log->mutex);
+        tap->log->events.push_back({tap->name, ms(tap->log->origin, now), GST_BUFFER_PTS(buffer)});
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+static void add_stage_probe(GstElement* element, const char* pad_name, StageTap* tap) {
+    auto* pad = gst_element_get_static_pad(element, pad_name);
+    if (!pad) throw std::runtime_error("stage pad missing");
+    if (!gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, on_stage, tap, nullptr)) {
+        gst_object_unref(pad);
+        throw std::runtime_error("cannot add stage probe");
+    }
+    gst_object_unref(pad);
+}
+
 static void on_present(GstElement*, GstObject*, gpointer, gpointer data) {
     auto* log = static_cast<PresentLog*>(data);
     const auto now = Clock::now();
@@ -65,12 +103,22 @@ static std::uint64_t sink_stat(GstElement* sink, const char* name) {
 
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
-    if (argc != 4) throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv");
+    if (argc < 4 || argc > 7)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless]]");
+    bool preroll = false;
+    bool lossless = false;
+    for (int i = 5; i < argc; ++i) {
+        const std::string option(argv[i]);
+        if (option == "preroll") preroll = true;
+        else if (option == "lossless") lossless = true;
+        else throw std::runtime_error("unknown display option: " + option);
+    }
     const int loops = std::stoi(argv[2]);
     if (loops < 1) throw std::runtime_error("loops must be positive");
     GError* error = nullptr;
     auto* pipeline = gst_parse_launch(
-        "filesrc name=source ! qtdemux ! proresd3d11dec ! d3d11convert ! "
+        "filesrc name=source ! qtdemux ! proresd3d11dec name=decoder ! "
+        "d3d11convert name=converter ! "
         "video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! "
         "d3d11videosink name=sink sync=true emit-present=true qos=true", &error);
     if (error || !pipeline) {
@@ -79,14 +127,36 @@ int main(int argc, char** argv) try {
         throw std::runtime_error(text);
     }
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline), "source");
+    auto* decoder = gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
+    auto* converter = gst_bin_get_by_name(GST_BIN(pipeline), "converter");
     auto* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     auto* bus = gst_element_get_bus(pipeline);
-    if (!source || !sink || !bus) throw std::runtime_error("pipeline endpoint missing");
+    if (!source || !decoder || !converter || !sink || !bus)
+        throw std::runtime_error("pipeline endpoint missing");
     g_object_set(source, "location", argv[1], nullptr);
+    if (lossless) g_object_set(sink, "qos", FALSE, "max-lateness", gint64(-1), nullptr);
     gst_object_unref(source);
     PresentLog presents;
     presents.origin = Clock::now();
+    StageLog stages;
+    stages.origin = presents.origin;
+    StageTap compressed{&stages, "compressed"};
+    StageTap decoded{&stages, "decoded"};
+    StageTap rgb{&stages, "rgb"};
+    if (argc >= 5) {
+        add_stage_probe(decoder, "sink", &compressed);
+        add_stage_probe(decoder, "src", &decoded);
+        add_stage_probe(converter, "src", &rgb);
+    }
     g_signal_connect(sink, "present", G_CALLBACK(on_present), &presents);
+    double preroll_ms = 0;
+    if (preroll) {
+        const auto preroll_start = Clock::now();
+        if (gst_element_set_state(pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE ||
+            gst_element_get_state(pipeline, nullptr, nullptr, 10 * GST_SECOND) != GST_STATE_CHANGE_SUCCESS)
+            throw std::runtime_error("PAUSED preroll failed");
+        preroll_ms = ms(preroll_start, Clock::now());
+    }
     const auto start = Clock::now();
     const auto cpu_start = cpu_seconds();
     if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
@@ -149,6 +219,16 @@ int main(int argc, char** argv) try {
             if (i > endpoints[loop] + 30) intervals.push_back(interval);
         }
     }
+    if (argc >= 5) {
+        std::ofstream stage_csv(argv[4]);
+        if (!stage_csv) throw std::runtime_error("cannot open stages CSV");
+        stage_csv << "stage,wall_ms,pts_ns\n";
+        for (const auto& event : stages.events) {
+            stage_csv << event.stage << ',' << event.wall_ms << ',';
+            if (GST_CLOCK_TIME_IS_VALID(event.pts)) stage_csv << event.pts;
+            stage_csv << '\n';
+        }
+    }
     const double wall = ms(start, finish);
     std::uint64_t total_rendered = 0, total_dropped = 0;
     for (auto value : rendered) total_rendered += value;
@@ -156,7 +236,9 @@ int main(int argc, char** argv) try {
     SYSTEM_INFO system{};
     GetSystemInfo(&system);
     std::cout << std::fixed << std::setprecision(3)
-              << "{\"loops\":" << loops << ",\"present_count\":" << presents.times.size()
+              << "{\"loops\":" << loops << ",\"preroll_ms\":" << preroll_ms
+              << ",\"lossless_sink_policy\":" << (lossless ? "true" : "false")
+              << ",\"present_count\":" << presents.times.size()
               << ",\"rendered\":" << total_rendered << ",\"dropped\":" << total_dropped
               << ",\"qos_messages\":" << qos
               << ",\"wall_ms\":" << wall
@@ -177,6 +259,8 @@ int main(int argc, char** argv) try {
     }
     std::cout << "]}\n";
     gst_object_unref(bus);
+    gst_object_unref(decoder);
+    gst_object_unref(converter);
     gst_object_unref(sink);
     gst_object_unref(pipeline);
     return 0;

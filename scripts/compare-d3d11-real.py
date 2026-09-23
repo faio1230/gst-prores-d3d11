@@ -5,6 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SDK = ROOT / 'tools/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1/bin'
 GST = Path('C:/Program Files/gstreamer/1.0/msvc_x86_64/bin')
 PLUGIN = ROOT / 'build/vs18/plugins/Release'
+RGB_COLORIMETRY = '1:1:5:1'  # full-range RGB, BT.709 transfer and primaries
 
 
 def execute(command, log, env=None):
@@ -30,16 +32,17 @@ def gst_command(source, destination, mode, frames):
            f'location={source.as_posix()}', '!', 'qtdemux', '!', 'proresd3d11dec', '!']
     if mode == 'rgb_gpu':
         cmd += ['d3d11convert', '!',
-                'video/x-raw(memory:D3D11Memory),format=RGB10A2_LE', '!']
+                f'video/x-raw(memory:D3D11Memory),format=RGB10A2_LE,colorimetry={RGB_COLORIMETRY}', '!']
     cmd += ['d3d11download', '!']
     if mode == 'rgb_cpu':
         # d3d11convert samples 4:2:2 chroma at centered positions.  Without
         # chroma-site the CPU path defaults to left-cosited interpolation.
         cmd += ['video/x-raw,format=I422_10LE,colorimetry=bt709,chroma-site=jpeg', '!',
-                'videoconvert', 'dither=none', 'chroma-resampler=linear', '!',
-                'video/x-raw,format=RGB10A2_LE', '!']
+                'videoconvert', 'dither=none', 'chroma-resampler=linear',
+                'matrix-mode=full', 'gamma-mode=none', 'primaries-mode=none', '!',
+                f'video/x-raw,format=RGB10A2_LE,colorimetry={RGB_COLORIMETRY}', '!']
     elif mode == 'rgb_gpu':
-        cmd += ['video/x-raw,format=RGB10A2_LE', '!']
+        cmd += [f'video/x-raw,format=RGB10A2_LE,colorimetry={RGB_COLORIMETRY}', '!']
     if frames:
         cmd += ['identity', f'eos-after={frames + 1}', '!']
     return cmd + ['filesink', f'location={destination.as_posix()}']
@@ -117,8 +120,12 @@ def main():
     parser.add_argument('input', type=Path)
     parser.add_argument('--mode', choices=('yuv', 'rgb'), required=True)
     parser.add_argument('--frames', type=int, help='先頭Nフレーム。省略時は全フレーム')
+    parser.add_argument('--diagnostic-dir', type=Path,
+                        help='RGB先頭1フレームのI422・CPU RGB・GPU RGB rawを保存')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
+    if args.diagnostic_dir and (args.mode != 'rgb' or args.frames != 1):
+        parser.error('--diagnostic-dir は --mode rgb --frames 1 と併用する')
     source = args.input.resolve()
     probe = json.loads(subprocess.check_output([
         str(SDK / 'ffprobe.exe'), '-v', 'error', '-select_streams', 'v:0',
@@ -161,6 +168,15 @@ def main():
             command = gst_command(source, right, 'rgb_gpu', args.frames)
             execute(command, args.out.with_suffix('.dx11.log'), env)
             runs.append([str(item) for item in command])
+            if args.diagnostic_dir:
+                yuv = temp / 'dx11-i422.raw'
+                command = gst_command(source, yuv, 'yuv', 1)
+                execute(command, args.out.with_suffix('.yuv.log'), env)
+                runs.append([str(item) for item in command])
+                args.diagnostic_dir.mkdir(parents=True, exist_ok=True)
+                for name, path in (('dx11-i422.raw', yuv), ('cpu-rgb10a2.raw', left),
+                                   ('gpu-rgb10a2.raw', right)):
+                    shutil.copyfile(path, args.diagnostic_dir / name)
         result = compare(left, right, width, height, args.mode, expected_frames)
     with source.open('rb') as stream:
         source_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()

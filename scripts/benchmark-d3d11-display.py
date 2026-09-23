@@ -1,5 +1,6 @@
 """D3D11実表示経路を反復し、present/QoS/CPU/GPUを個別に保存する。"""
 import argparse
+from collections import Counter
 import csv
 import json
 import math
@@ -36,11 +37,61 @@ def gpu_stats(path):
     return result
 
 
+def stage_stats(path, expected_frames, loops, rendered):
+    events = {}
+    counts = Counter()
+    wall_by_stage = {name: {} for name in ('compressed', 'decoded', 'rgb')}
+    widest_gaps = {}
+    with path.open(newline='', encoding='utf-8-sig') as stream:
+        for row in csv.DictReader(stream):
+            name = row['stage']
+            pts = int(row['pts_ns'])
+            wall = float(row['wall_ms'])
+            previous = events.get(name)
+            loop = previous['loop'] + int(pts < previous['pts']) if previous else 0
+            if previous and loop == previous['loop']:
+                gap = wall - previous['wall']
+                if gap > widest_gaps.get(name, {}).get('interval_ms', 0):
+                    widest_gaps[name] = {'interval_ms': gap, 'loop': loop,
+                                         'before_pts_ns': previous['pts'], 'after_pts_ns': pts}
+            events[name] = {'pts': pts, 'wall': wall, 'loop': loop}
+            counts[(name, loop, pts)] += 1
+            wall_by_stage[name][(loop, pts)] = wall
+    by_stage = {name: {(loop, pts) for stage, loop, pts in counts if stage == name}
+                for name in ('compressed', 'decoded', 'rgb')}
+    missing_after_decoder = sorted(by_stage['compressed'] - by_stage['decoded'])
+    missing_after_converter = sorted(by_stage['decoded'] - by_stage['rgb'])
+    latencies = {}
+    for before, after in (('compressed', 'decoded'), ('decoded', 'rgb')):
+        durations = sorted(wall_by_stage[after][key] - wall_by_stage[before][key]
+                           for key in by_stage[before] & by_stage[after])
+        latencies[f'{before}_to_{after}_ms'] = {
+            'p95': durations[math.ceil(.95 * (len(durations) - 1))] if durations else None,
+            'p99': durations[math.ceil(.99 * (len(durations) - 1))] if durations else None,
+            'max': durations[-1] if durations else None}
+    expected = expected_frames * loops
+    return {'expected_frames': expected,
+            'compressed': len(by_stage['compressed']),
+            'decoded': len(by_stage['decoded']),
+            'rgb': len(by_stage['rgb']),
+            'rendered': rendered,
+            'end_to_end_missing': expected - rendered,
+            'missing_after_decoder': missing_after_decoder[:32],
+            'missing_after_decoder_count': len(missing_after_decoder),
+            'missing_after_converter': missing_after_converter[:32],
+            'missing_after_converter_count': len(missing_after_converter),
+            'widest_same_loop_gap': widest_gaps,
+            'stage_latency': latencies}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('inputs', nargs='+', type=Path)
     parser.add_argument('--loops', type=int, default=3)
     parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument('--preroll', action='store_true', help='先にPAUSED prerollを完了してからPLAYING')
+    parser.add_argument('--lossless-sink-policy', action='store_true',
+                        help='診断用: sink QoSを止めmax-lateness=-1にする')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
@@ -69,7 +120,12 @@ def main():
                     pass
                 try:
                     command = [str(BENCH), str(source), str(args.loops),
-                               str(stem.with_suffix('.present.csv'))]
+                               str(stem.with_suffix('.present.csv')),
+                               str(stem.with_suffix('.stages.csv'))]
+                    if args.preroll:
+                        command.append('preroll')
+                    if args.lossless_sink_policy:
+                        command.append('lossless')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:
                         process = subprocess.run(command, env=env, text=True,
                                                  stdout=subprocess.PIPE, stderr=errors,
@@ -84,11 +140,15 @@ def main():
             record = json.loads(process.stdout)
             record.update(input=str(source), repeat=repeat, source_fps=probe['r_frame_rate'],
                           source_frames=int(probe['nb_frames']), gpu=gpu_stats(monitor_path),
+                          stages=stage_stats(stem.with_suffix('.stages.csv'),
+                                             int(probe['nb_frames']), args.loops,
+                                             record['rendered']),
                           command=command)
             stem.with_suffix('.json').write_text(json.dumps(record, ensure_ascii=False, indent=2),
                                                  encoding='utf-8')
             print(json.dumps({'source': source.name, 'repeat': repeat,
                               'rendered': record['rendered'], 'dropped': record['dropped'],
+                              'end_to_end_missing': record['stages']['end_to_end_missing'],
                               'p95_ms': record['interval_p95_ms'],
                               'p99_ms': record['interval_p99_ms']}, ensure_ascii=False))
 

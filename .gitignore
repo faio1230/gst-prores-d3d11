@@ -9,3 +9,8 @@ __pycache__/
 /results/display-1080.json
 /results/display-1080-present.csv
 /results/display-1080-stderr.log
+# 条件決め用の単発試行。正式な反復記録はresults/d3d11-display-*-repeat/など。
+/results/d3d11-display-stages-pilot/
+/results/d3d11-display-stages-check/
+/results/d3d11-display-dji-preroll-pilot/
+/results/proton-real-rgb-explicit-pilot.*
