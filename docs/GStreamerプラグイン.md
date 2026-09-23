@@ -41,6 +41,8 @@ DLLの直接依存はGStreamer D3D11とMSVC/Windows runtimeで、FFmpeg/Vulkan/D
 
 同日の後続検査では`source/`へDX11版のC++/HLSL 8ファイルと専用CMake定義を同梱した。ステージ内のソースだけを入力として、GStreamer SDK・MSVC・Windows SDKでDLL/CSOを再ビルドし、再ビルドDLLから両要素をロードしてBT.709 RGB D3D11Memory経路を完走した。元DLL・再ビルドDLLとも直接依存にFFmpeg/Vulkan/D3DCompilerなし。cleanなコミット`1485eea`の20ファイルSHA256と検査結果は`results/stage-d3d11-source-rebuild-2026-09-24.json`。ソース同梱は内部での再現性を示すが、公開ライセンスの許諾表示・対応ソース提供条件や製品採用は未確定。
 
+AC境界修正後のコミット`fdff052`でも、cleanな作業ツリーから21ファイルを内部ステージへ配置し、ステージ内ソースだけでDLL/CSOを再ビルドした。両要素のロード、合成1080p/4KのI422_10LEとBT.709 RGBのD3D11Memory出力が通過。記録は`results/stage-ac-boundary-2026-09-24.json`。公開配布の認定ではない。
+
 parserとVLD shaderのFFmpeg由来部分はSPDXでLGPL-2.1-or-laterを明記し、plugin metadataもLGPLとする。GStreamerはLGPL、fxc／D3D11はWindows SDKのビルド・実行依存。リポジトリ全体の独自コードの公開ライセンスは未決定なので、外部配布前にライセンス本文、著作権表示、対応ソースの提供方法を確定する。ProResの商標・特許・認証はOSSライセンスと別に確認する。
 
 実機結果は次のとおり。
