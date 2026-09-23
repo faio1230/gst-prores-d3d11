@@ -100,11 +100,17 @@ public:
             auto* d3d_memory = GST_D3D11_MEMORY_CAST(memory);
             require(d3d_memory->device == gst_device_, "RGB input device changed");
             D3D11_TEXTURE2D_DESC desc{};
-            require(gst_d3d11_memory_get_texture_desc(d3d_memory, &desc) &&
-                    desc.Format == DXGI_FORMAT_R16_UNORM && desc.ArraySize == 1 &&
-                    desc.Width == (index ? width_ / 2 : width_) && desc.Height == height_ &&
-                    (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE),
-                    "RGB input plane topology is unexpected");
+            const bool has_desc = gst_d3d11_memory_get_texture_desc(d3d_memory, &desc);
+            if (!has_desc || desc.Format != DXGI_FORMAT_R16_UNORM || desc.ArraySize != 1 ||
+                desc.Width != (index ? width_ / 2 : width_) || desc.Height != height_ ||
+                !(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE))
+                throw std::runtime_error("RGB input plane topology is unexpected: plane=" +
+                    std::to_string(index) + " format=" + std::to_string(desc.Format) +
+                    " array=" + std::to_string(desc.ArraySize) +
+                    " size=" + std::to_string(desc.Width) + "x" + std::to_string(desc.Height) +
+                    " bind=" + std::to_string(desc.BindFlags) +
+                    " subresource=" +
+                    std::to_string(gst_d3d11_memory_get_subresource_index(d3d_memory)));
             check_hr(device_->CreateShaderResourceView(
                 gst_d3d11_memory_get_resource_handle(d3d_memory), nullptr, &inputs[index]),
                 "CreateShaderResourceView RGB input");
