@@ -31,6 +31,11 @@ void check_hr(HRESULT result, const char* operation) {
                                                   std::to_string(static_cast<unsigned long>(result)));
 }
 
+HRESULT device_removed_reason(GstD3D11Device* gst_device) {
+    auto* device = gst_device ? gst_d3d11_device_get_device_handle(gst_device) : nullptr;
+    return device ? device->GetDeviceRemovedReason() : S_OK;
+}
+
 std::filesystem::path shader_path() {
     static int anchor;
     HMODULE module = nullptr;
@@ -66,11 +71,23 @@ public:
           context_(gst_d3d11_device_get_device_context_handle(gst_device)),
           width_(width), height_(height) {
         require(device_ && context_, "missing native D3D11 handles");
+        require(device_->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0,
+                "RGB Compute Shader requires D3D feature level 11_0 or higher");
+        UINT input_support = 0;
+        check_hr(device_->CheckFormatSupport(DXGI_FORMAT_R16_UNORM, &input_support),
+                 "CheckFormatSupport RGB input R16_UNORM");
+        constexpr UINT required_input = D3D11_FORMAT_SUPPORT_TEXTURE2D |
+            D3D11_FORMAT_SUPPORT_SHADER_LOAD;
+        require((input_support & required_input) == required_input,
+                "R16_UNORM texture shader load unsupported by this adapter");
         UINT support = 0;
         check_hr(device_->CheckFormatSupport(DXGI_FORMAT_R10G10B10A2_UNORM, &support),
                  "CheckFormatSupport RGB10A2");
-        require((support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) != 0,
-                "RGB10A2 typed UAV unsupported by this adapter");
+        constexpr UINT required_output = D3D11_FORMAT_SUPPORT_TEXTURE2D |
+            D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_RENDER_TARGET |
+            D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
+        require((support & required_output) == required_output,
+                "RGB10A2 texture/load/render target/typed UAV unsupported by this adapter");
         std::ifstream file(shader_path(), std::ios::binary | std::ios::ate);
         require(static_cast<bool>(file), "cannot open prores_rgb.cso");
         const auto size = file.tellg();
@@ -91,6 +108,7 @@ public:
     }
 
     void convert(GstBuffer* input, GstBuffer* output) {
+        check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed before RGB conversion");
         require(gst_buffer_n_memory(input) == 3 && gst_buffer_n_memory(output) == 1,
                 "RGB converter expected three input and one output D3D11Memory objects");
         ComPtr<ID3D11ShaderResourceView> inputs[3];
@@ -285,8 +303,14 @@ static GstFlowReturn prepare_output_buffer(GstBaseTransform* transform, GstBuffe
         ensure_output_pool(self, input);
         return gst_buffer_pool_acquire_buffer(self->pool, output, nullptr);
     } catch (const std::exception& error) {
-        GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("Native D3D11 RGB allocation failed"),
-                          ("%s", error.what()));
+        const HRESULT removed = device_removed_reason(self->device);
+        if (FAILED(removed))
+            GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("D3D11 device lost during RGB allocation"),
+                              ("reason=%lu; %s; no fallback was attempted",
+                               static_cast<unsigned long>(removed), error.what()));
+        else
+            GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("Native D3D11 RGB allocation failed"),
+                              ("%s", error.what()));
         return GST_FLOW_ERROR;
     }
 }
@@ -302,8 +326,14 @@ static GstFlowReturn transform(GstBaseTransform* transform, GstBuffer* input,
                 "cannot copy RGB buffer timestamps");
         return GST_FLOW_OK;
     } catch (const std::exception& error) {
-        GST_ELEMENT_ERROR(self, STREAM, DECODE, ("Native D3D11 RGB conversion failed"),
-                          ("%s; no fallback was attempted", error.what()));
+        const HRESULT removed = device_removed_reason(self->device);
+        if (FAILED(removed))
+            GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("D3D11 device lost during RGB conversion"),
+                              ("reason=%lu; %s; no fallback was attempted",
+                               static_cast<unsigned long>(removed), error.what()));
+        else
+            GST_ELEMENT_ERROR(self, STREAM, DECODE, ("Native D3D11 RGB conversion failed"),
+                              ("%s; no fallback was attempted", error.what()));
         return GST_FLOW_ERROR;
     }
 }

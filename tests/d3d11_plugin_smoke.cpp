@@ -18,6 +18,29 @@ static void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
+struct DecoderGpuCapabilities {
+    unsigned feature_level;
+    UINT r16_support;
+};
+
+static DecoderGpuCapabilities check_device_capabilities() {
+    auto* gst_device = gst_d3d11_device_new(0, 0);
+    require(gst_device != nullptr, "cannot create D3D11 capability test device");
+    auto* device = gst_d3d11_device_get_device_handle(gst_device);
+    require(device != nullptr, "D3D11 capability test has no native device");
+    const auto level = device->GetFeatureLevel();
+    UINT support = 0;
+    const HRESULT result = device->CheckFormatSupport(DXGI_FORMAT_R16_UNORM, &support);
+    gst_object_unref(gst_device);
+    require(level >= D3D_FEATURE_LEVEL_11_0, "GPU does not support required SM5 feature level");
+    require(SUCCEEDED(result), "R16_UNORM format support query failed");
+    constexpr UINT required = D3D11_FORMAT_SUPPORT_TEXTURE2D |
+        D3D11_FORMAT_SUPPORT_SHADER_LOAD |
+        D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
+    require((support & required) == required, "R16_UNORM texture/load/typed UAV capability missing");
+    return {static_cast<unsigned>(level), support};
+}
+
 struct Pipeline {
     GstElement* pipe = nullptr;
     GstElement* sink = nullptr;
@@ -361,6 +384,7 @@ int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
     require(argc == 2 || argc == 3,
             "d3d11_plugin_smoke 1080p60-hq.mov [2160p60-hq.mov]");
+    const auto capabilities = check_device_capabilities();
     GstBuffer* retained = nullptr;
     {
         Pipeline pipeline(direct_pipeline);
@@ -469,6 +493,8 @@ int main(int argc, char** argv) try {
                  "\"flushing_seeks\":4,\"known_color_cases\":2,"
                  "\"dynamic_caps_changes\":" << (argc == 3 ? 2 : 0) << ","
                  "\"retained_buffer_after_destroy\":true,\"shared_device_instances\":2,"
+                 "\"feature_level\":" << capabilities.feature_level << ","
+                 "\"r16_format_support\":" << capabilities.r16_support << ","
                  "\"error_cases\":6,"
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();

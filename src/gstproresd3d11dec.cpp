@@ -35,6 +35,11 @@ GST_DEBUG_CATEGORY_STATIC(proresd3d11_debug);
 
 namespace {
 
+class UnsupportedDevice : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 void check_hr(HRESULT result, const char* operation) {
     if (FAILED(result))
         throw std::runtime_error(std::string(operation) + " HRESULT=" +
@@ -138,6 +143,19 @@ public:
           context_(gst_d3d11_device_get_device_context_handle(gst_device)),
           token_(gst_d3d11_create_user_token()) {
         if (!device_ || !context_) throw std::runtime_error("GstD3D11Device has no native handles");
+        const auto feature_level = device_->GetFeatureLevel();
+        if (feature_level < D3D_FEATURE_LEVEL_11_0)
+            throw UnsupportedDevice("ProRes SM5 requires D3D feature level 11_0 or higher; actual=" +
+                                    std::to_string(static_cast<unsigned>(feature_level)));
+        UINT format_support = 0;
+        check_hr(device_->CheckFormatSupport(DXGI_FORMAT_R16_UNORM, &format_support),
+                 "CheckFormatSupport R16_UNORM");
+        constexpr UINT required_format_support = D3D11_FORMAT_SUPPORT_TEXTURE2D |
+            D3D11_FORMAT_SUPPORT_SHADER_LOAD |
+            D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
+        if ((format_support & required_format_support) != required_format_support)
+            throw UnsupportedDevice("R16_UNORM texture, shader load, or typed UAV unsupported; "
+                                    "format support=" + std::to_string(format_support));
         const auto vld_bytecode = read_shader(shader_directory / L"prores_vld.cso");
         check_hr(device_->CreateComputeShader(vld_bytecode.data(), vld_bytecode.size(),
                                               nullptr, &vld_),
@@ -150,6 +168,7 @@ public:
 
     void decode(const std::uint8_t* packet, std::size_t packet_size,
                 const prores::Frame& parsed, GstBuffer* output) {
+        check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed before decode");
         std::vector<prores::CoefficientJob> coefficient_jobs;
         std::uint32_t coefficient_count = 0;
         prores::make_coefficient_jobs(parsed, coefficient_jobs, coefficient_count);
@@ -441,9 +460,20 @@ static gboolean start(GstVideoDecoder* decoder) {
         delete self->backend;
         self->backend = new Dx11Backend(self->device, directory);
         GST_INFO_OBJECT(self, "native D3D11 shaders loaded from %s", directory.u8string().c_str());
+    } catch (const UnsupportedDevice& error) {
+        GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("D3D11 adapter lacks decoder capabilities"),
+                          ("%s; no fallback was attempted", error.what()));
+        return FALSE;
     } catch (const std::exception& error) {
-        GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("Cannot initialize native D3D11 decoder"),
-                          ("%s", error.what()));
+        auto* native = self->device ? gst_d3d11_device_get_device_handle(self->device) : nullptr;
+        const HRESULT removed = native ? native->GetDeviceRemovedReason() : S_OK;
+        if (FAILED(removed))
+            GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("D3D11 device lost during initialization"),
+                              ("reason=%lu; %s; no fallback was attempted",
+                               static_cast<unsigned long>(removed), error.what()));
+        else
+            GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("Cannot initialize native D3D11 decoder"),
+                              ("%s", error.what()));
         return FALSE;
     }
     return TRUE;
@@ -589,8 +619,15 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
     } catch (const std::exception& exception) {
         gst_buffer_unmap(frame->input_buffer, &input);
         self->failed = TRUE;
-        GST_ELEMENT_ERROR(self, STREAM, DECODE, ("Native D3D11 ProRes decode failed"),
-                          ("%s; no fallback was attempted", exception.what()));
+        auto* native = self->device ? gst_d3d11_device_get_device_handle(self->device) : nullptr;
+        const HRESULT removed = native ? native->GetDeviceRemovedReason() : S_OK;
+        if (FAILED(removed))
+            GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("D3D11 device lost during ProRes decode"),
+                              ("reason=%lu; %s; no fallback was attempted",
+                               static_cast<unsigned long>(removed), exception.what()));
+        else
+            GST_ELEMENT_ERROR(self, STREAM, DECODE, ("Native D3D11 ProRes decode failed"),
+                              ("%s; no fallback was attempted", exception.what()));
         gst_video_decoder_drop_frame(decoder, frame);
         return GST_FLOW_ERROR;
     }
