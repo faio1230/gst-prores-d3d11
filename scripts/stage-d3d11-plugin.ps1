@@ -27,15 +27,26 @@ $files = @(
     'gstproresd3d11.dll', 'prores_vld.cso', 'prores_idct_unorm.cso', 'prores_rgb.cso',
     'prores_vld.hlsl', 'prores_idct.hlsl', 'prores_rgb.hlsl'
 )
+$sourceFiles = @(
+    'gstproresd3d11dec.cpp', 'gstproresd3d11rgb.cpp', 'd3d11_hardware_device.hpp',
+    'prores_parser.cpp', 'prores_parser.hpp',
+    'prores_vld.hlsl', 'prores_idct.hlsl', 'prores_rgb.hlsl'
+)
+$sourceCmake = Join-Path $root 'packaging/CMakeLists.txt'
 $docs = @('GStreamerプラグイン.md', '採用判断サマリー.md', 'DX11実装検証.md')
 foreach ($required in @($inspect, $launch, $ffmpeg, $fixture1080, $fixture4k, $vswhere,
-    (Join-Path $root 'packaging/README-ja.md')) +
+    (Join-Path $root 'packaging/README-ja.md'), $sourceCmake) +
     @($files | ForEach-Object { Join-Path $artifactDir $_ }) +
+    @($sourceFiles | ForEach-Object { Join-Path (Join-Path $root 'src') $_ }) +
     @($docs | ForEach-Object { Join-Path (Join-Path $root 'docs') $_ })) {
     if (!(Test-Path -LiteralPath $required)) { throw "必要なファイルがありません: $required" }
 }
 $vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json)[0]
 if (!$vs) { throw 'MSVCの依存DLL検査器がありません' }
+$major = [int]$vs.installationVersion.Split('.')[0]
+$generator = switch ($major) {18 {'Visual Studio 18 2026'} 17 {'Visual Studio 17 2022'} default {throw "未検証のVisual Studio: $major"} }
+$cmake = Join-Path $vs.installationPath 'Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe'
+if (!(Test-Path -LiteralPath $cmake)) { $cmake = (Get-Command cmake -ErrorAction Stop).Source }
 $dumpbin = Get-ChildItem (Join-Path $vs.installationPath 'VC/Tools/MSVC') -Recurse -Filter dumpbin.exe |
     Where-Object FullName -Match 'Hostx64\\x64' | Sort-Object FullName -Descending |
     Select-Object -First 1 -ExpandProperty FullName
@@ -65,8 +76,38 @@ New-Item -ItemType Directory -Path $docOut | Out-Null
 foreach ($doc in $docs) {
     Copy-Item -LiteralPath (Join-Path (Join-Path $root 'docs') $doc) -Destination (Join-Path $docOut $doc)
 }
+$sourceOut = Join-Path $out 'source'
+$sourceSrc = Join-Path $sourceOut 'src'
+New-Item -ItemType Directory -Path $sourceSrc -Force | Out-Null
+Copy-Item -LiteralPath $sourceCmake -Destination (Join-Path $sourceOut 'CMakeLists.txt')
+foreach ($file in $sourceFiles) {
+    Copy-Item -LiteralPath (Join-Path (Join-Path $root 'src') $file) -Destination (Join-Path $sourceSrc $file)
+}
 if ((Get-ChildItem -LiteralPath $out -File | Where-Object Name -Match '(?i)vulkan|gstproresvk|ffmpeg')) {
     throw 'DX11ステージへ比較用ファイルが混入しました'
+}
+$sourceBuild = Join-Path $build ('stage-source-build-' + [guid]::NewGuid().ToString('N'))
+$sourceBuildLog = Join-Path $build 'stage-d3d11-source-build.log'
+& $cmake -S $sourceOut -B $sourceBuild -G $generator -A x64 `
+    "-DCMAKE_GENERATOR_INSTANCE=$($vs.installationPath)" "-DGSTREAMER_ROOT=$GStreamerRoot" `
+    *> $sourceBuildLog
+if ($LASTEXITCODE -ne 0) { throw "独立ソースのCMake構成に失敗: $sourceBuildLog" }
+& $cmake --build $sourceBuild --config Release *>> $sourceBuildLog
+if ($LASTEXITCODE -ne 0) { throw "独立ソースの再ビルドに失敗: $sourceBuildLog" }
+$rebuiltDir = Join-Path $sourceBuild 'plugins/Release'
+$rebuiltDll = Join-Path $rebuiltDir 'gstproresd3d11.dll'
+foreach ($file in @('gstproresd3d11.dll', 'prores_vld.cso', 'prores_idct_unorm.cso', 'prores_rgb.cso')) {
+    if (!(Test-Path -LiteralPath (Join-Path $rebuiltDir $file))) {
+        throw "独立ソースの再ビルド成果物が不足: $file"
+    }
+}
+$rebuiltImportsText = (& $dumpbin /dependents $rebuiltDll | Out-String)
+if ($LASTEXITCODE -ne 0) { throw '再ビルドDLLの直接依存を読めません' }
+$rebuiltImports = @([regex]::Matches($rebuiltImportsText, '(?im)^\s+([A-Za-z0-9_.-]+\.dll)\s*$') |
+    ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() })
+if ($rebuiltImports -notcontains 'gstd3d11-1.0-0.dll' -or
+    @($rebuiltImports | Where-Object { $_ -match '^(avcodec|avutil|swscale|swresample|vulkan|d3dcompiler|gstproresvk).*\.dll$' }).Count) {
+    throw '独立ソース再ビルドDLLの直接依存が不適切です'
 }
 $savedPath = $env:PATH
 $savedPluginPath = $env:GST_PLUGIN_PATH
@@ -104,13 +145,27 @@ try {
         fakesink sync=false *> $log
     if ($LASTEXITCODE -ne 0) { throw "ステージのDX11 RGB変換に失敗: $log" }
     $pipelineResults += [ordered]@{ input = 'stage-d3d11-bt709-fixture.mov'; output = 'RGB10A2_LE D3D11Memory'; passed = $true }
+    $env:GST_PLUGIN_PATH = $rebuiltDir
+    $env:GST_REGISTRY = Join-Path $build ("stage-source-registry-" + [guid]::NewGuid().ToString('N') + '.bin')
+    foreach ($element in @('proresd3d11dec', 'proresd3d11rgb')) {
+        $details = (& $inspect $element 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $details -notmatch [regex]::Escape($rebuiltDll)) {
+            throw "独立ソース再ビルドの要素をロードできません: $element"
+        }
+    }
+    & $launch -q -e filesrc "location=$rgbInput" ! qtdemux ! `
+        proresd3d11dec ! proresd3d11rgb ! `
+        'video/x-raw(memory:D3D11Memory),format=RGB10A2_LE' ! fakesink sync=false `
+        *> $log
+    if ($LASTEXITCODE -ne 0) { throw "独立ソース再ビルドのRGB経路が失敗: $log" }
     $version = (& $inspect --version | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'GStreamer版を取得できません' }
     $commit = (& git -C $root rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Git revisionを取得できません' }
     $workingTreeDirty = @(& git -C $root status --porcelain).Count -gt 0
     if ($LASTEXITCODE -ne 0) { throw 'Git作業ツリー状態を取得できません' }
-    $manifestNames = @($files + 'README-ja.md') + @($docs | ForEach-Object { "docs/$_" })
+    $manifestNames = @($files + 'README-ja.md') + @($docs | ForEach-Object { "docs/$_" }) +
+        @('source/CMakeLists.txt') + @($sourceFiles | ForEach-Object { "source/src/$_" })
     $manifestFiles = @($manifestNames | ForEach-Object {
         $path = Join-Path $out $_
         [ordered]@{
@@ -129,7 +184,13 @@ try {
         direct_dll_dependencies = $imports
         files = $manifestFiles
         isolated_pipeline_checks = $pipelineResults
-        outstanding_gates = @('公開ライセンスと対応ソースの提供方法', '実表示の安定性', '他GPUと実際のdevice lost')
+        source_rebuild = [ordered]@{
+            passed = $true
+            independent_source_directory = $sourceOut
+            output = 'proresd3d11dec ! proresd3d11rgb -> RGB10A2_LE D3D11Memory'
+            direct_dll_dependencies = $rebuiltImports
+        }
+        outstanding_gates = @('公開ライセンスと対応ソースの提供条件', '実表示の安定性', '他GPUと実際のdevice lost')
     }
     $manifestJson = $manifest | ConvertTo-Json -Depth 5
     $manifestJson | Set-Content -LiteralPath (Join-Path $out 'manifest.json') -Encoding utf8

@@ -20,4 +20,11 @@ filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! video/x-raw(memory:D3D1
 filesrc location=bt709-hq.mov ! qtdemux ! proresd3d11dec ! proresd3d11rgb ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! fakesink sync=false
 ```
 
-このステージの`manifest.json`はファイルSHA256、DLLの直接依存、分離したディレクトリからの動作検査を記録します。画質・EOS・seek・実表示の正式な証拠と未達事項は、同梱の`docs/採用判断サマリー.md`と`docs/GStreamerプラグイン.md`、リポジトリの`docs/進捗.md`を参照してください。
+`source/`にはDX11版DLLのC++/HLSLソースと、FFmpeg/Vulkan SDKを必要としない単独ビルド定義を含めます。Visual StudioのMSVC x64・Windows SDK・GStreamer MSVC x64 SDKを用意し、ステージのディレクトリから次のように再ビルドできます（generator名はインストール済みのVisual Studioに合わせてください）。
+
+```powershell
+cmake -S source -B source-build -G "Visual Studio 18 2026" -A x64 "-DGSTREAMER_ROOT=C:/Program Files/gstreamer/1.0/msvc_x86_64"
+cmake --build source-build --config Release
+```
+
+このソース同梱は内部での再現性検査であり、公開ライセンスの許諾表示や対応ソース提供条件を確定したことを意味しません。`manifest.json`はファイルSHA256、DLLの直接依存、分離したディレクトリからの動作とソース再ビルドの検査を記録します。画質・EOS・seek・実表示の正式な証拠と未達事項は、同梱の`docs/採用判断サマリー.md`と`docs/GStreamerプラグイン.md`、リポジトリの`docs/進捗.md`を参照してください。
