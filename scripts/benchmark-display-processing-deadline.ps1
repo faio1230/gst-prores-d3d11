@@ -4,6 +4,7 @@ param(
     [int]$Repeats = 2,
     [int]$Loops = 3,
     [int]$SettleMs = 150,
+    [ValidateSet(0, 1)][int]$OrderOffset = 0,
     [switch]$Topmost,
     [string]$OutDir = 'results/display-processing-deadline-2026-09-24',
     [string]$Source = 'media/reference-dji-nature-4k60-rec709-hq.mov'
@@ -27,7 +28,7 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 $sessionPrefix = 'PDl' + (Get-Date -Format 'MMddHHmmss')
 $records = @()
 for ($repeat = 0; $repeat -lt $Repeats; ++$repeat) {
-    $conditions = if ($repeat % 2 -eq 0) { @(15, 45) } else { @(45, 15) }
+    $conditions = if (($repeat + $OrderOffset) % 2 -eq 0) { @(15, 45) } else { @(45, 15) }
     foreach ($deadline in $conditions) {
         $tag = "r$repeat-pd$deadline"
         $trialDir = Join-Path $out $tag
@@ -56,6 +57,7 @@ for ($repeat = 0; $repeat -lt $Repeats; ++$repeat) {
                 '--trace-sink-return', '--sink-processing-deadline-ms', [string]$deadline,
                 '--settle-ms', [string]$SettleMs, '--out', $trialDir)
             if ($Topmost) { $arguments += '--topmost-window' }
+            else { $arguments += '--trace-window-state' }
             & $python @arguments *> $benchLog
             if ($LASTEXITCODE -ne 0) { throw "表示試行失敗: $tag ($benchLog)" }
             if (!$monitor.WaitForExit(30000)) { throw "PresentMon終了待ちが時間切れ: $tag" }
@@ -73,6 +75,7 @@ for ($repeat = 0; $repeat -lt $Repeats; ++$repeat) {
             if ($metrics.sink_processing_deadline_ms -ne $deadline -or
                 !$metrics.sink_clock_sync -or $metrics.present_sync_interval -ne 0 -or
                 $metrics.decoder_no_qos -or $metrics.lossless_sink_policy -or
+                !$metrics.trace_window_state -or
                 $metrics.topmost_window -ne [bool]$Topmost -or
                 ($Topmost -and !$metrics.topmost_request_ok)) {
                 throw "表示条件の記録が不一致: $tag"
