@@ -10,8 +10,8 @@ param(
     [string]$Source = 'media/reference-dji-nature-4k60-rec709-hq.mov'
 )
 $ErrorActionPreference = 'Stop'
-if ($Repeats -lt 1 -or $Loops -lt 1 -or $Loops -gt 3) {
-    throw 'Repeatsは1以上、Loopsは1～3を指定してください'
+if ($Repeats -lt 1 -or $Loops -lt 1 -or $Loops -gt 10) {
+    throw 'Repeatsは1以上、Loopsは1～10を指定してください'
 }
 if ($SettleMs -lt 0 -or $SettleMs -gt 5000) { throw 'SettleMsは0～5000を指定してください' }
 $root = Split-Path $PSScriptRoot -Parent
