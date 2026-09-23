@@ -8,6 +8,7 @@ endif()
 
 add_library(gstproresd3d11 MODULE
   src/gstproresd3d11dec.cpp src/gstproresd3d11rgb.cpp src/prores_parser.cpp
+  src/d3d11_bounded_map.hpp
   src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl)
 set_source_files_properties(src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl
   PROPERTIES HEADER_FILE_ONLY TRUE)

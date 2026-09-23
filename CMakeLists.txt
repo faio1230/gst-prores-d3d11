@@ -39,7 +39,7 @@ if(BUILD_GSTREAMER_PLUGIN)
   endif()
 
   add_library(gstproresd3d11 MODULE src/gstproresd3d11dec.cpp src/gstproresd3d11rgb.cpp
-    src/prores_parser.cpp
+    src/prores_parser.cpp src/d3d11_bounded_map.hpp
     src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl)
   set_source_files_properties(src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl
     PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -163,6 +163,13 @@ if(BUILD_GSTREAMER_PLUGIN)
   if(MSVC)
     target_compile_options(d3d11_present_control PRIVATE /W4 /utf-8)
   endif()
+endif()
+
+add_executable(d3d11_bounded_map_test tests/d3d11_bounded_map_test.cpp)
+target_include_directories(d3d11_bounded_map_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_compile_definitions(d3d11_bounded_map_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+  target_compile_options(d3d11_bounded_map_test PRIVATE /W4 /utf-8)
 endif()
 add_executable(dx11_primitives src/dx11_primitives.cpp)
 target_link_libraries(dx11_primitives PRIVATE d3d11 d3dcompiler)

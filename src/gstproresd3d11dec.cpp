@@ -5,6 +5,7 @@
  */
 #include "prores_parser.hpp"
 #include "d3d11_hardware_device.hpp"
+#include "d3d11_bounded_map.hpp"
 
 #include <gst/gst.h>
 #include <gst/video/gstvideodecoder.h>
@@ -303,8 +304,18 @@ public:
         context_->CSSetShaderResources(0, 2, null_vld_srvs);
         context_->CopyResource(cache_.error_staging.Get(), cache_.errors.Get());
         D3D11_MAPPED_SUBRESOURCE mapped_errors{};
-        check_hr(context_->Map(cache_.error_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped_errors),
-                 "Map VLD error flags");
+        const auto map_result = prores::bounded_staging_map(
+            [&] {
+                return context_->Map(cache_.error_staging.Get(), 0, D3D11_MAP_READ,
+                                     D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped_errors);
+            },
+            [&] { return device_->GetDeviceRemovedReason(); },
+            [] { return std::chrono::steady_clock::now(); },
+            [] { std::this_thread::yield(); },
+            std::chrono::seconds(10));
+        if (map_result.timed_out)
+            throw std::runtime_error("VLD error readback exceeded 10 seconds");
+        check_hr(map_result.result, "Map VLD error flags");
         const auto* errors = static_cast<const std::uint32_t*>(mapped_errors.pData);
         std::size_t failed_job = coefficient_jobs.size();
         for (std::size_t i = 0; i < coefficient_jobs.size(); ++i) {

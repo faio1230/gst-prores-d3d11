@@ -29,7 +29,7 @@ $files = @(
 )
 $sourceFiles = @(
     'gstproresd3d11dec.cpp', 'gstproresd3d11rgb.cpp', 'd3d11_hardware_device.hpp',
-    'prores_parser.cpp', 'prores_parser.hpp',
+    'prores_parser.cpp', 'prores_parser.hpp', 'd3d11_bounded_map.hpp',
     'prores_vld.hlsl', 'prores_idct.hlsl', 'prores_rgb.hlsl'
 )
 $sourceCmake = Join-Path $root 'packaging/CMakeLists.txt'

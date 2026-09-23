@@ -20,6 +20,8 @@ filesrc → qtdemux → proresd3d11dec → video/x-raw(memory:D3D11Memory)
 
 出力は `video/x-raw(memory:D3D11Memory),format=I422_10LE`。Yは幅×高さ、U/Vは幅/2×高さの3枚 `DXGI_FORMAT_R16_UNORM` textureで、全てSRV|UAV。IDCT shaderがpoolのtextureへ直接書くため通常経路の画像GPU copyは0回、画像のCPU読み戻しも0回。圧縮packetのCPU→GPU uploadと、小さいVLDエラーフラグのGPU→CPU検査は行うため、処理全体を無条件に「ゼロコピー」とは呼ばない。
 
+VLDエラーフラグのstaging readは、[Microsoftの`Map`仕様](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-map)に従い`D3D11_MAP_FLAG_DO_NOT_WAIT`で処理中を判定し、10秒のポーリング期限を設けた。各処理中応答で`GetDeviceRemovedReason()`も確認する。期限超過やHRESULT失敗は画像を出さずGStreamerエラーへ進む。期限・device lost・通常完了の分岐はGPUを失わせない単体試験で確認し、実GPUの復号/EOS/seekと公開素材779枚を回帰した。ただし実際のdevice lost、driver内部でAPI呼出し自体が停止する事態、全GPUでの期限保証は未検証。画像のCPU読み戻しは増やしていない。
+
 ```powershell
 ./scripts/build.ps1
 . ./scripts/use-d3d11-plugin.ps1

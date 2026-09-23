@@ -12,12 +12,13 @@ $pluginDirectory = Join-Path $build 'plugins/Release'
 $gstBin = Join-Path $GStreamerRoot 'bin'
 $launcher = Join-Path $gstBin 'gst-launch-1.0.exe'
 $smoke = Join-Path $build 'Release/d3d11_plugin_smoke.exe'
+$boundedMap = Join-Path $build 'Release/d3d11_bounded_map_test.exe'
 $rgbSmoke = Join-Path $build 'Release/d3d11_rgb_element_smoke.exe'
 $ffmpeg = Join-Path $root 'tools/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1/bin/ffmpeg.exe'
 $input1080 = Join-Path $root 'media/synthetic-1080p60-hq.mov'
 $input2160 = Join-Path $root 'media/synthetic-2160p60-hq.mov'
 $out = Join-Path $root $OutDir
-foreach ($required in @($launcher, $smoke, $rgbSmoke, $ffmpeg, $input1080, $input2160,
+foreach ($required in @($launcher, $smoke, $boundedMap, $rgbSmoke, $ffmpeg, $input1080, $input2160,
     (Join-Path $pluginDirectory 'gstproresd3d11.dll'),
     (Join-Path $pluginDirectory 'prores_vld.cso'),
     (Join-Path $pluginDirectory 'prores_idct_unorm.cso'),
@@ -34,6 +35,12 @@ try {
     $env:GST_PLUGIN_PATH = $pluginDirectory
     $env:GST_REGISTRY = Join-Path $build 'plugin-d3d11-test-registry.bin'
     Remove-Item Env:PRORES_DX11_SHADER_DIR -ErrorAction SilentlyContinue
+
+    $mapOutput = & $boundedMap 2>&1
+    $mapCode = $LASTEXITCODE
+    $mapOutput | Set-Content -LiteralPath (Join-Path $out 'd3d11-bounded-map.json') -Encoding utf8
+    $mapOutput | Write-Host
+    if ($mapCode) { throw 'D3D11 staging Mapの期限分岐検査に失敗' }
 
     $smokeOutput = & $smoke $input1080 $input2160 2>&1
     $smokeCode = $LASTEXITCODE
