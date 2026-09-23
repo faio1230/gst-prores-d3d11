@@ -133,6 +133,9 @@ struct GpuStageTiming {
 struct CpuDecodeTiming {
     double coefficient_jobs_ms = 0;
     double idct_jobs_ms = 0;
+    bool idct_layout_rebuilt = false;
+    std::uint32_t idct_quant_slices_changed = 0;
+    bool idct_gpu_upload = false;
     double cache_ms = 0;
     double output_uav_ms = 0;
     double device_lock_ms = 0;
@@ -237,8 +240,12 @@ public:
         std::uint32_t coefficient_count = 0;
         prores::make_coefficient_jobs(parsed, coefficient_jobs, coefficient_count);
         mark(&CpuDecodeTiming::coefficient_jobs_ms);
+        const auto idct_update = refresh_idct_jobs(parsed, coefficient_jobs);
+        if (cpu_timing) {
+            cpu_timing->idct_layout_rebuilt = idct_update.layout_rebuilt;
+            cpu_timing->idct_quant_slices_changed = idct_update.quant_slices_changed;
+        }
         auto& idct_jobs = idct_jobs_;
-        prores::make_idct_jobs(parsed, coefficient_jobs, idct_jobs);
         mark(&CpuDecodeTiming::idct_jobs_ms);
         if (!coefficient_count || coefficient_jobs.empty() || idct_jobs.empty())
             throw std::runtime_error("empty ProRes GPU job list");
@@ -246,9 +253,11 @@ public:
         if (packet_size > UINT_MAX - 3 || coefficient_jobs.size() > UINT_MAX ||
             idct_jobs.size() > UINT_MAX)
             throw std::runtime_error("frame exceeds D3D11 buffer addressing range");
-        ensure_cache(parsed, static_cast<UINT>(packet_size),
+        const auto cache_rebuilt = ensure_cache(parsed, static_cast<UINT>(packet_size),
                      static_cast<UINT>(coefficient_jobs.size()), coefficient_count,
                      static_cast<UINT>(idct_jobs.size()));
+        const auto upload_idct_jobs = idct_update.dirty || cache_rebuilt;
+        if (cpu_timing) cpu_timing->idct_gpu_upload = upload_idct_jobs;
         mark(&CpuDecodeTiming::cache_ms);
 
         if (gst_buffer_n_memory(output) != 3)
@@ -304,8 +313,9 @@ public:
                                     coefficient_jobs.data(), 0, 0);
         context_->UpdateSubresource(cache_.vld_parameters.Get(), 0, nullptr,
                                     &vld_parameter_values, 0, 0);
-        context_->UpdateSubresource(cache_.idct_jobs.Get(), 0, nullptr,
-                                    idct_jobs.data(), 0, 0);
+        if (upload_idct_jobs)
+            context_->UpdateSubresource(cache_.idct_jobs.Get(), 0, nullptr,
+                                        idct_jobs.data(), 0, 0);
         context_->UpdateSubresource(cache_.quant_matrices.Get(), 0, nullptr,
                                     quant_matrices.data(), 0, 0);
         context_->UpdateSubresource(cache_.idct_parameters.Get(), 0, nullptr,
@@ -447,7 +457,78 @@ private:
         ComPtr<ID3D11UnorderedAccessView> error_uav;
     };
 
-    void ensure_cache(const prores::Frame& parsed, UINT packet_size,
+    struct IdctLayoutSlice {
+        std::uint16_t mb_x = 0;
+        std::uint16_t mb_y = 0;
+        std::uint16_t mb_count = 0;
+        std::uint32_t quant_scale = 0;
+        std::size_t job_begin = 0;
+        std::size_t job_end = 0;
+    };
+
+    struct IdctJobUpdate {
+        bool dirty = false;
+        bool layout_rebuilt = false;
+        std::uint32_t quant_slices_changed = 0;
+    };
+
+    IdctJobUpdate refresh_idct_jobs(const prores::Frame& parsed,
+                                    const std::vector<prores::CoefficientJob>& coefficient_jobs) {
+        bool same_layout = idct_layout_width_ == parsed.width &&
+                           idct_layout_height_ == parsed.height &&
+                           idct_layout_.size() == parsed.slices.size() &&
+                           coefficient_jobs.size() == parsed.slices.size() * 3;
+        if (same_layout && (idct_layout_.empty() ||
+                            idct_layout_.back().job_end != idct_jobs_.size()))
+            same_layout = false;
+        if (same_layout) {
+            for (std::size_t i = 0; i < parsed.slices.size(); ++i) {
+                const auto& slice = parsed.slices[i];
+                const auto& layout = idct_layout_[i];
+                if (layout.mb_x != slice.mb_x || layout.mb_y != slice.mb_y ||
+                    layout.mb_count != slice.mb_count ||
+                    layout.job_begin > layout.job_end ||
+                    layout.job_end > idct_jobs_.size() ||
+                    layout.job_end - layout.job_begin != static_cast<std::size_t>(slice.mb_count) * 8) {
+                    same_layout = false;
+                    break;
+                }
+            }
+        }
+        if (!same_layout) {
+            prores::make_idct_jobs(parsed, coefficient_jobs, idct_jobs_);
+            idct_layout_.clear();
+            idct_layout_.reserve(parsed.slices.size());
+            std::size_t job_begin = 0;
+            for (const auto& slice : parsed.slices) {
+                const auto quant_scale = slice.quant_index > 128
+                    ? static_cast<std::uint32_t>(slice.quant_index - 96) * 4 : slice.quant_index;
+                const auto job_end = job_begin + static_cast<std::size_t>(slice.mb_count) * 8;
+                idct_layout_.push_back({slice.mb_x, slice.mb_y, slice.mb_count,
+                                        quant_scale, job_begin, job_end});
+                job_begin = job_end;
+            }
+            idct_layout_width_ = parsed.width;
+            idct_layout_height_ = parsed.height;
+            return {true, true, static_cast<std::uint32_t>(parsed.slices.size())};
+        }
+        IdctJobUpdate update{};
+        for (std::size_t i = 0; i < parsed.slices.size(); ++i) {
+            const auto quant_index = parsed.slices[i].quant_index;
+            const auto quant_scale = quant_index > 128
+                ? static_cast<std::uint32_t>(quant_index - 96) * 4 : quant_index;
+            auto& layout = idct_layout_[i];
+            if (layout.quant_scale == quant_scale) continue;
+            for (auto job = layout.job_begin; job < layout.job_end; ++job)
+                idct_jobs_[job].quant_scale = quant_scale;
+            layout.quant_scale = quant_scale;
+            update.dirty = true;
+            ++update.quant_slices_changed;
+        }
+        return update;
+    }
+
+    bool ensure_cache(const prores::Frame& parsed, UINT packet_size,
                       UINT coefficient_job_count, UINT coefficient_count,
                       UINT idct_job_count) {
         const UINT padded_packet_size = (packet_size + 3u) & ~3u;
@@ -456,7 +537,7 @@ private:
             cache_.coefficient_job_count == coefficient_job_count &&
             cache_.coefficient_count == coefficient_count &&
             cache_.idct_job_count == idct_job_count)
-            return;
+            return false;
 
         const std::uint64_t rounded =
             (static_cast<std::uint64_t>(padded_packet_size) + 65535u) & ~std::uint64_t(65535u);
@@ -517,6 +598,7 @@ private:
                                                     &replacement.error_uav),
                  "Create VLD error UAV");
         cache_ = std::move(replacement);
+        return true;
     }
 
     GstD3D11Device* gst_device_;
@@ -529,6 +611,9 @@ private:
     Cache cache_;
     std::vector<prores::CoefficientJob> coefficient_jobs_;
     std::vector<prores::IdctBlockJob> idct_jobs_;
+    std::vector<IdctLayoutSlice> idct_layout_;
+    std::uint16_t idct_layout_width_ = 0;
+    std::uint16_t idct_layout_height_ = 0;
 };
 
 }  // namespace
@@ -802,13 +887,18 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
         GST_INFO_OBJECT(self, "CPU_STAGE seq=%" G_GUINT64_FORMAT
                         " pts_ns=%" G_GUINT64_FORMAT
                         " parse_ms=%.6f negotiate_ms=%.6f allocate_ms=%.6f"
-                        " coefficient_jobs_ms=%.6f idct_jobs_ms=%.6f cache_ms=%.6f"
+                        " coefficient_jobs_ms=%.6f idct_jobs_ms=%.6f"
+                        " idct_layout_rebuilt=%u idct_quant_slices_changed=%u"
+                        " idct_gpu_upload=%u cache_ms=%.6f"
                         " output_uav_ms=%.6f device_lock_ms=%.6f"
                         " upload_ms=%.6f vld_submit_ms=%.6f vld_map_ms=%.6f"
                         " map_attempts=%" G_GUINT64_FORMAT " idct_submit_ms=%.6f"
                         " backend_ms=%.6f finish_ms=%.6f", sequence, pts,
                         parse_ms, negotiate_ms, allocate_ms,
                         decode_timing.coefficient_jobs_ms, decode_timing.idct_jobs_ms,
+                        decode_timing.idct_layout_rebuilt,
+                        decode_timing.idct_quant_slices_changed,
+                        decode_timing.idct_gpu_upload,
                         decode_timing.cache_ms, decode_timing.output_uav_ms,
                         decode_timing.device_lock_ms, decode_timing.upload_ms,
                         decode_timing.vld_submit_ms, decode_timing.vld_map_ms,

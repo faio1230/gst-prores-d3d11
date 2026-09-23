@@ -163,11 +163,16 @@ def align_pts(rows, record, present_csv, stage_csv, display_column):
     missing_with_gpu_completion = 0
     next_display_position = Counter()
     cadence_examples = []
+    not_displayed_frames = []
     for key in sorted(interior & captured - displayed):
         row = matched_rows[key][0]
         present_ms = metric(row, 'CPUStartQPCTimeInMs') + metric(row, 'MsCPUBusy')
         position = bisect_right(display_times, present_ms)
         if position == len(display_times):
+            not_displayed_frames.append({'loop': key[0], 'pts_ns': key[1],
+                                         'present_qpc_ms': present_ms,
+                                         'next_display_qpc_ms': None,
+                                         'gpu_headroom_to_next_display_ms': None})
             continue
         refresh_ms, refresh_key = display_events[position]
         if refresh_key[0] != key[0]:
@@ -199,6 +204,12 @@ def align_pts(rows, record, present_csv, stage_csv, display_column):
             next_present_observed += 1
             if next_present_ms <= refresh_ms:
                 next_present_before_refresh += 1
+        not_displayed_frames.append({'loop': key[0], 'pts_ns': key[1],
+                                     'present_qpc_ms': present_ms,
+                                     'next_display_qpc_ms': refresh_ms,
+                                     'gpu_headroom_to_next_display_ms': gpu_headroom,
+                                     'next_present_before_next_display':
+                                     next_present_ms <= refresh_ms if next_present_ms is not None else None})
         if len(cadence_examples) < 12:
             cadence_examples.append({'loop': key[0], 'pts_ns': key[1],
                                      'gpu_headroom_to_next_display_ms': gpu_headroom,
@@ -223,6 +234,7 @@ def align_pts(rows, record, present_csv, stage_csv, display_column):
             'interior_confirmed_displayed': len(interior & displayed),
             'interior_captured_but_not_displayed': len(interior & captured - displayed),
             'interior_uncaptured': len(interior - captured),
+            'interior_not_displayed_frames': not_displayed_frames,
             'interior_by_loop': interior_by_loop,
             'interior_window_state_by_display': {key: dict(value)
                                                  for key, value in window_by_result.items()},
