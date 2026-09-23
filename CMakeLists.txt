@@ -148,6 +148,20 @@ if(BUILD_GSTREAMER_PLUGIN)
   if(MSVC)
     target_compile_options(d3d11_display_bench PRIVATE /W4 /utf-8)
   endif()
+
+  add_executable(d3d11_present_control tests/d3d11_present_control.cpp)
+  target_include_directories(d3d11_present_control PRIVATE
+    "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
+    "${GSTREAMER_ROOT}/lib/glib-2.0/include" "${GSTREAMER_ROOT}/lib/gstreamer-1.0/include")
+  target_link_directories(d3d11_present_control PRIVATE "${GSTREAMER_ROOT}/lib")
+  target_link_libraries(d3d11_present_control PRIVATE gstd3d11-1.0 gstapp-1.0 gstvideo-1.0
+    gstbase-1.0 gstreamer-1.0 gobject-2.0 glib-2.0 d3d11 dxgi user32)
+  target_compile_definitions(d3d11_present_control PRIVATE
+    GST_USE_UNSTABLE_API NOMINMAX WIN32_LEAN_AND_MEAN)
+  add_dependencies(d3d11_present_control gstproresd3d11)
+  if(MSVC)
+    target_compile_options(d3d11_present_control PRIVATE /W4 /utf-8)
+  endif()
 endif()
 add_executable(dx11_primitives src/dx11_primitives.cpp)
 target_link_libraries(dx11_primitives PRIVATE d3d11 d3dcompiler)

@@ -14,3 +14,10 @@ __pycache__/
 /results/d3d11-display-stages-check/
 /results/d3d11-display-dji-preroll-pilot/
 /results/proton-real-rgb-explicit-pilot.*
+# Present同期条件決め用の短時間試行。正式な反復CSVはresults/present-control-*-4k60-2026-09-24/。
+/results/present-control-pilot*/
+/results/present-control-window-state-pilot*/
+/results/present-control-topmost-pilot*/
+/results/present-control-topmost-direct.csv
+/results/present-control-dji-pilot.csv
+/results/present-control-pilot.csv
