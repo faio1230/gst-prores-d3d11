@@ -52,3 +52,9 @@ python scripts/summarize-presentmon-display.py results/present-sync-standard-202
 ```
 
 変更後のビルド、DX11係数・画素・D3D11Memory、GStreamer EOS／seek／動的caps／RGBの回帰は`results/verification-present-sync-2026-09-24/`に記録した。初期のsettleなし試行では末尾2枚のPresentMon行が確定せず、内側1枚も未捕捉になったため採用集計には含めない。
+
+### 通常decoder QoSでの追加確認
+
+上のA/BはdecoderのQoS破棄だけを無効化し、OS未表示を独立に測った。通常QoSへ戻し、同じDJI実写4K60・3周・最前面・preroll・専用RGB・EOS後150ms待機で追加した。同期値1の2試行はOS表示時刻なし0/1420・0/1432枚（PTS内側、捕捉漏れ0）だったが、GStreamer出力は1426/1440・1438/1440枚。欠けた14・2枚はdecoder入力後／出力前のQoS破棄で、sink申告dropは0。最初の試行では`Present1(1)` APIが最大110.327msかかり、次のPTSのsink pushも119.2ms待ち、後続にQoS破棄が集中した。同期値0の対照1試行は1440/1440枚、内側OS未表示0/1434枚であり、試行間変動が大きい。**同期値1はOS側を改善しても、通常QoSを含むend-to-end無欠落を満たしていない**。この少数の非交互試行で同期値1が通常QoSに不利と断定しない。
+
+個別PTS・PresentMon・GPU・段階時刻は`results/present-sync-normal-qos-2026-09-24/`。通常QoSの残るsink待ちを復号器内部の負荷と混同せず、同時に短い最大待ちとOS無欠落を満たす保守可能な表示経路が必要である。
