@@ -144,6 +144,8 @@ def main():
     parser.add_argument('--settle-ms', type=int, default=0,
                         help='診断用: 最終EOS後、swap chain破棄前に待機（最大5000ms）')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
+    parser.add_argument('--plugin-dir', type=Path,
+                        help='交互比較用: DX11プラグインとCSOを含む内部ステージ')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
         parser.error('loops/repeats must be positive')
@@ -162,11 +164,16 @@ def main():
                 hashlib.sha256(DIAGNOSTIC_D3D11_DLL.read_bytes()).hexdigest() !=
                 DIAGNOSTIC_D3D11_SHA256):
             parser.error('非公開ABI診断は検証済みgstd3d11.dllのSHA256一致が必要')
+    plugin_dir = args.plugin_dir.resolve() if args.plugin_dir else PLUGIN
+    plugin_dll = plugin_dir / 'gstproresd3d11.dll'
+    if not plugin_dll.is_file():
+        parser.error(f'DX11プラグインがありません: {plugin_dll}')
     args.out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env['PATH'] = str(GST) + os.pathsep + env.get('PATH', '')
-    env['GST_PLUGIN_PATH'] = str(PLUGIN)
-    env['GST_REGISTRY'] = str(ROOT / 'build/vs18/plugin-display-registry.bin')
+    env['GST_PLUGIN_PATH'] = str(plugin_dir)
+    env['GST_REGISTRY'] = str(args.out / 'gst-registry.bin') if args.plugin_dir else str(
+        ROOT / 'build/vs18/plugin-display-registry.bin')
     env.pop('PRORES_DX11_SHADER_DIR', None)
     for source in args.inputs:
         source = source.resolve()
@@ -231,6 +238,8 @@ def main():
             record = json.loads(process.stdout)
             record.update(input=str(source), repeat=repeat, source_fps=probe['r_frame_rate'],
                           source_frames=int(probe['nb_frames']), gpu=gpu_stats(monitor_path),
+                          plugin_dir=str(plugin_dir),
+                          plugin_sha256=hashlib.sha256(plugin_dll.read_bytes()).hexdigest(),
                           stages=stage_stats(stem.with_suffix('.stages.csv'),
                                              int(probe['nb_frames']), args.loops,
                                              record['rendered'], args.queue_after_rgb),
