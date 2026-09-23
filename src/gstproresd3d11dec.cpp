@@ -160,7 +160,7 @@ ComPtr<ID3D11Query> make_query(ID3D11Device* device, D3D11_QUERY type) {
     D3D11_QUERY_DESC desc{};
     desc.Query = type;
     ComPtr<ID3D11Query> query;
-    check_hr(device->CreateQuery(&desc, &query), "Create GPU timing query");
+    check_hr(device->CreateQuery(&desc, &query), "Create D3D11 query");
     return query;
 }
 
@@ -384,8 +384,10 @@ public:
         context_->CSSetShaderResources(0, 3, null_idct_srvs);
         context_->CSSetShader(nullptr, nullptr, 0);
         const auto staging = cache_.error_staging[next_staging_index_];
+        const auto ready_query = cache_.error_ready[next_staging_index_];
         if (timing_) context_->End(timing_->copy_begin.Get());
         context_->CopyResource(staging.Get(), cache_.errors.Get());
+        context_->End(ready_query.Get());
         if (timing_) {
             context_->End(timing_->copy_end.Get());
             context_->End(timing_->disjoint.Get());
@@ -403,7 +405,8 @@ public:
         {
             std::lock_guard<std::mutex> queue_lock(error_mutex_);
             if (!error_failure_.empty()) throw std::runtime_error(error_failure_);
-            pending_errors_.push_back({staging, static_cast<UINT>(coefficient_jobs.size()),
+            pending_errors_.push_back({staging, ready_query,
+                                       static_cast<UINT>(coefficient_jobs.size()),
                                        frame_sequence_++, pts});
             next_staging_index_ = (next_staging_index_ + 1) % kErrorRingSize;
         }
@@ -414,13 +417,9 @@ public:
 
     void drain_errors() {
         std::unique_lock<std::mutex> queue_lock(error_mutex_);
-        draining_errors_ = true;
-        error_cv_.notify_all();
-        const bool completed = error_cv_.wait_for(queue_lock, std::chrono::seconds(10), [&] {
+        if (!error_cv_.wait_for(queue_lock, std::chrono::seconds(10), [&] {
                 return pending_errors_.empty() || !error_failure_.empty();
-            });
-        draining_errors_ = false;
-        if (!completed) {
+            })) {
             queue_lock.unlock();
             check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed during VLD drain");
             throw std::runtime_error("delayed VLD error drain exceeded 10 seconds");
@@ -440,7 +439,6 @@ public:
             std::lock_guard<std::mutex> queue_lock(error_mutex_);
             pending_errors_.clear();
             error_failure_.clear();
-            draining_errors_ = false;
         }
         next_staging_index_ = 0;
     }
@@ -450,6 +448,7 @@ private:
 
     struct PendingError {
         ComPtr<ID3D11Buffer> staging;
+        ComPtr<ID3D11Query> ready;
         UINT job_count;
         std::uint64_t frame_sequence;
         GstClockTime pts;
@@ -461,6 +460,21 @@ private:
         {
             DeviceLock lock(gst_device_);
             context_->Flush();
+        }
+        for (;;) {
+            if (stop_error_worker_.load(std::memory_order_acquire)) return false;
+            HRESULT result;
+            {
+                DeviceLock lock(gst_device_);
+                result = context_->GetData(pending.ready.Get(), nullptr, 0,
+                                           D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            }
+            if (result == S_OK) break;
+            if (result != S_FALSE) check_hr(result, "Get VLD error copy completion");
+            check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed waiting for VLD error copy");
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error("delayed VLD error copy exceeded 10 seconds");
+            std::this_thread::sleep_for(std::chrono::microseconds(250));
         }
         std::size_t failed_job = pending.job_count;
         for (;;) {
@@ -502,8 +516,7 @@ private:
                 std::unique_lock<std::mutex> queue_lock(error_mutex_);
                 error_cv_.wait(queue_lock, [&] {
                     return stop_error_worker_.load(std::memory_order_acquire) ||
-                           pending_errors_.size() >= 2 ||
-                           (draining_errors_ && !pending_errors_.empty());
+                           !pending_errors_.empty();
                 });
                 if (stop_error_worker_.load(std::memory_order_acquire)) return;
                 pending = pending_errors_.front();
@@ -612,6 +625,7 @@ private:
         ComPtr<ID3D11Buffer> coefficients;
         ComPtr<ID3D11Buffer> errors;
         std::array<ComPtr<ID3D11Buffer>, kErrorRingSize> error_staging;
+        std::array<ComPtr<ID3D11Query>, kErrorRingSize> error_ready;
         ComPtr<ID3D11Buffer> vld_parameters;
         ComPtr<ID3D11Buffer> idct_jobs;
         ComPtr<ID3D11Buffer> quant_matrices;
@@ -731,6 +745,8 @@ private:
         for (auto& staging : replacement.error_staging)
             staging = structured_buffer(device_, coefficient_job_count,
                 sizeof(std::uint32_t), 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ);
+        for (auto& ready : replacement.error_ready)
+            ready = make_query(device_, D3D11_QUERY_EVENT);
         replacement.vld_parameters = make_buffer(device_, sizeof(VldParameters),
                                                    D3D11_BIND_CONSTANT_BUFFER);
         replacement.idct_jobs = structured_buffer(device_, idct_job_count,
@@ -785,7 +801,6 @@ private:
     std::thread error_worker_;
     std::deque<PendingError> pending_errors_;
     std::string error_failure_;
-    bool draining_errors_ = false;
     std::size_t next_staging_index_ = 0;
     std::uint64_t frame_sequence_ = 0;
     std::vector<prores::CoefficientJob> coefficient_jobs_;

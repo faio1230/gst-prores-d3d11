@@ -33,3 +33,9 @@ RTX 3070でビルド、係数完全一致、合成1080p/4Kの画素差最大1 co
 ワーカーの開始条件を未回収2枚、またはEOS/drainで残りがある場合に変更した。3面上限とFIFO、`Flush()`後の非blocking Map、10秒期限、flushing seekの破棄は維持した。ビルド、係数完全一致、画素差最大1、EOS×3・seek×4・RGB・破損14例、公開素材779枚のD3D11Memory/EOS、ASan変異2,000件（AC境界9件拒否）は通過。合成1080p directの単独3反復は378.152/380.801/382.038fpsで、前版の交互比較中央値314.561fpsより高いが、同時期の旧版との交互比較ではないため性能ゲートには使わない。
 
 通常QoS・Present(0)の実写4K60×10周パイロットは**4781/4800枚**で、19枚がすべてdecoder出力前のQoS欠落、sink dropは0枚だった。全試行decoder欠落0枚の必須条件に反するため、この候補の独立ステージ交互4組と待機p99・最大値は実施せず、採用しない。次の実装変更は、1枚目から回収ワーカーを動かしつつ、各error copyの後にD3D11 event queryを置き、ワーカーはevent完了を確認してからstagingをMapする方式へ替えること。2枚蓄積による回収開始遅延をなくし、未完了stagingへのMapポーリングを減らす狙いであり、効果は未検証。記録は`results/verification-vld-worker-two-deep-2026-09-24/`、`results/vld-worker-two-deep-direct-pilot-2026-09-24/`、`results/display-vld-worker-two-deep-pilot-2026-09-24/`。
+
+## D3D11 event query版（採用不合格）
+
+3面の各error stagingに`D3D11_QUERY_EVENT`を対応させ、copy直後に`End(query)`を投入した。ワーカーを再び1枚目から動かし、明示`Flush()`後の`GetData(DONOTFLUSH)`が`S_OK`になってからstagingを非blocking Mapする。[Microsoftのevent query仕様](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_query)ではGPUの先行命令完了を`S_OK`で示し、[DONOTFLUSHの仕様](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_async_getdata_flag)は未提出命令への無限待ちを警告するため、Flushを維持した。待機中はdevice lockを保持しない。ビルドとプラグイン試験（EOS×3、seek×4、RGB、破損14例）は通過。係数・画素、公開素材779枚、ASan変異はこの候補では再実行していない。
+
+合成1080p direct単独3反復は431.772/445.199/448.019fps。ただし旧版との交互比較ではない。通常QoS・Present(0)の実写4K60×10周パイロットは**4780/4800枚**で、20枚がすべてdecoder出力前、sink dropは0枚。decoder欠落全試行0枚に反するので独立ステージ交互4組と待機p99・最大値は実施せず、採用しない。次の実装変更は、利用可能なD3D11.3の`ID3D11DeviceContext3::Flush1`によるWin32完了イベント通知に回収ワーカーを切り替え、`GetData`のdevice lock付き反復をなくすこと。非対応deviceは明示的に停止し、CPU/Vulkan fallbackは置かない。効果・互換性は未検証。記録は`results/vld-worker-event-direct-pilot-2026-09-24/`と`results/display-vld-worker-event-pilot-2026-09-24/`。
