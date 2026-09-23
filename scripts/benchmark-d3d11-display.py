@@ -125,8 +125,10 @@ def main():
                         help='診断用: sink同期時刻の相対移動（負値は早い提出、単位ms）')
     parser.add_argument('--present-sync-interval', type=int, choices=(0, 1), default=0,
                         help='診断用: 固定GStreamer 1.28.2 sinkのPresent1同期値を1にする')
+    parser.add_argument('--sink-no-clock-sync', action='store_true',
+                        help='診断用: sinkのPTS時計同期を外し、Presentの同期だけで供給する')
     parser.add_argument('--settle-ms', type=int, default=0,
-                        help='診断用: 最終EOS後、swap chain破棄前に待機（最大500ms）')
+                        help='診断用: 最終EOS後、swap chain破棄前に待機（最大5000ms）')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
@@ -137,8 +139,8 @@ def main():
         parser.error('--sink-ts-offset-ms は-100～100を指定する')
     if args.present_sync_interval == 1 and not args.preroll:
         parser.error('--present-sync-interval 1 には--prerollが必要')
-    if not 0 <= args.settle_ms <= 500:
-        parser.error('--settle-ms は0～500を指定する')
+    if not 0 <= args.settle_ms <= 5000:
+        parser.error('--settle-ms は0～5000を指定する')
     if args.present_sync_interval == 1:
         if (not DIAGNOSTIC_D3D11_DLL.is_file() or
                 hashlib.sha256(DIAGNOSTIC_D3D11_DLL.read_bytes()).hexdigest() !=
@@ -192,6 +194,8 @@ def main():
                         command.append(f'sink-ts-offset-ms={args.sink_ts_offset_ms}')
                     if args.present_sync_interval == 1:
                         command.append('present-sync1')
+                    if args.sink_no_clock_sync:
+                        command.append('sink-no-clock-sync')
                     if args.settle_ms:
                         command.append(f'settle-ms={args.settle_ms}')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:

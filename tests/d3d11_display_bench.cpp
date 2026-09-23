@@ -393,8 +393,8 @@ int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
-    if (argc < 4 || argc > 17)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [present-sync1] [settle-ms=N]]");
+    if (argc < 4 || argc > 18)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [present-sync1] [settle-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
@@ -404,6 +404,7 @@ int main(int argc, char** argv) try {
     bool trace_window_state = false;
     bool topmost_window = false;
     bool present_sync1 = false;
+    bool sink_clock_sync = true;
     guint sink_stall_ms = 0;
     guint settle_ms = 0;
     int sink_ts_offset_ms = 0;
@@ -418,6 +419,7 @@ int main(int argc, char** argv) try {
         else if (option == "trace-window-state") trace_window_state = true;
         else if (option == "topmost-window") { topmost_window = true; trace_window_state = true; }
         else if (option == "present-sync1") present_sync1 = true;
+        else if (option == "sink-no-clock-sync") sink_clock_sync = false;
         else if (option.rfind("sink-ts-offset-ms=", 0) == 0)
             sink_ts_offset_ms = std::stoi(option.substr(std::string("sink-ts-offset-ms=").size()));
         else if (option.rfind("sink-stall-ms=", 0) == 0)
@@ -427,7 +429,7 @@ int main(int argc, char** argv) try {
         else throw std::runtime_error("unknown display option: " + option);
     }
     if (sink_stall_ms > 1000) throw std::runtime_error("sink stall must be at most 1000ms");
-    if (settle_ms > 500) throw std::runtime_error("settle time must be at most 500ms");
+    if (settle_ms > 5000) throw std::runtime_error("settle time must be at most 5000ms");
     if (sink_ts_offset_ms < -100 || sink_ts_offset_ms > 100)
         throw std::runtime_error("sink ts offset must be between -100 and 100ms");
     if (present_sync1 && !preroll)
@@ -489,6 +491,11 @@ int main(int argc, char** argv) try {
         if (!decoder) throw std::runtime_error("decoder-no-qos requires ProRes input");
         g_object_set(decoder, "qos", FALSE, nullptr);
     }
+    if (!sink_clock_sync) g_object_set(sink, "sync", FALSE, nullptr);
+    gboolean actual_sink_clock_sync = FALSE;
+    g_object_get(sink, "sync", &actual_sink_clock_sync, nullptr);
+    if (static_cast<bool>(actual_sink_clock_sync) != sink_clock_sync)
+        throw std::runtime_error("sink clock sync was not applied");
     if (lossless) g_object_set(sink, "qos", FALSE, "max-lateness", gint64(-1), nullptr);
     if (sink_ts_offset_ms)
         g_object_set(sink, "ts-offset", static_cast<gint64>(sink_ts_offset_ms) * GST_MSECOND, nullptr);
@@ -654,6 +661,7 @@ int main(int argc, char** argv) try {
               << ",\"topmost_request_ok\":" << (presents.topmost_request_ok ? "true" : "false")
               << ",\"sink_ts_offset_ms\":" << sink_ts_offset_ms
               << ",\"present_sync_interval\":" << (present_sync1 ? 1 : 0)
+              << ",\"sink_clock_sync\":" << (sink_clock_sync ? "true" : "false")
               << ",\"present_sync_hook_calls\":" << sync_hook_calls.load()
               << ",\"present_sync_hook_success\":" << sync_hook_success.load()
               << ",\"present_sync_hook_swapchain1\":" << sync_hook_swapchain1.load()

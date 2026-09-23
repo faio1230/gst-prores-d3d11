@@ -58,3 +58,18 @@ python scripts/summarize-presentmon-display.py results/present-sync-standard-202
 上のA/BはdecoderのQoS破棄だけを無効化し、OS未表示を独立に測った。通常QoSへ戻し、同じDJI実写4K60・3周・最前面・preroll・専用RGB・EOS後150ms待機で追加した。同期値1の2試行はOS表示時刻なし0/1420・0/1432枚（PTS内側、捕捉漏れ0）だったが、GStreamer出力は1426/1440・1438/1440枚。欠けた14・2枚はdecoder入力後／出力前のQoS破棄で、sink申告dropは0。最初の試行では`Present1(1)` APIが最大110.327msかかり、次のPTSのsink pushも119.2ms待ち、後続にQoS破棄が集中した。同期値0の対照1試行は1440/1440枚、内側OS未表示0/1434枚であり、試行間変動が大きい。**同期値1はOS側を改善しても、通常QoSを含むend-to-end無欠落を満たしていない**。この少数の非交互試行で同期値1が通常QoSに不利と断定しない。
 
 個別PTS・PresentMon・GPU・段階時刻は`results/present-sync-normal-qos-2026-09-24/`。通常QoSの残るsink待ちを復号器内部の負荷と混同せず、同時に短い最大待ちとOS無欠落を満たす保守可能な表示経路が必要である。
+
+### sink時計同期とPresent同期を分けた診断
+
+標準sinkの`sync=true`（PTSをパイプライン時計へ合わせる）だけを外し、診断専用hookの`Present1(1)`は両条件で維持した。`tests/d3d11_display_bench.cpp`の`sink-no-clock-sync`は実際のsink propertyを読み戻して検証し、`scripts/benchmark-display-clock-sync.ps1`が順序を交互にしてPresentMonのPID/QPC/PTS照合と完全捕捉を要求する。いずれもRTX 3070／60Hz、最前面、通常decoder QoS、専用RGB、preroll、EOS後150ms保持、DJI実写4K60 480枚×3周。非公開ABI hookは前節と同じ診断専用で、製品プラグインは変更しない。
+
+| 試行順 | sink時計同期 | GStreamer出力 / 予定 | decoder QoS欠落 | 内側OS未表示 / 捕捉 | 最大OS表示間隔 |
+|---|---|---:|---:|---:|---:|
+| 0 | あり | 1436/1440 | 4 | 0/1430 | 33.321ms |
+| 1 | なし | 1440/1440 | 0 | 0/1434 | 38.313ms |
+| 2 | なし | 1440/1440 | 0 | 0/1434 | 21.640ms |
+| 3 | あり | 1436/1440 | 4 | 0/1430 | 33.377ms |
+
+時計同期なしは2試行で出力前欠落を避けたが、1試行の最大表示間隔38.313msは60Hzの2周期を超える。短い2組だけで滑らかさを保証しない。24fpsでも素材PTSを守れるかを同じ実写経路で確認すると、129枚のwall時間は同期あり5,335ms／なし2,114ms、GStreamerのpresent間隔中央値は41.641ms／16.658ms。PresentMonは両方とも内側127/127枚を捕捉しOS未表示0だったが、時計同期なしは約2.52倍速であり、`Present1(1)`の60Hz pacingは24fpsのPTS同期を代替できない。診断時のEOS後保持は3,000msとし、表示wall値には含めない。
+
+生記録・PTS照合は`results/display-clock-sync-long-2026-09-24/`と`results/display-clock-sync-24fps-hold-2026-09-24/`、再現スクリプトは`scripts/benchmark-display-clock-sync.ps1`。短い24fps試行を同名出力へ再取得した際、PresentMonが短命PIDを識別できず捕捉不足になった記録は採用せず、非コミットの`build/vs18/failed-display-clock-sync-24fps-2026-09-24/`に移して保持した。長い試行・再取得した24fps試行はいずれも要約器の完全捕捉判定を通過。時計同期なしを製品設定へは採用せず、PTSを保ったままsink待ち・decoder QoS欠落とOS未表示を両立して減らす保守可能な経路が必要である。
