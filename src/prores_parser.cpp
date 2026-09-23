@@ -244,8 +244,16 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     if (picture_size > size - picture_offset ||
         picture_size < static_cast<std::uint32_t>(picture_header_size))
         return fail(error, "invalid picture data size");
-    if (picture_offset + picture_size != size)
-        return fail(error, "progressive frame must contain exactly one complete picture");
+    const auto picture_end = picture_offset + picture_size;
+    // Recorders may pad the outer frame to 512 bytes (possibly with nonzero
+    // bytes) or use a small all-zero trailer.  The indexed picture still has
+    // to end exactly at its own size; the trailer is not entropy data.
+    const auto trailer_size = size - picture_end;
+    if (trailer_size && (trailer_size >= 512 ||
+        ((size & 511) != 0 &&
+         !std::all_of(data + picture_end, data + size,
+                      [](std::uint8_t byte) { return byte == 0; }))))
+        return fail(error, "progressive frame has an invalid picture trailer");
     const unsigned log2_slice_width = picture[7] >> 4;
     const unsigned log2_slice_height = picture[7] & 15;
     if (log2_slice_width > 3 || log2_slice_height)
@@ -269,7 +277,8 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     for (std::size_t i = 0; i < slice_count; ++i) {
         const auto slice_size = read_be16(index + i * 2);
         while (output.mb_width - mb_x < mb_count) mb_count >>= 1;
-        if (!mb_count || slice_size < 6 || slice_offset > size || slice_size > size - slice_offset)
+        if (!mb_count || slice_size < 6 || slice_offset > picture_end ||
+            slice_size > picture_end - slice_offset)
             return fail(error, "invalid slice size or macroblock coverage");
         const auto* slice_data = data + slice_offset;
         const auto slice_header_size = slice_data[0] >> 3;

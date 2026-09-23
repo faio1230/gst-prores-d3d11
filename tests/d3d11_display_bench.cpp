@@ -1,0 +1,186 @@
+// DX11 decode→RGB10A2→実際のD3D11 swapchain sinkを時計同期で計測する。
+#include <gst/gst.h>
+#include <windows.h>
+#include <psapi.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using Clock = std::chrono::steady_clock;
+
+static double ms(Clock::time_point first, Clock::time_point second) {
+    return std::chrono::duration<double, std::milli>(second - first).count();
+}
+
+static double cpu_seconds() {
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user))
+        throw std::runtime_error("GetProcessTimes failed");
+    ULARGE_INTEGER k{}, u{};
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+    return (k.QuadPart + u.QuadPart) / 10000000.0;
+}
+
+static double percentile(std::vector<double> numbers, double fraction) {
+    if (numbers.empty()) return 0;
+    std::sort(numbers.begin(), numbers.end());
+    return numbers[static_cast<std::size_t>(std::ceil((numbers.size() - 1) * fraction))];
+}
+
+struct PresentLog {
+    Clock::time_point origin{};
+    std::mutex mutex;
+    std::vector<double> times;
+};
+
+static void on_present(GstElement*, GstObject*, gpointer, gpointer data) {
+    auto* log = static_cast<PresentLog*>(data);
+    const auto now = Clock::now();
+    std::lock_guard<std::mutex> guard(log->mutex);
+    log->times.push_back(ms(log->origin, now));
+}
+
+static std::uint64_t sink_stat(GstElement* sink, const char* name) {
+    GstStructure* stats = nullptr;
+    g_object_get(sink, "stats", &stats, nullptr);
+    std::uint64_t value = 0;
+    if (stats) {
+        gst_structure_get_uint64(stats, name, &value);
+        gst_structure_free(stats);
+    }
+    return value;
+}
+
+int main(int argc, char** argv) try {
+    gst_init(&argc, &argv);
+    if (argc != 4) throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv");
+    const int loops = std::stoi(argv[2]);
+    if (loops < 1) throw std::runtime_error("loops must be positive");
+    GError* error = nullptr;
+    auto* pipeline = gst_parse_launch(
+        "filesrc name=source ! qtdemux ! proresd3d11dec ! d3d11convert ! "
+        "video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! "
+        "d3d11videosink name=sink sync=true emit-present=true qos=true", &error);
+    if (error || !pipeline) {
+        const std::string text = error ? error->message : "cannot construct pipeline";
+        if (error) g_error_free(error);
+        throw std::runtime_error(text);
+    }
+    auto* source = gst_bin_get_by_name(GST_BIN(pipeline), "source");
+    auto* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+    auto* bus = gst_element_get_bus(pipeline);
+    if (!source || !sink || !bus) throw std::runtime_error("pipeline endpoint missing");
+    g_object_set(source, "location", argv[1], nullptr);
+    gst_object_unref(source);
+    PresentLog presents;
+    presents.origin = Clock::now();
+    g_signal_connect(sink, "present", G_CALLBACK(on_present), &presents);
+    const auto start = Clock::now();
+    const auto cpu_start = cpu_seconds();
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
+        throw std::runtime_error("PLAYING failed");
+    std::vector<std::size_t> endpoints{0};
+    std::vector<double> seek_first_ms;
+    std::vector<std::uint64_t> rendered, dropped;
+    std::uint64_t qos = 0;
+    double seek_start = 0;
+    for (int loop = 0; loop < loops;) {
+        GstMessage* message = gst_bus_timed_pop_filtered(bus, 30 * GST_SECOND,
+            static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR | GST_MESSAGE_QOS));
+        if (!message) throw std::runtime_error("display pipeline timeout");
+        const auto type = GST_MESSAGE_TYPE(message);
+        if (type == GST_MESSAGE_ERROR) {
+            GError* gst_error = nullptr;
+            gchar* debug = nullptr;
+            gst_message_parse_error(message, &gst_error, &debug);
+            const std::string text = gst_error ? gst_error->message : "GStreamer error";
+            g_clear_error(&gst_error);
+            g_free(debug);
+            gst_message_unref(message);
+            throw std::runtime_error(text);
+        }
+        if (type == GST_MESSAGE_QOS) ++qos;
+        if (type == GST_MESSAGE_EOS) {
+            {
+                std::lock_guard<std::mutex> guard(presents.mutex);
+                endpoints.push_back(presents.times.size());
+                if (loop > 0 && endpoints.back() > endpoints[endpoints.size() - 2])
+                    seek_first_ms.push_back(presents.times[endpoints[endpoints.size() - 2]] - seek_start);
+            }
+            rendered.push_back(sink_stat(sink, "rendered"));
+            dropped.push_back(sink_stat(sink, "dropped"));
+            ++loop;
+            if (loop < loops) {
+                seek_start = ms(presents.origin, Clock::now());
+                if (!gst_element_seek_simple(pipeline, GST_FORMAT_TIME,
+                    static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE), 0))
+                    throw std::runtime_error("EOS seek failed");
+            }
+        }
+        gst_message_unref(message);
+    }
+    const auto finish = Clock::now();
+    const auto cpu_used = cpu_seconds() - cpu_start;
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    PROCESS_MEMORY_COUNTERS_EX memory{};
+    memory.cb = sizeof(memory);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+                              sizeof(memory))) throw std::runtime_error("GetProcessMemoryInfo failed");
+    std::ofstream csv(argv[3]);
+    if (!csv) throw std::runtime_error("cannot open present CSV");
+    csv << "loop,present_index,wall_ms,interval_ms\n";
+    std::vector<double> intervals;
+    for (int loop = 0; loop < loops; ++loop) {
+        for (std::size_t i = endpoints[loop]; i < endpoints[loop + 1]; ++i) {
+            const double interval = i > endpoints[loop] ? presents.times[i] - presents.times[i - 1] : 0;
+            csv << loop << ',' << i - endpoints[loop] << ',' << presents.times[i] << ',' << interval << '\n';
+            if (i > endpoints[loop] + 30) intervals.push_back(interval);
+        }
+    }
+    const double wall = ms(start, finish);
+    std::uint64_t total_rendered = 0, total_dropped = 0;
+    for (auto value : rendered) total_rendered += value;
+    for (auto value : dropped) total_dropped += value;
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    std::cout << std::fixed << std::setprecision(3)
+              << "{\"loops\":" << loops << ",\"present_count\":" << presents.times.size()
+              << ",\"rendered\":" << total_rendered << ",\"dropped\":" << total_dropped
+              << ",\"qos_messages\":" << qos
+              << ",\"wall_ms\":" << wall
+              << ",\"interval_p50_ms\":" << percentile(intervals, .5)
+              << ",\"interval_p95_ms\":" << percentile(intervals, .95)
+              << ",\"interval_p99_ms\":" << percentile(intervals, .99)
+              << ",\"seek_first_p95_ms\":" << percentile(seek_first_ms, .95)
+              << ",\"cpu_core_equivalent_percent\":" << cpu_used / (wall / 1000) * 100
+              << ",\"cpu_machine_percent\":" << cpu_used / (wall / 1000) * 100 / system.dwNumberOfProcessors
+              << ",\"peak_working_set_mib\":" << memory.PeakWorkingSetSize / 1048576.0
+              << ",\"private_mib_end\":" << memory.PrivateUsage / 1048576.0
+              << ",\"per_loop\":[";
+    for (int loop = 0; loop < loops; ++loop) {
+        if (loop) std::cout << ',';
+        std::cout << "{\"present\":" << endpoints[loop + 1] - endpoints[loop]
+                  << ",\"rendered\":" << rendered[loop]
+                  << ",\"dropped\":" << dropped[loop] << '}';
+    }
+    std::cout << "]}\n";
+    gst_object_unref(bus);
+    gst_object_unref(sink);
+    gst_object_unref(pipeline);
+    return 0;
+} catch (const std::exception& exception) {
+    std::cerr << "d3d11_display_bench: " << exception.what() << '\n';
+    return 1;
+}

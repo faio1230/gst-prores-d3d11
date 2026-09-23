@@ -265,7 +265,14 @@ public:
         context_->CSSetUnorderedAccessViews(0, 3, null_idct_uavs, nullptr);
         context_->CSSetShaderResources(0, 3, null_idct_srvs);
         context_->CSSetShader(nullptr, nullptr, 0);
-
+        // The pool can recycle these memory objects.  A direct UAV write does
+        // not pass through GstD3D11Memory's map path, so invalidate its cached
+        // staging copy explicitly before any downstream CPU mapping.
+        for (guint component = 0; component < 3; ++component) {
+            auto* memory = gst_buffer_peek_memory(output, component);
+            GST_MEMORY_FLAG_UNSET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
+            GST_MINI_OBJECT_FLAG_SET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
+        }
     }
 
 private:

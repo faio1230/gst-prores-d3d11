@@ -294,11 +294,31 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
     mutation[parsed.slices[0].offset + 3] = 0xff;
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "plane-size");
     mutation = packet.bytes;
-    mutation.push_back(0);
+    mutation.resize(parsed.slices.back().offset + parsed.slices.back().size);
+    mutation.insert(mutation.end(), 16 - (mutation.size() & 15), 0);
+    write_be32(mutation.data(), static_cast<std::uint32_t>(mutation.size()));
+    prores::Frame zero_padded;
+    std::string padding_error;
+    if (!prores::parse_frame(mutation.data(), mutation.size(), parsed.width,
+                             parsed.height, zero_padded, padding_error))
+        throw std::runtime_error("zero-padded frame rejected: " + padding_error);
+    mutation = packet.bytes;
+    mutation.push_back(0x7f);
+    if ((mutation.size() & 511) == 0) mutation.push_back(0x7f);
     write_be32(mutation.data(), static_cast<std::uint32_t>(mutation.size()));
     write_be32(mutation.data() + picture_offset + 1,
                static_cast<std::uint32_t>(mutation.size() - picture_offset));
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "unindexed-picture-tail");
+    mutation = packet.bytes;
+    mutation.push_back(0x7f);
+    if ((mutation.size() & 511) == 0) mutation.push_back(0x7f);
+    write_be32(mutation.data(), static_cast<std::uint32_t>(mutation.size()));
+    expect_rejection(std::move(mutation), parsed.width, parsed.height, "unaligned-frame-trailer");
+    mutation = packet.bytes;
+    mutation.insert(mutation.end(),
+                    512 + ((512 - (mutation.size() & 511)) & 511), 0);
+    write_be32(mutation.data(), static_cast<std::uint32_t>(mutation.size()));
+    expect_rejection(std::move(mutation), parsed.width, parsed.height, "oversized-frame-trailer");
     expect_rejection(packet.bytes, static_cast<std::uint16_t>(parsed.width + 2),
                      parsed.height, "caps-dimensions");
     return rejected;
@@ -580,7 +600,7 @@ int main(int argc, char** argv) try {
     // boundary; coefficients themselves remain bit exact.
     constexpr std::uint32_t pixel_tolerance = 1;
     const bool passed = coefficients_passed && maximum_pixel_difference <= pixel_tolerance &&
-                        malformed_rejections == 10 &&
+                        malformed_rejections == 12 &&
                         (!external_compared || external_difference.maximum <= pixel_tolerance);
     std::cout << "{\"passed\":" << (passed ? "true" : "false")
               << ",\"adapter\":\"" << adapter_name << "\""

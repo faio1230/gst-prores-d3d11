@@ -1,8 +1,8 @@
 # 独立したProRes GPUデコーダー
 
-主実装は純粋DX11の `proresd3d11dec`。比較用にFFmpeg Vulkanの `proresvkdec` も保持する。限定対象で最終アーキテクチャは成立したが、実素材、長時間、複数instance、表示／合成、他GPUを含む完成判定は[開発計画](プラグイン化計画.md)に従って継続する。
+主実装は純粋DX11の `proresd3d11dec`。比較用にFFmpeg Vulkanの `proresvkdec` も保持する。限定対象で最終アーキテクチャは成立した。実素材1080p/4K、長時間、複数instance、表示／合成を検証済みだが、色の採用許容値、安定した実表示、他GPUを含む完成判定は[開発計画](プラグイン化計画.md)に従って継続する。
 
-2026-09-22。利用先アプリを外し、GStreamer標準のパイプラインで使える `GstVideoDecoder` 派生の独立DLLとして検査した。環境はRTX 3070 / NVIDIA 591.86 / Windows 11 / GStreamer 1.28.2 MSVC x64。CPU画質参照にだけリポジトリ内固定FFmpeg 8.1.3を使う。
+2026-09-23更新。利用先アプリを外し、GStreamer標準のパイプラインで使える `GstVideoDecoder` 派生の独立DLLとして検査した。環境はRTX 3070 / NVIDIA 591.86 / Windows 11 / GStreamer 1.28.2 MSVC x64。CPU画質参照にだけリポジトリ内固定FFmpeg 8.1.3を使う。最新の実素材・表示結果は[実素材と表示検証](実素材と表示検証.md)。
 
 ## 純粋DX11版：proresd3d11dec
 
@@ -51,10 +51,15 @@ parserとVLD shaderのFFmpeg由来部分はSPDXでLGPL-2.1-or-laterを明記し�
 | 2プロセス同時4K、GPU完了込み | 各91.08/91.86 fps、両方成功 |
 | d3d11convert→RGB10A2 D3D11Memory→検査download | 1080p 152.6 fps、4K 68.0 fps、EOS成功 |
 | 2入力decode→convert→d3d11compositor→検査download | 1080p 118.4 fps、EOS成功 |
+| 公開カメラ由来1080p実写50フレーム | 固定FFmpeg CPU比Y/U/V最大差1 |
+| 公開カメラ由来4K実写129フレーム | 固定FFmpeg CPU比Y/U/V最大差1 |
+| RGB10A2全50フレーム、BT.709中央クロマCPU比 | R/G/B最大差5/2/5 |
+| RGB10A2全129フレーム、BT.709中央クロマCPU比 | R/G/B最大差6/2/5 |
+| clock同期の実表示1080p60／4K60 | 1080p 3試行drop 0、4K 3試行中1試行で14 drop |
 
-VLDを1-bit反復loadから32-bit windowへ変更する前の検査用download込み保存記録は1080p 4.22 fpsだった。最終値はそのボトルネックを除き、shaderをビルド時CSOへ変更した後の値。D3D11Memory直結の初回bufferは1080p 229 ms、4K 232 msで、実行時compile版の約0.5〜0.9秒から改善した。同一プロセス内の起動100回はp95 31.08 ms、seek 1000回はp95 3.84 msで全て成功。同一deviceの2instanceも成功。実表示、実素材、他GPUは未測定。
+VLDを1-bit反復loadから32-bit windowへ変更する前の検査用download込み保存記録は1080p 4.22 fpsだった。最終値はそのボトルネックを除き、shaderをビルド時CSOへ変更した後の値。D3D11Memory直結の初回bufferは1080p 229 ms、4K 232 msで、実行時compile版の約0.5〜0.9秒から改善した。同一プロセス内の起動100回はp95 31.08 ms、seek 1000回はp95 3.84 msで全て成功。同一deviceの2instanceも成功。他GPUは未測定。
 
-D3D11下流検査ではdecoderの3面I422_10LEからd3d11convertのRGB10A2_LE、d3d11compositor出力まで `memory:D3D11Memory` を維持した。RGB10A2は10bit channelを保持するが、YUV→RGB変換後の全画素比較やdisplay色管理はまだ行っていない。compositor内部のrender/copy回数も未計測なので、この下流全体をゼロコピーとは呼ばない。保存ログは `results/proresd3d11-compositor-caps.log`。
+D3D11下流検査ではdecoderの3面I422_10LEからd3d11convertのRGB10A2_LE、d3d11compositor出力まで `memory:D3D11Memory` を維持した。RGB10A2の全画素比較は実写1080p/4Kで行ったが、表示機器の色管理と素材のクロマ位置は未確定。compositor内部のrender/copy回数も未計測なので、この下流全体をゼロコピーとは呼ばない。保存ログは `results/proresd3d11-compositor-caps.log`。
 
 ## 比較用Vulkan版：proresvkdec
 
