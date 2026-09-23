@@ -74,6 +74,16 @@ python scripts/summarize-presentmon-display.py results/present-sync-standard-202
 
 生記録・PTS照合は`results/display-clock-sync-long-2026-09-24/`と`results/display-clock-sync-24fps-hold-2026-09-24/`、再現スクリプトは`scripts/benchmark-display-clock-sync.ps1`。短い24fps試行を同名出力へ再取得した際、PresentMonが短命PIDを識別できず捕捉不足になった記録は採用せず、非コミットの`build/vs18/failed-display-clock-sync-24fps-2026-09-24/`に移して保持した。長い試行・再取得した24fps試行はいずれも要約器の完全捕捉判定を通過。時計同期なしを製品設定へは採用せず、PTSを保ったままsink待ち・decoder QoS欠落とOS未表示を両立して減らす保守可能な経路が必要である。
 
+### IDCT配置キャッシュ後の同期値1・通常QoS
+
+IDCTジョブ準備を短縮した純粋DX11版でも、診断専用の標準sink Present同期値1を実写4K60・480枚×10周、PTS時計同期・通常decoder/sink QoS・非最前面で確認した。`scripts/benchmark-display-cpu-presentmon.ps1 -PresentSyncInterval 1`は固定GStreamer DLLのSHA256、hook全4798回成功、PresentMonのPID/QPC/PTS完全捕捉を要求する。CPU段階ログ付き試行ではGStreamer出力4789/4800枚、decoder QoS欠落11、OS表示時刻なし0/4769枚、最大OS表示間隔21.645ms。IDCTジョブ生成p99は0.329msだったが、欠落11枚中9枚は各周回のPTS約33.3msに集中し、直前フレームのVLDエラーstaging Map待ちが約24～31msに伸びた。sink push最大15.536msで、待ちをsink pushだけに帰せない。`results/display-idct-layout-cache-sync1-2026-09-24/`に全PTSとCPU段階を残す。
+
+CPU段階ログなしの同条件10周も4790/4800枚、decoder QoS欠落10。うち8枚は第2～9周のPTS約33.3ms、2枚は同じ境界直後のPTS約50msで、周回境界の問題は診断ログだけの副作用ではない。demuxとdecoderの間に検査用queueを置いた別10周も4791/4800枚、入力前欠落0、decoder出力前欠落9、最大圧縮入力→復号出力33.5ms。queueだけでは解消しない。両試行ではPresentMonを取得していない。記録は`results/display-idct-layout-cache-sync1-normal-2026-09-24/`と`results/display-idct-layout-cache-sync1-prequeue-2026-09-24/`。
+
+これはPresent(1)ならOS表示が必ず無欠落という証明でも、GPU Map待ちの根本原因の確定でもない。非公開ABI hookを製品化せず、VLD実GPU時間と待ち時間、前周のflip/Present、seek/prerollの時系列を分け、PTSを守ったままend-to-end 0欠落を反復確認するまで採用しない。
+
+追加の3周試行では診断用D3D11 timestamp/disjointとCPU段階を同時記録し、`GPU_STAGE`と`CPU_STAGE`各1440行のPTSを全件一致・disjoint 0と検査した。第2周境界のPTS 16.7msではVLDのstaging Map待ち15.446msに対しVLD shader GPU区間3.267ms、第3周境界の同PTSではMap待ち28.072msに対しGPU区間2.824ms。その直後のPTS 33.3/50msが第3周でdecoder QoS破棄された。GPU区間の全体中央値2.905ms、p99 3.597ms。Map待ちの長さをVLD shader実行時間だけで説明できないが、待ちはGPU queue、copy、driver内部や他のGPU作業を含み得るため正確な滞留位置は未特定。timestamp診断はIDCT完了まで追加で待つため、通常試行のQoS枚数（この試行は2/1440）へ流用しない。個別照合は`results/display-idct-layout-cache-sync1-gpu-stage-2026-09-24/cpu-gpu-stage-summary.json`。
+
 ### 同期値1とRGB後queueの交互診断
 
 `scripts/benchmark-display-queue-sync1.ps1`でDJI実写4K60を480枚×3周、RGB後の4 buffer非leaky queueなし→あり、あり→なしの順に比較した。標準sinkのPTS時計同期と通常decoder/sink QoSを維持し、診断専用の非公開ABI hookでPresent同期値だけを1にした。窓は各Presentで可視・非最小化・非最前面、前面窓との矩形重なり率23%。PresentMonは全試行でPID/QPC/PTS照合・内側捕捉漏れ0を確認した。

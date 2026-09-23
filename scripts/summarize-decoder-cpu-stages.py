@@ -37,7 +37,17 @@ def main():
     source_frames = trial["source_frames"]
     expected = source_frames * trial["loops"]
     rows = []
+    gpu_rows = []
+    gpu_disjoint = 0
     for line in args.stderr_log.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "GPU_STAGE_DISJOINT" in line:
+            gpu_disjoint += 1
+        elif "GPU_STAGE pts_ns=" in line:
+            match = re.search(r"GPU_STAGE pts_ns=(\d+) vld_ms=([0-9.]+) idct_ms=([0-9.]+)", line)
+            if not match:
+                raise ValueError("GPU_STAGEの項目が不足しています: " + line)
+            gpu_rows.append({"pts_ns": int(match[1]), "vld_ms": float(match[2]),
+                             "idct_ms": float(match[3])})
         if "CPU_STAGE seq=" not in line:
             continue
         fields = dict(re.findall(r"([a-z_]+)=([0-9.]+)", line.split("CPU_STAGE ", 1)[1]))
@@ -104,6 +114,26 @@ def main():
             "quant_slices_changed_total": sum(row["idct_quant_slices_changed"] for row in rows),
             "gpu_job_upload_frames": sum(row["idct_gpu_upload"] for row in rows),
             "gpu_job_upload_skipped_frames": sum(1 - row["idct_gpu_upload"] for row in rows),
+        }
+    if gpu_rows or gpu_disjoint:
+        if gpu_disjoint or len(gpu_rows) != expected or any(
+                gpu["pts_ns"] != cpu["pts_ns"] for cpu, gpu in zip(rows, gpu_rows)):
+            raise ValueError("CPU/GPU段階のPTS・枚数またはdisjointが不一致")
+        summary["gpu_stage"] = {
+            "vld_ms": distribution(gpu_rows, "vld_ms"),
+            "idct_ms": distribution(gpu_rows, "idct_ms"),
+            "largest_cpu_map_wait": [
+                {"seq": cpu["seq"], "pts_ns": cpu["pts_ns"],
+                 "vld_map_ms": cpu["vld_map_ms"], "gpu_vld_ms": gpu_rows[cpu["seq"]]["vld_ms"]}
+                for cpu in sorted(rows, key=lambda item: item["vld_map_ms"], reverse=True)[:20]
+            ],
+            "qos_missing_previous": [
+                {"seq": item["previous"]["seq"],
+                 "pts_ns": item["previous"]["pts_ns"],
+                 "vld_map_ms": item["previous"]["vld_map_ms"],
+                 "gpu_vld_ms": gpu_rows[item["previous"]["seq"]]["vld_ms"]}
+                for item in missing_rows if item["previous"] is not None
+            ],
         }
     if args.presentmon_summary:
         present = json.loads(args.presentmon_summary.read_text(encoding="utf-8-sig"))

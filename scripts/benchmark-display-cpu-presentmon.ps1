@@ -1,7 +1,8 @@
-# 標準Present(0)の通常QoSでCPU段階とOS表示記録を同じPTSへ結合する。
+# 標準Present(0)または診断専用Present(1)でCPU段階とOS表示を同じPTSへ結合する。
 [CmdletBinding()]
 param(
     [ValidateRange(1, 20)][int]$Loops = 10,
+    [ValidateSet(0, 1)][int]$PresentSyncInterval = 0,
     [string]$OutDir = 'results/display-cpu-presentmon-2026-09-24',
     [string]$Source = 'media/reference-dji-nature-4k60-rec709-hq.mov'
 )
@@ -36,10 +37,12 @@ try {
     Start-Sleep -Milliseconds 1200
     $env:PRORES_DX11_CPU_TIMING = '1'
     $env:GST_DEBUG = 'proresd3d11dec:4'
-    & $python scripts/benchmark-d3d11-display.py $sourcePath `
-        --loops $Loops --repeats 1 --preroll --native-rgb `
-        --trace-sink-return --trace-window-state --settle-ms 150 --out $trial `
-        *> (Join-Path $out 'benchmark.log')
+    $arguments = @('scripts/benchmark-d3d11-display.py', $sourcePath,
+        '--loops', [string]$Loops, '--repeats', '1', '--preroll', '--native-rgb',
+        '--trace-sink-return', '--trace-window-state', '--settle-ms', '150',
+        '--out', $trial)
+    if ($PresentSyncInterval -eq 1) { $arguments += @('--present-sync-interval', '1') }
+    & $python @arguments *> (Join-Path $out 'benchmark.log')
     if ($LASTEXITCODE) { throw '表示試行に失敗しました' }
     if (!$monitor.WaitForExit(30000) -or $monitor.ExitCode -ne 0 -or
         !(Test-Path -LiteralPath $capture)) { throw 'PresentMon取得に失敗しました' }
@@ -61,7 +64,7 @@ try {
     $present = Get-Content -LiteralPath $presentSummary -Raw | ConvertFrom-Json
     $cpu = Get-Content -LiteralPath $cpuSummary -Raw | ConvertFrom-Json
     $expected = $metrics.source_frames * $Loops
-    if ($metrics.present_sync_interval -ne 0 -or !$metrics.sink_clock_sync -or
+    if ($metrics.present_sync_interval -ne $PresentSyncInterval -or !$metrics.sink_clock_sync -or
         $metrics.decoder_no_qos -or $metrics.lossless_sink_policy -or
         $metrics.postrgb_queue -or $metrics.dropped -ne 0 -or
         $metrics.stages.compressed -ne $expected -or
@@ -69,7 +72,10 @@ try {
         $present.coverage_sufficient_trials -ne 1 -or
         $present.pts_aligned_trials -ne 1 -or
         $present.interior_uncaptured_aligned -ne 0 -or
-        $cpu.cpu_stage_rows -ne $expected) {
+        $cpu.cpu_stage_rows -ne $expected -or
+        ($PresentSyncInterval -eq 1 -and
+            ($metrics.present_sync_hook_calls -le 0 -or
+             $metrics.present_sync_hook_calls -ne $metrics.present_sync_hook_success))) {
         throw '表示・QoS・PTS照合の試行条件が不完全です'
     }
     $record = [ordered]@{
