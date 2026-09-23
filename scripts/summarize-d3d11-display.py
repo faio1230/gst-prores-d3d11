@@ -1,4 +1,4 @@
-"""実表示試行のsink統計と3段階のPTSログを突き合わせる。"""
+"""実表示試行のsink統計と段階別PTSログを突き合わせる。"""
 import argparse
 import csv
 import json
@@ -37,6 +37,7 @@ def main():
                        'rgb_converter': record.get('rgb_converter', 'd3d11convert'),
                        'predecode_queue': record.get('predecode_queue', False),
                        'decoder_no_qos': record.get('decoder_no_qos', False),
+                       'trace_sink_return': record.get('trace_sink_return', False),
                        'injected_sink_stall_ms': record.get('injected_sink_stall_ms', 0),
                        'expected': stages['expected_frames'], 'rendered': record['rendered'],
                        'sink_dropped': record['dropped'], 'qos': record['qos_messages'],
@@ -47,6 +48,10 @@ def main():
                        'present_p99_ms': record['interval_p99_ms'],
                        'first_present_ms': float(presents[0]['wall_ms']),
                        'max_present_gap_ms': max_present_gap,
+                       'sink_push_p99_ms': stages['stage_latency'].get(
+                           'sink_push_to_sink_return_ms', {}).get('p99'),
+                       'max_sink_push_ms': stages['stage_latency'].get(
+                           'sink_push_to_sink_return_ms', {}).get('max'),
                        'seek_first_p95_ms': record['seek_first_p95_ms'],
                        'cpu_machine_percent': record['cpu_machine_percent'],
                        'gpu_util_percent_mean': record['gpu']['gpu_util_percent_mean'],
@@ -55,6 +60,7 @@ def main():
     if len({trial['input'] for trial in trials}) != 1:
         parser.error('複数素材は別々に集計する')
     for field in ('rgb_converter', 'predecode_queue', 'decoder_no_qos',
+                  'trace_sink_return',
                   'injected_sink_stall_ms',
                   'lossless_sink_policy'):
         if len({trial[field] for trial in trials}) != 1:
@@ -67,6 +73,7 @@ def main():
                'rgb_converter': trials[0]['rgb_converter'],
                'predecode_queue': trials[0]['predecode_queue'],
                'decoder_no_qos': trials[0]['decoder_no_qos'],
+               'trace_sink_return': trials[0]['trace_sink_return'],
                'injected_sink_stall_ms': trials[0]['injected_sink_stall_ms'],
                'lossless_sink_policy': trials[0]['lossless_sink_policy'],
                'repeats': len(trials),
@@ -82,6 +89,12 @@ def main():
                'median_gpu_util_percent_mean': median('gpu_util_percent_mean'),
                'median_peak_working_set_mib': median('peak_working_set_mib'),
                'max_present_gap_ms': max(trial['max_present_gap_ms'] for trial in trials),
+               'median_sink_push_p99_ms': median('sink_push_p99_ms'),
+               'max_sink_push_ms': max((trial['max_sink_push_ms'] for trial in trials
+                                        if trial['max_sink_push_ms'] is not None), default=None),
+               'trials_with_sink_push_over_50_ms': sum(
+                   trial['max_sink_push_ms'] is not None and trial['max_sink_push_ms'] > 50
+                   for trial in trials),
                'trials': trials}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')

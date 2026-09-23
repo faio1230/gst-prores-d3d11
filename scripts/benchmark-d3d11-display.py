@@ -40,7 +40,7 @@ def gpu_stats(path):
 def stage_stats(path, expected_frames, loops, rendered):
     events = {}
     counts = Counter()
-    stage_names = ('demuxed', 'compressed', 'decoded', 'rgb')
+    stage_names = ('demuxed', 'compressed', 'decoded', 'rgb', 'sink_push', 'sink_return')
     wall_by_stage = {name: {} for name in stage_names}
     widest_gaps = {}
     with path.open(newline='', encoding='utf-8-sig') as stream:
@@ -67,6 +67,8 @@ def stage_stats(path, expected_frames, loops, rendered):
     pairs = [('compressed', 'decoded'), ('decoded', 'rgb')]
     if by_stage['demuxed']:
         pairs.insert(0, ('demuxed', 'compressed'))
+    if by_stage['sink_push']:
+        pairs.extend((('rgb', 'sink_push'), ('sink_push', 'sink_return')))
     for before, after in pairs:
         durations = sorted(wall_by_stage[after][key] - wall_by_stage[before][key]
                            for key in by_stage[before] & by_stage[after])
@@ -80,6 +82,8 @@ def stage_stats(path, expected_frames, loops, rendered):
             'compressed': len(by_stage['compressed']),
             'decoded': len(by_stage['decoded']),
             'rgb': len(by_stage['rgb']),
+            'sink_push': len(by_stage['sink_push']) if by_stage['sink_push'] else None,
+            'sink_return': len(by_stage['sink_return']) if by_stage['sink_return'] else None,
             'rendered': rendered,
             'end_to_end_missing': expected - rendered,
             'missing_before_decoder': missing_before_decoder[:32],
@@ -108,6 +112,8 @@ def main():
                         help='診断用: decoderだけQoSによる遅延フレーム破棄を無効化する')
     parser.add_argument('--sink-stall-ms', type=int, default=0,
                         help='診断用: PTS 1秒のsink入力を一度だけN ms止める（最大1000）')
+    parser.add_argument('--trace-sink-return', action='store_true',
+                        help='診断用: RGB出力の下流pushが戻るまでをPTSごとに記録する')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
@@ -152,6 +158,8 @@ def main():
                         command.append('decoder-no-qos')
                     if args.sink_stall_ms:
                         command.append(f'sink-stall-ms={args.sink_stall_ms}')
+                    if args.trace_sink_return:
+                        command.append('trace-sink-return')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:
                         process = subprocess.run(command, env=env, text=True,
                                                  stdout=subprocess.PIPE, stderr=errors,
