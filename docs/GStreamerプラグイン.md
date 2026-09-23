@@ -32,6 +32,8 @@ gst-launch-1.0 -e filesrc location=media/reference-proton-rec709-hq.mov ! qtdemu
 
 DLLの直接依存はGStreamer D3D11とMSVC/Windows runtimeで、FFmpeg/Vulkan/D3DCompiler DLLはない。`use-d3d11-plugin.ps1` と `test-d3d11-plugin.ps1` はプロジェクトのFFmpegをPATHへ追加しない。D3D11 deviceはGStreamer context query/set_contextで共有し、poolの各memoryに作ったUAVをmemory寿命へ結び付けて再利用する。
 
+2026-09-24に`scripts/stage-d3d11-plugin.ps1`で内部検証用の独立ステージを作成した。プラグインDLL、3つのCSOと対応HLSL、利用説明と主要検証文書だけを配置し、比較用Vulkan DLLを含めない。x64 PEと直接依存を`dumpbin`で検査し、ステージを作業ディレクトリにして、そのDLLから両要素を`gst-inspect`でロード。合成1080p/4Kの`I422_10LE(memory:D3D11Memory)`と、固定FFmpeg SDKで色タグを付けた合成1080pの`RGB10A2_LE(memory:D3D11Memory)`をfakesinkまで完走した。11ファイルのSHA256と依存DLL・検査結果は`results/stage-d3d11-internal-2026-09-24.json`。GStreamer SDKとMSVC runtimeは同梱しない。これは**内部検証ステージ**であり、公開ライセンス・対応ソースの提供方法、安定した実表示、他GPU/device lostが未達のため公開配布を認定しない。
+
 parserとVLD shaderのFFmpeg由来部分はSPDXでLGPL-2.1-or-laterを明記し、plugin metadataもLGPLとする。GStreamerはLGPL、fxc／D3D11はWindows SDKのビルド・実行依存。リポジトリ全体の独自コードの公開ライセンスは未決定なので、外部配布前にライセンス本文、著作権表示、対応ソースの提供方法を確定する。ProResの商標・特許・認証はOSSライセンスと別に確認する。
 
 実機結果は次のとおり。
