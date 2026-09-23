@@ -44,6 +44,18 @@ struct PresentLog {
     std::mutex mutex;
     std::vector<double> times;
     std::vector<GstClockTime> pts;
+    struct WindowState {
+        HWND hwnd = nullptr;
+        int found = -1;
+        int visible = -1;
+        int minimized = -1;
+        int foreground = -1;
+        int width = -1;
+        int height = -1;
+    };
+    bool trace_window_state = false;
+    HWND window_handle = nullptr;
+    std::vector<WindowState> windows;
 };
 
 static thread_local GstClockTime active_sink_pts = GST_CLOCK_TIME_NONE;
@@ -160,12 +172,47 @@ static void add_stage_probe(GstElement* element, const char* pad_name, StageTap*
     gst_object_unref(pad);
 }
 
+static void sample_d3d11_window(HWND hwnd, PresentLog::WindowState* state) {
+    state->hwnd = hwnd;
+    state->found = 1;
+    state->visible = IsWindowVisible(hwnd) ? 1 : 0;
+    state->minimized = IsIconic(hwnd) ? 1 : 0;
+    state->foreground = GetForegroundWindow() == hwnd ? 1 : 0;
+    RECT rect{};
+    if (GetWindowRect(hwnd, &rect)) {
+        state->width = rect.right - rect.left;
+        state->height = rect.bottom - rect.top;
+    }
+}
+
+static BOOL CALLBACK find_d3d11_window(HWND hwnd, LPARAM param) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    char class_name[32]{};
+    if (!GetClassNameA(hwnd, class_name, sizeof(class_name)) ||
+        std::string(class_name) != "GSTD3D11") return TRUE;
+    sample_d3d11_window(hwnd, reinterpret_cast<PresentLog::WindowState*>(param));
+    return FALSE;
+}
+
 static void on_present(GstElement*, GstObject*, gpointer, gpointer data) {
     auto* log = static_cast<PresentLog*>(data);
+    PresentLog::WindowState window;
+    if (log->trace_window_state) {
+        window.found = 0;
+        if (log->window_handle && IsWindow(log->window_handle))
+            sample_d3d11_window(log->window_handle, &window);
+        else {
+            EnumWindows(find_d3d11_window, reinterpret_cast<LPARAM>(&window));
+            log->window_handle = window.hwnd;
+        }
+    }
     const auto now = Clock::now();
     std::lock_guard<std::mutex> guard(log->mutex);
     log->times.push_back(ms(log->origin, now));
     log->pts.push_back(active_sink_pts);
+    log->windows.push_back(window);
 }
 
 static std::uint64_t sink_stat(GstElement* sink, const char* name) {
@@ -204,14 +251,15 @@ int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
-    if (argc < 4 || argc > 12)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return]]");
+    if (argc < 4 || argc > 13)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
     bool predecode_queue = false;
     bool decoder_no_qos = false;
     bool trace_sink_return = false;
+    bool trace_window_state = false;
     guint sink_stall_ms = 0;
     for (int i = 5; i < argc; ++i) {
         const std::string option(argv[i]);
@@ -221,6 +269,7 @@ int main(int argc, char** argv) try {
         else if (option == "queue-before-decoder") predecode_queue = true;
         else if (option == "decoder-no-qos") decoder_no_qos = true;
         else if (option == "trace-sink-return") trace_sink_return = true;
+        else if (option == "trace-window-state") trace_window_state = true;
         else if (option.rfind("sink-stall-ms=", 0) == 0)
             sink_stall_ms = static_cast<guint>(std::stoi(option.substr(14)));
         else throw std::runtime_error("unknown display option: " + option);
@@ -258,6 +307,7 @@ int main(int argc, char** argv) try {
     gst_object_unref(source);
     PresentLog presents;
     presents.origin = Clock::now();
+    presents.trace_window_state = trace_window_state;
     LARGE_INTEGER qpc_origin{}, qpc_frequency{};
     if (!QueryPerformanceFrequency(&qpc_frequency) || !QueryPerformanceCounter(&qpc_origin))
         throw std::runtime_error("QueryPerformanceCounter failed");
@@ -347,13 +397,16 @@ int main(int argc, char** argv) try {
                               sizeof(memory))) throw std::runtime_error("GetProcessMemoryInfo failed");
     std::ofstream csv(argv[3]);
     if (!csv) throw std::runtime_error("cannot open present CSV");
-    csv << "loop,present_index,wall_ms,interval_ms,pts_ns\n";
+    csv << "loop,present_index,wall_ms,interval_ms,pts_ns,window_found,window_visible,window_minimized,window_foreground,window_width,window_height\n";
     std::vector<double> intervals;
     for (int loop = 0; loop < loops; ++loop) {
         for (std::size_t i = endpoints[loop]; i < endpoints[loop + 1]; ++i) {
             const double interval = i > endpoints[loop] ? presents.times[i] - presents.times[i - 1] : 0;
             csv << loop << ',' << i - endpoints[loop] << ',' << presents.times[i] << ',' << interval << ',';
             if (GST_CLOCK_TIME_IS_VALID(presents.pts[i])) csv << presents.pts[i];
+            const auto& window = presents.windows[i];
+            csv << ',' << window.found << ',' << window.visible << ',' << window.minimized
+                << ',' << window.foreground << ',' << window.width << ',' << window.height;
             csv << '\n';
             if (i > endpoints[loop] + 30) intervals.push_back(interval);
         }
@@ -384,6 +437,7 @@ int main(int argc, char** argv) try {
               << ",\"predecode_queue\":" << (predecode_queue ? "true" : "false")
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
               << ",\"trace_sink_return\":" << (trace_sink_return ? "true" : "false")
+              << ",\"trace_window_state\":" << (trace_window_state ? "true" : "false")
               << ",\"injected_sink_stall_ms\":" << sink_stall_ms
               << ",\"injected_stall_start_ms\":" << stall.start_ms
               << ",\"injected_stall_end_ms\":" << stall.end_ms

@@ -114,6 +114,8 @@ def main():
                         help='診断用: PTS 1秒のsink入力を一度だけN ms止める（最大1000）')
     parser.add_argument('--trace-sink-return', action='store_true',
                         help='診断用: RGB出力の下流pushが戻るまでをPTSごとに記録する')
+    parser.add_argument('--trace-window-state', action='store_true',
+                        help='診断用: present通知時に自プロセスのD3D11ウィンドウ状態を読む')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
@@ -160,6 +162,8 @@ def main():
                         command.append(f'sink-stall-ms={args.sink_stall_ms}')
                     if args.trace_sink_return:
                         command.append('trace-sink-return')
+                    if args.trace_window_state:
+                        command.append('trace-window-state')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:
                         process = subprocess.run(command, env=env, text=True,
                                                  stdout=subprocess.PIPE, stderr=errors,

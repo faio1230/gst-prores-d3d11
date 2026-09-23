@@ -24,6 +24,23 @@ def percentiles(rows, name):
             'p99': at(.99), 'max': values[-1]}
 
 
+def rows_for_trial(rows, record, present_csv):
+    """同じPIDが再利用されてもQPCでその試行のPresentだけを選ぶ。"""
+    if ('qpc_origin_ms' not in record or not rows or
+            'CPUStartQPCTimeInMs' not in rows[0] or not present_csv.is_file()):
+        return rows
+    with present_csv.open(newline='', encoding='utf-8-sig') as stream:
+        wall_times = [float(row['wall_ms']) for row in csv.DictReader(stream)]
+    if not wall_times:
+        return rows
+    origin = float(record['qpc_origin_ms'])
+    lower = origin + min(wall_times) - 2.0
+    upper = origin + max(wall_times) + 2.0
+    return [row for row in rows if (start := metric(row, 'CPUStartQPCTimeInMs'))
+            is not None and (busy := metric(row, 'MsCPUBusy')) is not None
+            and lower <= start + busy <= upper]
+
+
 def align_pts(rows, record, present_csv, display_column):
     if ('qpc_origin_ms' not in record or not rows or
             'CPUStartQPCTimeInMs' not in rows[0] or not present_csv.is_file()):
@@ -35,9 +52,17 @@ def align_pts(rows, record, present_csv, display_column):
     origin = float(record['qpc_origin_ms'])
     signal_times = [origin + float(row['wall_ms']) for row in signals]
     all_frames = {(int(row['loop']), int(row['pts_ns'])) for row in signals}
+    window_states = defaultdict(set)
+    if signals[0].get('window_found') not in (None, '', '-1'):
+        for row in signals:
+            key = (int(row['loop']), int(row['pts_ns']))
+            window_states[key].add(
+                'found={window_found} visible={window_visible} minimized={window_minimized} '
+                'foreground={window_foreground} size={window_width}x{window_height}'.format(**row))
     used = set()
     captured = set()
     displayed = set()
+    matched_rows = defaultdict(list)
     deltas = []
     for row in rows:
         start = metric(row, 'CPUStartQPCTimeInMs')
@@ -55,6 +80,7 @@ def align_pts(rows, record, present_csv, display_column):
         deltas.append(abs(signal_times[nearest] - target))
         key = (int(signals[nearest]['loop']), int(signals[nearest]['pts_ns']))
         captured.add(key)
+        matched_rows[key].append(row)
         if metric(row, display_column) is not None:
             displayed.add(key)
     bounds = {}
@@ -64,6 +90,13 @@ def align_pts(rows, record, present_csv, display_column):
     interior = {(loop, pts) for loop, pts in all_frames
                 if pts not in bounds[loop]}
     missing_display = sorted(captured - displayed)
+    window_by_result = {'displayed': Counter(), 'not_displayed': Counter()}
+    rows_by_result = {'displayed': [], 'not_displayed': []}
+    for key in interior & captured:
+        result = 'displayed' if key in displayed else 'not_displayed'
+        states = window_states.get(key)
+        window_by_result[result][' / '.join(sorted(states)) if states else 'not-recorded'] += 1
+        rows_by_result[result].extend(matched_rows[key])
     return {'method': 'QPC + MsCPUBusy とpresent通知を1ms以内で照合',
             'matched_presentmon_rows': len(used),
             'unmatched_presentmon_rows': len(rows) - len(used),
@@ -77,6 +110,13 @@ def align_pts(rows, record, present_csv, display_column):
             'interior_confirmed_displayed': len(interior & displayed),
             'interior_captured_but_not_displayed': len(interior & captured - displayed),
             'interior_uncaptured': len(interior - captured),
+            'interior_window_state_by_display': {key: dict(value)
+                                                 for key, value in window_by_result.items()},
+            'interior_presentmon_metrics_by_display': {
+                key: {'between_presents_ms': percentiles(value, 'MsBetweenPresents'),
+                      'present_api_ms': percentiles(value, 'MsInPresentAPI'),
+                      'gpu_busy_ms': percentiles(value, 'MsGPUBusy')}
+                for key, value in rows_by_result.items()},
             'not_displayed_first_32': missing_display[:32]}
 
 
@@ -109,7 +149,8 @@ def main():
         pid = record.get('process_id')
         if pid is None:
             parser.error(f'{path}にprocess_idがない。計測器を更新して再測定する')
-        rows = by_pid[str(pid)]
+        present_csv = path.with_suffix('.present.csv')
+        rows = rows_for_trial(by_pid[str(pid)], record, present_csv)
         visible = [row for row in rows if metric(row, display_column) is not None]
         present_count = record['present_count']
         # PresentMonは開始・終了端で1件程度少なく、sink自身の追加Presentで多くなる場合もある。
@@ -130,8 +171,7 @@ def main():
                        'display_change_ms': percentiles(rows, 'MsBetweenDisplayChange'),
                        'present_api_ms': percentiles(rows, 'MsInPresentAPI'),
                        'until_displayed_ms': percentiles(rows, display_column),
-                       'pts_alignment': align_pts(rows, record,
-                                                  path.with_suffix('.present.csv'),
+                       'pts_alignment': align_pts(rows, record, present_csv,
                                                   display_column),
                        'max_sink_push_ms': push.get('max')})
     trials.sort(key=lambda trial: trial['repeat'])
