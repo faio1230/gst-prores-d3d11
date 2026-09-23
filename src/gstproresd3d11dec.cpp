@@ -18,13 +18,16 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -119,6 +122,35 @@ struct MemoryUav {
     ComPtr<ID3D11UnorderedAccessView> view;
 };
 
+struct GpuStageTiming {
+    bool disjoint = false;
+    double vld_ms = 0;
+    double idct_ms = 0;
+};
+
+ComPtr<ID3D11Query> make_query(ID3D11Device* device, D3D11_QUERY type) {
+    D3D11_QUERY_DESC desc{};
+    desc.Query = type;
+    ComPtr<ID3D11Query> query;
+    check_hr(device->CreateQuery(&desc, &query), "Create GPU timing query");
+    return query;
+}
+
+struct GpuTimingQueries {
+    explicit GpuTimingQueries(ID3D11Device* device)
+        : disjoint(make_query(device, D3D11_QUERY_TIMESTAMP_DISJOINT)),
+          vld_begin(make_query(device, D3D11_QUERY_TIMESTAMP)),
+          vld_end(make_query(device, D3D11_QUERY_TIMESTAMP)),
+          idct_begin(make_query(device, D3D11_QUERY_TIMESTAMP)),
+          idct_end(make_query(device, D3D11_QUERY_TIMESTAMP)) {}
+
+    ComPtr<ID3D11Query> disjoint;
+    ComPtr<ID3D11Query> vld_begin;
+    ComPtr<ID3D11Query> vld_end;
+    ComPtr<ID3D11Query> idct_begin;
+    ComPtr<ID3D11Query> idct_end;
+};
+
 void destroy_memory_uav(gpointer data) {
     delete static_cast<MemoryUav*>(data);
 }
@@ -164,10 +196,12 @@ public:
         check_hr(device_->CreateComputeShader(idct_bytecode.data(), idct_bytecode.size(),
                                               nullptr, &idct_),
                  "Create IDCT shader");
+        if (g_strcmp0(g_getenv("PRORES_DX11_GPU_TIMING"), "1") == 0)
+            timing_ = std::make_unique<GpuTimingQueries>(device_);
     }
 
-    void decode(const std::uint8_t* packet, std::size_t packet_size,
-                const prores::Frame& parsed, GstBuffer* output) {
+    std::optional<GpuStageTiming> decode(const std::uint8_t* packet, std::size_t packet_size,
+                                         const prores::Frame& parsed, GstBuffer* output) {
         check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed before decode");
         std::vector<prores::CoefficientJob> coefficient_jobs;
         std::uint32_t coefficient_count = 0;
@@ -251,7 +285,12 @@ public:
         context_->CSSetShaderResources(0, 2, vld_srvs);
         context_->CSSetUnorderedAccessViews(0, 2, vld_uavs, nullptr);
         context_->CSSetConstantBuffers(0, 1, vld_constants);
+        if (timing_) {
+            context_->Begin(timing_->disjoint.Get());
+            context_->End(timing_->vld_begin.Get());
+        }
         context_->Dispatch(static_cast<UINT>((coefficient_jobs.size() + 63) / 64), 1, 1);
+        if (timing_) context_->End(timing_->vld_end.Get());
         ID3D11UnorderedAccessView* null_vld_uavs[] = {nullptr, nullptr};
         ID3D11ShaderResourceView* null_vld_srvs[] = {nullptr, nullptr};
         context_->CSSetUnorderedAccessViews(0, 2, null_vld_uavs, nullptr);
@@ -266,8 +305,10 @@ public:
             if (errors[i]) { failed_job = i; break; }
         }
         context_->Unmap(cache_.error_staging.Get(), 0);
-        if (failed_job != coefficient_jobs.size())
+        if (failed_job != coefficient_jobs.size()) {
+            if (timing_) context_->End(timing_->disjoint.Get());
             throw std::runtime_error("GPU entropy decoder rejected job " + std::to_string(failed_job));
+        }
 
         ID3D11ShaderResourceView* idct_srvs[] = {
             cache_.coefficient_srv.Get(), cache_.idct_job_srv.Get(), cache_.quant_srv.Get()};
@@ -278,7 +319,12 @@ public:
         context_->CSSetShaderResources(0, 3, idct_srvs);
         context_->CSSetUnorderedAccessViews(0, 3, idct_uavs, nullptr);
         context_->CSSetConstantBuffers(0, 1, idct_constants);
+        if (timing_) context_->End(timing_->idct_begin.Get());
         context_->Dispatch(static_cast<UINT>(idct_jobs.size()), 1, 1);
+        if (timing_) {
+            context_->End(timing_->idct_end.Get());
+            context_->End(timing_->disjoint.Get());
+        }
         ID3D11UnorderedAccessView* null_idct_uavs[] = {nullptr, nullptr, nullptr};
         ID3D11ShaderResourceView* null_idct_srvs[] = {nullptr, nullptr, nullptr};
         context_->CSSetUnorderedAccessViews(0, 3, null_idct_uavs, nullptr);
@@ -292,9 +338,40 @@ public:
             GST_MEMORY_FLAG_UNSET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
             GST_MINI_OBJECT_FLAG_SET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
         }
+        if (timing_) return collect_timing();
+        return std::nullopt;
     }
 
 private:
+    template <typename T>
+    void wait_for_query(ID3D11Query* query, T& data) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (;;) {
+            const HRESULT result = context_->GetData(query, &data, sizeof(data), 0);
+            if (result == S_OK) return;
+            check_hr(result, "Get GPU timing query");
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error("GPU timing query exceeded 10 seconds");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    GpuStageTiming collect_timing() {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{};
+        wait_for_query(timing_->disjoint.Get(), clock);
+        if (clock.Disjoint) return {true, 0, 0};
+        if (!clock.Frequency) throw std::runtime_error("GPU timestamp frequency is zero");
+        UINT64 vld_begin = 0, vld_end = 0, idct_begin = 0, idct_end = 0;
+        wait_for_query(timing_->vld_begin.Get(), vld_begin);
+        wait_for_query(timing_->vld_end.Get(), vld_end);
+        wait_for_query(timing_->idct_begin.Get(), idct_begin);
+        wait_for_query(timing_->idct_end.Get(), idct_end);
+        if (vld_begin > vld_end || vld_end > idct_begin || idct_begin > idct_end)
+            throw std::runtime_error("GPU timestamp order is invalid");
+        const double scale = 1000.0 / static_cast<double>(clock.Frequency);
+        return {false, (vld_end - vld_begin) * scale, (idct_end - idct_begin) * scale};
+    }
+
     struct Cache {
         UINT width = 0;
         UINT height = 0;
@@ -398,6 +475,7 @@ private:
     gint64 token_;
     ComPtr<ID3D11ComputeShader> vld_;
     ComPtr<ID3D11ComputeShader> idct_;
+    std::unique_ptr<GpuTimingQueries> timing_;
     Cache cache_;
 };
 
@@ -615,7 +693,17 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
         return flow;
     }
     try {
-        self->backend->decode(input.data, input.size, parsed, frame->output_buffer);
+        const auto timing = self->backend->decode(input.data, input.size, parsed,
+                                                  frame->output_buffer);
+        if (timing) {
+            const auto pts = GST_BUFFER_PTS(frame->input_buffer);
+            if (timing->disjoint)
+                GST_INFO_OBJECT(self, "GPU_STAGE_DISJOINT pts_ns=%" G_GUINT64_FORMAT, pts);
+            else
+                GST_INFO_OBJECT(self, "GPU_STAGE pts_ns=%" G_GUINT64_FORMAT
+                                " vld_ms=%.6f idct_ms=%.6f", pts,
+                                timing->vld_ms, timing->idct_ms);
+        }
     } catch (const std::exception& exception) {
         gst_buffer_unmap(frame->input_buffer, &input);
         self->failed = TRUE;
