@@ -2,6 +2,7 @@
 import argparse
 from collections import Counter
 import csv
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,8 @@ GST = Path('C:/Program Files/gstreamer/1.0/msvc_x86_64/bin')
 SDK = ROOT / 'tools/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1/bin'
 BENCH = ROOT / 'build/vs18/Release/d3d11_display_bench.exe'
 PLUGIN = ROOT / 'build/vs18/plugins/Release'
+DIAGNOSTIC_D3D11_DLL = GST.parent / 'lib/gstreamer-1.0/gstd3d11.dll'
+DIAGNOSTIC_D3D11_SHA256 = 'b6156f2299ab0af570b7935138b1389b5f91c84b9a6e0ed755cd15b2e5aa4992'
 
 
 def gpu_stats(path):
@@ -120,6 +123,10 @@ def main():
                         help='診断用: 検査ウィンドウだけを一時的に最前面へ置く')
     parser.add_argument('--sink-ts-offset-ms', type=int, default=0,
                         help='診断用: sink同期時刻の相対移動（負値は早い提出、単位ms）')
+    parser.add_argument('--present-sync-interval', type=int, choices=(0, 1), default=0,
+                        help='診断用: 固定GStreamer 1.28.2 sinkのPresent1同期値を1にする')
+    parser.add_argument('--settle-ms', type=int, default=0,
+                        help='診断用: 最終EOS後、swap chain破棄前に待機（最大500ms）')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
@@ -128,6 +135,15 @@ def main():
         parser.error('--sink-stall-ms は0～1000を指定する')
     if not -100 <= args.sink_ts_offset_ms <= 100:
         parser.error('--sink-ts-offset-ms は-100～100を指定する')
+    if args.present_sync_interval == 1 and not args.preroll:
+        parser.error('--present-sync-interval 1 には--prerollが必要')
+    if not 0 <= args.settle_ms <= 500:
+        parser.error('--settle-ms は0～500を指定する')
+    if args.present_sync_interval == 1:
+        if (not DIAGNOSTIC_D3D11_DLL.is_file() or
+                hashlib.sha256(DIAGNOSTIC_D3D11_DLL.read_bytes()).hexdigest() !=
+                DIAGNOSTIC_D3D11_SHA256):
+            parser.error('非公開ABI診断は検証済みgstd3d11.dllのSHA256一致が必要')
     args.out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env['PATH'] = str(GST) + os.pathsep + env.get('PATH', '')
@@ -174,6 +190,10 @@ def main():
                         command.append('topmost-window')
                     if args.sink_ts_offset_ms:
                         command.append(f'sink-ts-offset-ms={args.sink_ts_offset_ms}')
+                    if args.present_sync_interval == 1:
+                        command.append('present-sync1')
+                    if args.settle_ms:
+                        command.append(f'settle-ms={args.settle_ms}')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:
                         process = subprocess.run(command, env=env, text=True,
                                                  stdout=subprocess.PIPE, stderr=errors,

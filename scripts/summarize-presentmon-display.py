@@ -194,6 +194,12 @@ def align_pts(rows, record, present_csv, stage_csv, display_column):
             'confirmed_displayed_source_frames': len(displayed),
             'captured_but_not_displayed_source_frames': len(missing_display),
             'uncaptured_source_frames': len(all_frames - captured),
+            'uncaptured_first_32': [{'loop': loop, 'pts_ns': pts}
+                                    for loop, pts in sorted(all_frames - captured)[:32]],
+            'duplicate_presentmon_pts_first_32': [
+                {'loop': loop, 'pts_ns': pts, 'rows': len(matched_rows[(loop, pts)])}
+                for loop, pts in sorted(matched_rows)
+                if len(matched_rows[(loop, pts)]) > 1][:32],
             'interior_source_frames': len(interior),
             'interior_confirmed_displayed': len(interior & displayed),
             'interior_captured_but_not_displayed': len(interior & captured - displayed),

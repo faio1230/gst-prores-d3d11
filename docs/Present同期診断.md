@@ -29,3 +29,26 @@ python scripts/summarize-present-control.py results/present-control-testsrc-topm
 解釈：DXGI API失敗を原因とする説明は否定され、診断swap chainでは同期値0とOS未表示が同時に現れる。ただし独立`appsink`、CPU時計同期、4K→swap chainコピー、自前ウィンドウを使い、標準`d3d11videosink`の待機・QoS・ウィンドウ処理とは異なる。最前面化も製品既定値へ採用しない。次は標準sinkと同等の条件で同期値だけを変える診断を行い、DWMの個別ラッチ／キュー破棄イベントをPTSへ帰属する。実写4K60のend-to-end欠落と短い最大表示間隔を同時に満たすまでは製品採用を保留する。
 
 後続の標準sink・実写4K60検査では、`Present(0)`成功後のOS未表示32件とDWMのflip消費欠番32件を3試行各1441行へ完全対応づけた。これは独立swap chainの`Present(1)`比較を標準sinkの解決策と認定するものではない。キュー置換とDWM内部の破棄を分けるWin32K/DxgKrnl証拠は未取得で、詳細は[実素材と表示検証](実素材と表示検証.md)に記録した。
+
+## 標準sink内の同期値だけを変えた診断
+
+GStreamer 1.28.2の[Win32実装](https://github.com/GStreamer/gstreamer/blob/1.28.2/subprojects/gst-plugins-bad/sys/d3d11/gstd3d11window_win32.cpp#L1206-L1238)は`emit-present=true`時、dirty rectなしで`Present1(0, flags, ...)`する。検査プログラム`d3d11_display_bench`だけに、[非公開window class](https://github.com/GStreamer/gstreamer/blob/1.28.2/subprojects/gst-plugins-bad/sys/d3d11/gstd3d11window.h#L68-L135)の`present`仮想関数を一時差替えする`present-sync1`を追加。同じswap chain・flags・空のpresent parametersで`Present1(1, ...)`を呼び、pipelineをNULLへ戻した後に元の関数へ復元する。検査本体はプラグイン版・型・ABIサイズ、起動wrapperはDLLのSHA256一致を検査するが、非公開ABI依存のため**診断専用であり製品実装・SDK改変ではない**。preroll中の最初のPresentは切替前なので比較の内側から除外する。窓を閉じる操作は元実装と同等に処理していないため、本診断中は検査窓を閉じない。
+
+DJI公式REC.709実写4K60、480枚×3周、RTX 3070／60Hz／GStreamer 1.28.2で、`proresd3d11dec ! proresd3d11rgb ! d3d11videosink`を使用。両条件とも`--preroll --native-rgb --trace-sink-return --decoder-no-qos --settle-ms 150`を指定し、EOS直後のswap chain破棄で最後の2枚のPresentMon記録が確定しない測定誤差を除いた。最前面試験だけ`--topmost-window`を追加し、順序は0→1、1→0、0→1。非最前面は0→1、1→0の2組。同期値1の最初の呼出しでだけswap chain interfaceを確認し、毎フレームのCOM照会が表示位相へ影響する交絡を除いた。各試行ともGStreamerは1440/1440枚、drop／QoS 0、PresentMonは1441行、PTS内側1434枚の捕捉漏れ0。全行の`SyncInterval`と`PresentFlags`は指定値と0で、同期値1のhookは各1442回成功、COM照会は各1回。GStreamerの製品プラグインには手を加えていない。
+
+| ウィンドウ条件 | 同期値0：内側OS未表示 | 同期値1：内側OS未表示 | 最大OS表示間隔 |
+|---|---:|---:|---|
+| 検査窓だけ最前面、3組 | **133+125+124 / 4302** | **0 / 4302** | 0は33.38～33.42ms、1は21.64～21.67ms |
+| 最前面にしない、2組 | **107+8 / 2868** | **0+5 / 2868** | 試行間の変動が大きい |
+
+最前面条件では同期値1がOS未表示を大幅に減らすという、標準sinkに近いA/B証拠が得られた。一方、非最前面の同期値1では5枚残り、表示条件を問わず無欠落になるわけではない。同期値1を製品プラグインの設定や非公開ABIフックとして採用しない。次は保守可能な標準sink側の変更候補を検討し、非最前面・別素材・長時間・通常QoSでend-to-endとOS実表示を同時検証する。今回の診断は欠落が起こる正確なキュー位置も証明しない。
+
+生CSVと各試行JSON・PTS集計は`results/present-sync-standard-2026-09-24/`。採用集計は`*-direct-*`の試行であり、初期の毎フレームCOM照会入り試行`*-topmost*`／`*-settle*`とは分ける。固定GStreamer `gstd3d11.dll` SHA256は`b6156f2299ab0af570b7935138b1389b5f91c84b9a6e0ed755cd15b2e5aa4992`。再現時は、各試行の前にPresentMon 2.6.0を`--process_name d3d11_display_bench.exe --qpc_time_ms --write_display_metadata --set_circular_buffer_size 32768 --timed 37`で起動し、以下をそれぞれ実行する。
+
+```powershell
+python scripts/benchmark-d3d11-display.py media/reference-dji-nature-4k60-rec709-hq.mov --loops 3 --repeats 1 --preroll --native-rgb --trace-sink-return --topmost-window --decoder-no-qos --settle-ms 150 --out results/present-sync-standard-2026-09-24/sync0-direct-a
+python scripts/benchmark-d3d11-display.py media/reference-dji-nature-4k60-rec709-hq.mov --loops 3 --repeats 1 --preroll --native-rgb --trace-sink-return --topmost-window --decoder-no-qos --present-sync-interval 1 --settle-ms 150 --out results/present-sync-standard-2026-09-24/sync1-direct-a
+python scripts/summarize-presentmon-display.py results/present-sync-standard-2026-09-24/presentmon-sync1-direct-a.csv results/present-sync-standard-2026-09-24/sync1-direct-a --out results/present-sync-standard-2026-09-24/sync1-direct-a-summary.json
+```
+
+変更後のビルド、DX11係数・画素・D3D11Memory、GStreamer EOS／seek／動的caps／RGBの回帰は`results/verification-present-sync-2026-09-24/`に記録した。初期のsettleなし試行では末尾2枚のPresentMon行が確定せず、内側1枚も未捕捉になったため採用集計には含めない。

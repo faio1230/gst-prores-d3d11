@@ -1,9 +1,12 @@
 // DX11 decode→RGB10A2→実際のD3D11 swapchain sinkを時計同期で計測する。
 #include <gst/gst.h>
+#include <gst/video/video.h>
 #include <windows.h>
 #include <psapi.h>
+#include <dxgi1_2.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -16,6 +19,119 @@
 #include <vector>
 
 using Clock = std::chrono::steady_clock;
+
+// GStreamer 1.28.2の非公開gstd3d11window.hのprefixに限る診断用ABI mirror。
+// https://github.com/GStreamer/gstreamer/blob/1.28.2/subprojects/gst-plugins-bad/sys/d3d11/gstd3d11window.h
+// 製品側の型やGStreamer SDKを書き換えず、検査プロセス内だけでpresent仮想関数を差し替える。
+struct GstD3D11WindowProbe {
+    GstObject parent;
+    gboolean initialized;
+    void* device;
+    guintptr external_handle;
+    gboolean force_aspect_ratio;
+    gboolean enable_navigation_events;
+    int fullscreen_toggle_mode;
+    gboolean requested_fullscreen;
+    gboolean fullscreen;
+    gboolean emit_present;
+    GstVideoInfo info;
+    GstVideoInfo render_info;
+    void* converter;
+    void* compositor;
+    RECT render_rect;
+    RECT input_rect;
+    RECT prev_input_rect;
+    GstVideoRectangle rect;
+    guint surface_width;
+    guint surface_height;
+    IDXGISwapChain* swap_chain;
+};
+
+struct GstD3D11WindowClassProbe {
+    GstObjectClass parent;
+    void (*show)(GstD3D11WindowProbe*);
+    void (*update_swap_chain)(GstD3D11WindowProbe*);
+    void (*change_fullscreen_mode)(GstD3D11WindowProbe*);
+    gboolean (*create_swap_chain)(GstD3D11WindowProbe*, DXGI_FORMAT, guint, guint, guint,
+                                  IDXGISwapChain**);
+    GstFlowReturn (*present)(GstD3D11WindowProbe*, guint);
+};
+
+static std::atomic<std::uint64_t> sync_hook_calls{0};
+static std::atomic<std::uint64_t> sync_hook_success{0};
+static std::atomic<std::uint64_t> sync_hook_swapchain1{0};
+static std::atomic<std::uint64_t> sync_hook_queries{0};
+static std::atomic<std::uint32_t> sync_hook_last_hr{0};
+static std::atomic<IDXGISwapChain*> sync_hook_checked_chain{nullptr};
+
+static GstFlowReturn present_sync1_probe(GstD3D11WindowProbe* window, guint flags) {
+    ++sync_hook_calls;
+    if (!window->emit_present || !window->swap_chain) {
+        sync_hook_last_hr = static_cast<std::uint32_t>(E_POINTER);
+        return GST_FLOW_ERROR;
+    }
+    if (sync_hook_checked_chain.load() != window->swap_chain) {
+        // 最初の呼出しだけinterfaceを確認。後続のPresent経路にCOM照会を挟まない。
+        IDXGISwapChain1* checked = nullptr;
+        ++sync_hook_queries;
+        const HRESULT check = window->swap_chain->QueryInterface(
+            __uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&checked));
+        if (FAILED(check)) {
+            sync_hook_last_hr = static_cast<std::uint32_t>(check);
+            return GST_FLOW_ERROR;
+        }
+        checked->Release();
+        sync_hook_checked_chain = window->swap_chain;
+    }
+    ++sync_hook_swapchain1;
+    DXGI_PRESENT_PARAMETERS params{};
+    // 固定SDKの元実装も同じinterface pointerをIDXGISwapChain1へcastする。
+    const HRESULT hr = reinterpret_cast<IDXGISwapChain1*>(window->swap_chain)->Present1(
+        1, flags, &params);
+    sync_hook_last_hr = static_cast<std::uint32_t>(hr);
+    if (SUCCEEDED(hr)) ++sync_hook_success;
+    // 元実装と同じく、閉じていない窓ではHRESULTに関係なくGST_FLOW_OKを返す。
+    return GST_FLOW_OK;
+}
+
+struct PresentSyncHook {
+    GstD3D11WindowClassProbe* klass = nullptr;
+    GstFlowReturn (*original)(GstD3D11WindowProbe*, guint) = nullptr;
+
+    void install(GstElement* sink) {
+        auto* feature = GST_PLUGIN_FEATURE(gst_element_get_factory(sink));
+        const char* plugin_name = gst_plugin_feature_get_plugin_name(feature);
+        if (!plugin_name || std::string(plugin_name) != "d3d11")
+            throw std::runtime_error("present hook requires the d3d11 GStreamer plugin");
+        GstPlugin* plugin = gst_registry_find_plugin(gst_registry_get(), plugin_name);
+        if (!plugin) throw std::runtime_error("d3d11 GStreamer plugin was not found");
+        const std::string plugin_version = gst_plugin_get_version(plugin);
+        gst_object_unref(plugin);
+        if (plugin_version != "1.28.2")
+            throw std::runtime_error("present hook requires GStreamer d3d11 plugin 1.28.2");
+        const GType win32_type = g_type_from_name("GstD3D11WindowWin32");
+        const GType base_type = g_type_from_name("GstD3D11Window");
+        if (!win32_type || !base_type || !g_type_is_a(win32_type, base_type))
+            throw std::runtime_error("GStreamer Win32 D3D11 window type was not initialized");
+        GTypeQuery query{};
+        g_type_query(win32_type, &query);
+        if (query.class_size < sizeof(GstD3D11WindowClassProbe) ||
+            query.instance_size < sizeof(GstD3D11WindowProbe))
+            throw std::runtime_error("GStreamer D3D11 window ABI size mismatch");
+        klass = reinterpret_cast<GstD3D11WindowClassProbe*>(g_type_class_ref(win32_type));
+        if (!klass || !klass->present || klass->present == present_sync1_probe)
+            throw std::runtime_error("GStreamer D3D11 present hook unavailable");
+        original = klass->present;
+        klass->present = present_sync1_probe;
+    }
+
+    void restore() {
+        if (!klass) return;
+        klass->present = original;
+        g_type_class_unref(klass);
+        klass = nullptr;
+    }
+};
 
 static double ms(Clock::time_point first, Clock::time_point second) {
     return std::chrono::duration<double, std::milli>(second - first).count();
@@ -277,8 +393,8 @@ int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
-    if (argc < 4 || argc > 15)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N]]");
+    if (argc < 4 || argc > 17)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [present-sync1] [settle-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
@@ -287,7 +403,9 @@ int main(int argc, char** argv) try {
     bool trace_sink_return = false;
     bool trace_window_state = false;
     bool topmost_window = false;
+    bool present_sync1 = false;
     guint sink_stall_ms = 0;
+    guint settle_ms = 0;
     int sink_ts_offset_ms = 0;
     for (int i = 5; i < argc; ++i) {
         const std::string option(argv[i]);
@@ -299,15 +417,21 @@ int main(int argc, char** argv) try {
         else if (option == "trace-sink-return") trace_sink_return = true;
         else if (option == "trace-window-state") trace_window_state = true;
         else if (option == "topmost-window") { topmost_window = true; trace_window_state = true; }
+        else if (option == "present-sync1") present_sync1 = true;
         else if (option.rfind("sink-ts-offset-ms=", 0) == 0)
             sink_ts_offset_ms = std::stoi(option.substr(std::string("sink-ts-offset-ms=").size()));
         else if (option.rfind("sink-stall-ms=", 0) == 0)
             sink_stall_ms = static_cast<guint>(std::stoi(option.substr(14)));
+        else if (option.rfind("settle-ms=", 0) == 0)
+            settle_ms = static_cast<guint>(std::stoi(option.substr(10)));
         else throw std::runtime_error("unknown display option: " + option);
     }
     if (sink_stall_ms > 1000) throw std::runtime_error("sink stall must be at most 1000ms");
+    if (settle_ms > 500) throw std::runtime_error("settle time must be at most 500ms");
     if (sink_ts_offset_ms < -100 || sink_ts_offset_ms > 100)
         throw std::runtime_error("sink ts offset must be between -100 and 100ms");
+    if (present_sync1 && !preroll)
+        throw std::runtime_error("present-sync1 requires preroll before installing the diagnostic hook");
     const int loops = std::stoi(argv[2]);
     if (loops < 1) throw std::runtime_error("loops must be positive");
     const std::string input(argv[1]);
@@ -411,6 +535,7 @@ int main(int argc, char** argv) try {
     }
     g_signal_connect(sink, "present", G_CALLBACK(on_present), &presents);
     double preroll_ms = 0;
+    PresentSyncHook present_hook;
     if (preroll) {
         const auto preroll_start = Clock::now();
         if (gst_element_set_state(pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE ||
@@ -418,6 +543,7 @@ int main(int argc, char** argv) try {
             throw std::runtime_error("PAUSED preroll failed");
         preroll_ms = ms(preroll_start, Clock::now());
     }
+    if (present_sync1) present_hook.install(sink);
     const auto start = Clock::now();
     const auto cpu_start = cpu_seconds();
     if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
@@ -464,7 +590,16 @@ int main(int argc, char** argv) try {
     }
     const auto finish = Clock::now();
     const auto cpu_used = cpu_seconds() - cpu_start;
-    gst_element_set_state(pipeline, GST_STATE_NULL);
+    // EOS直後のswap chain破棄による終端PresentMon未確定を避ける。両A/B条件で同値にする。
+    if (settle_ms) Sleep(settle_ms);
+    if (gst_element_set_state(pipeline, GST_STATE_NULL) == GST_STATE_CHANGE_FAILURE ||
+        gst_element_get_state(pipeline, nullptr, nullptr, 10 * GST_SECOND) != GST_STATE_CHANGE_SUCCESS)
+        throw std::runtime_error("NULL teardown failed");
+    present_hook.restore();
+    if (present_sync1 && (!sync_hook_calls.load() ||
+                          sync_hook_success.load() != sync_hook_calls.load() ||
+                          sync_hook_swapchain1.load() != sync_hook_calls.load()))
+        throw std::runtime_error("present-sync1 hook did not succeed on every call");
     PROCESS_MEMORY_COUNTERS_EX memory{};
     memory.cb = sizeof(memory);
     if (!GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
@@ -518,6 +653,13 @@ int main(int argc, char** argv) try {
               << ",\"topmost_window\":" << (topmost_window ? "true" : "false")
               << ",\"topmost_request_ok\":" << (presents.topmost_request_ok ? "true" : "false")
               << ",\"sink_ts_offset_ms\":" << sink_ts_offset_ms
+              << ",\"present_sync_interval\":" << (present_sync1 ? 1 : 0)
+              << ",\"present_sync_hook_calls\":" << sync_hook_calls.load()
+              << ",\"present_sync_hook_success\":" << sync_hook_success.load()
+              << ",\"present_sync_hook_swapchain1\":" << sync_hook_swapchain1.load()
+              << ",\"present_sync_hook_queries\":" << sync_hook_queries.load()
+              << ",\"present_sync_hook_last_hr\":" << sync_hook_last_hr.load()
+              << ",\"settle_ms\":" << settle_ms
               << ",\"injected_sink_stall_ms\":" << sink_stall_ms
               << ",\"injected_stall_start_ms\":" << stall.start_ms
               << ",\"injected_stall_end_ms\":" << stall.end_ms
