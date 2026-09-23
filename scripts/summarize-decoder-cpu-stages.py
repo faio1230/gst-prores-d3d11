@@ -43,11 +43,18 @@ def main():
         if "GPU_STAGE_DISJOINT" in line:
             gpu_disjoint += 1
         elif "GPU_STAGE pts_ns=" in line:
-            match = re.search(r"GPU_STAGE pts_ns=(\d+) vld_ms=([0-9.]+) idct_ms=([0-9.]+)", line)
-            if not match:
+            match = re.search(
+                r"GPU_STAGE pts_ns=(\d+) vld_ms=([0-9.]+) idct_ms=([0-9.]+)"
+                r"(?: copy_ms=([0-9.]+) vld_to_copy_ms=([0-9.]+))?", line)
+            if not match or (" copy_ms=" in line and match[4] is None):
                 raise ValueError("GPU_STAGEの項目が不足しています: " + line)
-            gpu_rows.append({"pts_ns": int(match[1]), "vld_ms": float(match[2]),
-                             "idct_ms": float(match[3])})
+            gpu = {"pts_ns": int(match[1]), "vld_ms": float(match[2]),
+                   "idct_ms": float(match[3])}
+            if match[4] is not None:
+                gpu.update(copy_ms=float(match[4]), vld_to_copy_ms=float(match[5]))
+                if gpu["copy_ms"] < 0 or gpu["vld_to_copy_ms"] < gpu["copy_ms"]:
+                    raise ValueError("GPU copy区間の時刻が不正です: " + line)
+            gpu_rows.append(gpu)
         if "CPU_STAGE seq=" not in line:
             continue
         fields = dict(re.findall(r"([a-z_]+)=([0-9.]+)", line.split("CPU_STAGE ", 1)[1]))
@@ -56,6 +63,10 @@ def main():
             raise ValueError("CPU_STAGEの項目が不足しています: " + line)
         row = {field: float(fields[field]) for field in FIELDS}
         row.update(seq=int(fields["seq"]), pts_ns=int(fields["pts_ns"]))
+        if "copy_ready_wait_ms" in fields:
+            row["copy_ready_wait_ms"] = float(fields["copy_ready_wait_ms"])
+        if "map_attempts" in fields:
+            row["map_attempts"] = int(fields["map_attempts"])
         for optional in ("idct_layout_rebuilt", "idct_quant_slices_changed", "idct_gpu_upload"):
             if optional in fields:
                 row[optional] = int(fields[optional])
@@ -108,6 +119,12 @@ def main():
                                            for row in low_previous_idct)},
         },
     }
+    copy_ready_count = sum("copy_ready_wait_ms" in row for row in rows)
+    if copy_ready_count not in (0, expected):
+        raise ValueError("copy完了待ちのCPU記録が一部フレームで欠けています")
+    if copy_ready_count:
+        summary["field_ms"]["copy_ready_wait_ms"] = distribution(
+            rows, "copy_ready_wait_ms")
     if all("idct_gpu_upload" in row for row in rows):
         summary["idct_cache"] = {
             "layout_rebuild_frames": sum(row["idct_layout_rebuilt"] for row in rows),
@@ -135,6 +152,22 @@ def main():
                 for item in missing_rows if item["previous"] is not None
             ],
         }
+        with_copy = sum("copy_ms" in gpu for gpu in gpu_rows)
+        if with_copy not in (0, expected):
+            raise ValueError("GPU copy区間の記録が一部フレームで欠けています")
+        if with_copy:
+            summary["gpu_stage"]["copy_ms"] = distribution(gpu_rows, "copy_ms")
+            summary["gpu_stage"]["vld_to_copy_ms"] = distribution(
+                gpu_rows, "vld_to_copy_ms")
+            for key in ("largest_cpu_map_wait", "qos_missing_previous"):
+                for item in summary["gpu_stage"][key]:
+                    gpu = gpu_rows[item["seq"]]
+                    item["gpu_copy_ms"] = gpu["copy_ms"]
+                    item["gpu_vld_to_copy_ms"] = gpu["vld_to_copy_ms"]
+                    if copy_ready_count:
+                        cpu = rows[item["seq"]]
+                        item["copy_ready_wait_ms"] = cpu["copy_ready_wait_ms"]
+                        item["map_attempts"] = cpu.get("map_attempts")
     if args.presentmon_summary:
         present = json.loads(args.presentmon_summary.read_text(encoding="utf-8-sig"))
         if (present["trials"] != 1 or present["coverage_sufficient_trials"] != 1

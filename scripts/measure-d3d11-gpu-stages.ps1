@@ -65,6 +65,8 @@ try {
     foreach ($case in $cases) {
         $vld = [Collections.Generic.List[double]]::new()
         $idct = [Collections.Generic.List[double]]::new()
+        $copy = [Collections.Generic.List[double]]::new()
+        $vldToCopy = [Collections.Generic.List[double]]::new()
         $all = [Collections.Generic.List[double]]::new()
         for ($run = 1; $run -le $Repeats; ++$run) {
             $log = Join-Path $logs "$($case.Name)-run$run.log"
@@ -75,7 +77,7 @@ try {
             $content = Get-Content -LiteralPath $log -Raw
             if ($content.Contains('GPU_STAGE_DISJOINT')) { throw "GPU時刻の不連続を検出: $log" }
             $rows = [regex]::Matches($content,
-                'GPU_STAGE pts_ns=(\d+) vld_ms=([\d.]+) idct_ms=([\d.]+)')
+                'GPU_STAGE pts_ns=(\d+) vld_ms=([\d.]+) idct_ms=([\d.]+) copy_ms=([\d.]+) vld_to_copy_ms=([\d.]+)')
             if ($rows.Count -ne $case.Frames) {
                 throw "GPU時刻の件数が不一致: $log 期待=$($case.Frames) 実際=$($rows.Count)"
             }
@@ -88,9 +90,17 @@ try {
                     [Globalization.CultureInfo]::InvariantCulture)
                 $i = [double]::Parse($row.Groups[3].Value,
                     [Globalization.CultureInfo]::InvariantCulture)
-                if ($v -le 0 -or $i -le 0) { throw "GPU区間の時刻が不正: $log" }
+                $c = [double]::Parse($row.Groups[4].Value,
+                    [Globalization.CultureInfo]::InvariantCulture)
+                $vc = [double]::Parse($row.Groups[5].Value,
+                    [Globalization.CultureInfo]::InvariantCulture)
+                if ($v -le 0 -or $i -le 0 -or $c -lt 0 -or $vc -lt $c) {
+                    throw "GPU区間の時刻が不正: $log"
+                }
                 $vld.Add($v)
                 $idct.Add($i)
+                $copy.Add($c)
+                $vldToCopy.Add($vc)
                 $all.Add($v + $i)
             }
         }
@@ -104,13 +114,15 @@ try {
             measured_frames = $vld.Count
             vld = Get-Distribution $vld.ToArray()
             idct = Get-Distribution $idct.ToArray()
+            copy = Get-Distribution $copy.ToArray()
+            vld_to_copy = Get-Distribution $vldToCopy.ToArray()
             shader_total = Get-Distribution $all.ToArray()
         }
         Write-Host "$($case.Name): VLD中央値=$([math]::Round($summaries[-1].vld.median_ms, 3))ms、IDCT中央値=$([math]::Round($summaries[-1].idct.median_ms, 3))ms"
     }
     [ordered]@{
         passed = $true
-        timing_mode = 'PRORES_DX11_GPU_TIMING=1; D3D11 timestamp/disjoint; each dispatch only'
+        timing_mode = 'PRORES_DX11_GPU_TIMING=1; D3D11 timestamp/disjoint; VLD/IDCT dispatch and VLD error staging copy'
         gpu = $GpuLabel
         caveat = 'Diagnostic queries wait for IDCT completion per frame; not production throughput or full decode latency.'
         cases = $summaries

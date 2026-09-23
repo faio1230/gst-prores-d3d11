@@ -128,6 +128,8 @@ struct GpuStageTiming {
     bool disjoint = false;
     double vld_ms = 0;
     double idct_ms = 0;
+    double copy_ms = 0;
+    double vld_to_copy_ms = 0;
 };
 
 struct CpuDecodeTiming {
@@ -141,6 +143,7 @@ struct CpuDecodeTiming {
     double device_lock_ms = 0;
     double upload_ms = 0;
     double vld_submit_ms = 0;
+    double copy_ready_wait_ms = 0;
     double vld_map_ms = 0;
     std::uint64_t map_attempts = 0;
     double idct_submit_ms = 0;
@@ -159,12 +162,16 @@ struct GpuTimingQueries {
         : disjoint(make_query(device, D3D11_QUERY_TIMESTAMP_DISJOINT)),
           vld_begin(make_query(device, D3D11_QUERY_TIMESTAMP)),
           vld_end(make_query(device, D3D11_QUERY_TIMESTAMP)),
+          copy_begin(make_query(device, D3D11_QUERY_TIMESTAMP)),
+          copy_end(make_query(device, D3D11_QUERY_TIMESTAMP)),
           idct_begin(make_query(device, D3D11_QUERY_TIMESTAMP)),
           idct_end(make_query(device, D3D11_QUERY_TIMESTAMP)) {}
 
     ComPtr<ID3D11Query> disjoint;
     ComPtr<ID3D11Query> vld_begin;
     ComPtr<ID3D11Query> vld_end;
+    ComPtr<ID3D11Query> copy_begin;
+    ComPtr<ID3D11Query> copy_end;
     ComPtr<ID3D11Query> idct_begin;
     ComPtr<ID3D11Query> idct_end;
 };
@@ -341,8 +348,17 @@ public:
         ID3D11ShaderResourceView* null_vld_srvs[] = {nullptr, nullptr};
         context_->CSSetUnorderedAccessViews(0, 2, null_vld_uavs, nullptr);
         context_->CSSetShaderResources(0, 2, null_vld_srvs);
+        if (timing_) context_->End(timing_->copy_begin.Get());
         context_->CopyResource(cache_.error_staging.Get(), cache_.errors.Get());
+        if (timing_) context_->End(timing_->copy_end.Get());
         mark(&CpuDecodeTiming::vld_submit_ms);
+        // 診断時だけGPU copy完了とCPU Map可能時点を分ける。
+        // GetDataの待機自体が位相を変えるため、通常QoSへ外挿しない。
+        if (timing_ && cpu_timing) {
+            UINT64 copy_end = 0;
+            wait_for_query(timing_->copy_end.Get(), copy_end);
+            mark(&CpuDecodeTiming::copy_ready_wait_ms);
+        }
         D3D11_MAPPED_SUBRESOURCE mapped_errors{};
         const auto map_result = prores::bounded_staging_map(
             [&] {
@@ -419,17 +435,22 @@ private:
     GpuStageTiming collect_timing() {
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{};
         wait_for_query(timing_->disjoint.Get(), clock);
-        if (clock.Disjoint) return {true, 0, 0};
+        if (clock.Disjoint) return {true, 0, 0, 0, 0};
         if (!clock.Frequency) throw std::runtime_error("GPU timestamp frequency is zero");
-        UINT64 vld_begin = 0, vld_end = 0, idct_begin = 0, idct_end = 0;
+        UINT64 vld_begin = 0, vld_end = 0, copy_begin = 0, copy_end = 0;
+        UINT64 idct_begin = 0, idct_end = 0;
         wait_for_query(timing_->vld_begin.Get(), vld_begin);
         wait_for_query(timing_->vld_end.Get(), vld_end);
+        wait_for_query(timing_->copy_begin.Get(), copy_begin);
+        wait_for_query(timing_->copy_end.Get(), copy_end);
         wait_for_query(timing_->idct_begin.Get(), idct_begin);
         wait_for_query(timing_->idct_end.Get(), idct_end);
-        if (vld_begin > vld_end || vld_end > idct_begin || idct_begin > idct_end)
+        if (vld_begin > vld_end || vld_end > copy_begin || copy_begin > copy_end ||
+            copy_end > idct_begin || idct_begin > idct_end)
             throw std::runtime_error("GPU timestamp order is invalid");
         const double scale = 1000.0 / static_cast<double>(clock.Frequency);
-        return {false, (vld_end - vld_begin) * scale, (idct_end - idct_begin) * scale};
+        return {false, (vld_end - vld_begin) * scale, (idct_end - idct_begin) * scale,
+                (copy_end - copy_begin) * scale, (copy_end - vld_end) * scale};
     }
 
     struct Cache {
@@ -859,8 +880,10 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
                 GST_INFO_OBJECT(self, "GPU_STAGE_DISJOINT pts_ns=%" G_GUINT64_FORMAT, pts);
             else
                 GST_INFO_OBJECT(self, "GPU_STAGE pts_ns=%" G_GUINT64_FORMAT
-                                " vld_ms=%.6f idct_ms=%.6f", pts,
-                                timing->vld_ms, timing->idct_ms);
+                                " vld_ms=%.6f idct_ms=%.6f copy_ms=%.6f"
+                                " vld_to_copy_ms=%.6f", pts,
+                                timing->vld_ms, timing->idct_ms,
+                                timing->copy_ms, timing->vld_to_copy_ms);
         }
     } catch (const std::exception& exception) {
         gst_buffer_unmap(frame->input_buffer, &input);
@@ -891,7 +914,8 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
                         " idct_layout_rebuilt=%u idct_quant_slices_changed=%u"
                         " idct_gpu_upload=%u cache_ms=%.6f"
                         " output_uav_ms=%.6f device_lock_ms=%.6f"
-                        " upload_ms=%.6f vld_submit_ms=%.6f vld_map_ms=%.6f"
+                        " upload_ms=%.6f vld_submit_ms=%.6f"
+                        " copy_ready_wait_ms=%.6f vld_map_ms=%.6f"
                         " map_attempts=%" G_GUINT64_FORMAT " idct_submit_ms=%.6f"
                         " backend_ms=%.6f finish_ms=%.6f", sequence, pts,
                         parse_ms, negotiate_ms, allocate_ms,
@@ -901,7 +925,8 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
                         decode_timing.idct_gpu_upload,
                         decode_timing.cache_ms, decode_timing.output_uav_ms,
                         decode_timing.device_lock_ms, decode_timing.upload_ms,
-                        decode_timing.vld_submit_ms, decode_timing.vld_map_ms,
+                        decode_timing.vld_submit_ms, decode_timing.copy_ready_wait_ms,
+                        decode_timing.vld_map_ms,
                         decode_timing.map_attempts, decode_timing.idct_submit_ms,
                         backend_ms, finish_ms);
     return flow;

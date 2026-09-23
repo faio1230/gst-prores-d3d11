@@ -84,6 +84,10 @@ CPU段階ログなしの同条件10周も4790/4800枚、decoder QoS欠落10。�
 
 追加の3周試行では診断用D3D11 timestamp/disjointとCPU段階を同時記録し、`GPU_STAGE`と`CPU_STAGE`各1440行のPTSを全件一致・disjoint 0と検査した。第2周境界のPTS 16.7msではVLDのstaging Map待ち15.446msに対しVLD shader GPU区間3.267ms、第3周境界の同PTSではMap待ち28.072msに対しGPU区間2.824ms。その直後のPTS 33.3/50msが第3周でdecoder QoS破棄された。GPU区間の全体中央値2.905ms、p99 3.597ms。Map待ちの長さをVLD shader実行時間だけで説明できないが、待ちはGPU queue、copy、driver内部や他のGPU作業を含み得るため正確な滞留位置は未特定。timestamp診断はIDCT完了まで追加で待つため、通常試行のQoS枚数（この試行は2/1440）へ流用しない。個別照合は`results/display-idct-layout-cache-sync1-gpu-stage-2026-09-24/cpu-gpu-stage-summary.json`。
 
+VLD結果のGPU→staging `CopyResource`前後にもtimestampを加え、実写4K60・3周の各1440枚を再測定した。通常のMapポーリングを維持した診断では、第2・第3周のPTS 16.7msでMap待ち20.241／26.256ms、VLD実行2.811／2.807ms、コピーGPU区間0.0053／0.0056msだった。全体のコピー中央値0.0085ms・最大0.0356ms。両周の次PTS 33.3msがQoS破棄された。コピー区間自体の長さは待ちの主因ではない。`results/display-vld-copy-boundary-2026-09-24/`に同一PTSのCPU/GPUログと集計を保存した。
+
+次の診断では`PRORES_DX11_CPU_TIMING=1`と`PRORES_DX11_GPU_TIMING=1`の**同時指定時だけ**、コピー終端の`GetData`を先に待ってからstagingをMapした。3周1440枚のコピー完了通知待ちは中央値6.029ms・最大26.404ms、通知後のMapは中央値0.0067ms・最大0.1423msで、欠落直前の第2周PTS 16.7msでは通知待ち26.404ms／Map 0.012ms／Map試行1回。待ちの多くはMap呼出し後のCPUメモリ処理ではなく、GPUコピー完了を通知できるまでにある。ただし`GetData`のflush・1ms刻みポーリングは位相を変え、この非交互試行はdecoder QoS欠落16/1440枚であった。前試行の2/1440との差を診断変更の因果効果とは断定せず、通常QoSや製品性能の測定値に使わない。GPUの投入前キュー、driver、表示側のどこが滞留したかも未特定。行別記録は`results/display-vld-copy-ready-2026-09-24/`。
+
 ### 同期値1とRGB後queueの交互診断
 
 `scripts/benchmark-display-queue-sync1.ps1`でDJI実写4K60を480枚×3周、RGB後の4 buffer非leaky queueなし→あり、あり→なしの順に比較した。標準sinkのPTS時計同期と通常decoder/sink QoSを維持し、診断専用の非公開ABI hookでPresent同期値だけを1にした。窓は各Presentで可視・非最小化・非最前面、前面窓との矩形重なり率23%。PresentMonは全試行でPID/QPC/PTS照合・内側捕捉漏れ0を確認した。
