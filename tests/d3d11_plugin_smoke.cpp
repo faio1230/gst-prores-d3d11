@@ -3,9 +3,11 @@
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/d3d11/gstd3d11device.h>
+#include <gst/d3d11/gstd3d11bufferpool.h>
 #include <gst/d3d11/gstd3d11memory.h>
 #include <gst/d3d11/gstd3d11utils.h>
 #include <gst/gst.h>
+#include <gst/video/gstvideopool.h>
 #include <gst/video/video.h>
 
 #include <d3d11.h>
@@ -293,23 +295,69 @@ static void reject_software_device(GstSample* compressed) {
             "WARP test adapter does not report software flag");
     auto* wrapped = gst_d3d11_device_new_wrapped(native.Get());
     require(wrapped != nullptr, "cannot wrap WARP test device for GStreamer");
-    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec name=decoder ! "
-                      "fakesink name=sink");
-    auto* context = gst_d3d11_context_new(wrapped);
-    require(context != nullptr, "cannot create WARP GStreamer context");
-    gst_element_set_context(pipeline.pipe, context);
-    gst_context_unref(context);
+    {
+        Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec name=decoder ! "
+                          "fakesink name=sink");
+        auto* context = gst_d3d11_context_new(wrapped);
+        require(context != nullptr, "cannot create WARP GStreamer context");
+        gst_element_set_context(pipeline.pipe, context);
+        gst_context_unref(context);
+        auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+        require(source != nullptr, "WARP decoder appsrc missing");
+        gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+        gst_element_set_state(pipeline.pipe, GST_STATE_PLAYING);
+        auto* packet = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+        require(packet != nullptr, "WARP test packet copy failed");
+        gst_app_src_push_buffer(GST_APP_SRC(source), packet);
+        gst_object_unref(source);
+        pipeline.expect_error(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_FAILED,
+                              "software D3D11 adapter");
+    }
+
+    auto* caps = gst_caps_from_string(
+        "video/x-raw(memory:D3D11Memory),format=I422_10LE,width=16,height=16,"
+        "framerate=60/1,interlace-mode=progressive,colorimetry=bt709,chroma-site=jpeg");
+    GstVideoInfo info{};
+    require(caps && gst_video_info_from_caps(&info, caps), "WARP RGB caps invalid");
+    auto* pool = gst_d3d11_buffer_pool_new(wrapped);
+    require(pool != nullptr, "cannot create WARP RGB input pool");
+    auto* config = gst_buffer_pool_get_config(pool);
+    gst_buffer_pool_config_set_params(config, caps, static_cast<guint>(info.size), 1, 2);
+    gst_buffer_pool_config_add_option(config, GST_BUFFER_POOL_OPTION_VIDEO_META);
+    auto* params = gst_d3d11_allocation_params_new(wrapped, &info,
+        GST_D3D11_ALLOCATION_FLAG_DEFAULT,
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0);
+    require(params != nullptr, "cannot create WARP RGB allocation parameters");
+    gst_buffer_pool_config_set_d3d11_allocation_params(config, params);
+    gst_d3d11_allocation_params_free(params);
+    require(gst_buffer_pool_set_config(pool, config) && gst_buffer_pool_set_active(pool, TRUE),
+            "cannot activate WARP RGB input pool");
+    GstBuffer* buffer = nullptr;
+    require(gst_buffer_pool_acquire_buffer(pool, &buffer, nullptr) == GST_FLOW_OK,
+            "cannot acquire WARP RGB input buffer");
+    GST_BUFFER_PTS(buffer) = 0;
+    GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, 60);
+    {
+        Pipeline pipeline("appsrc name=source format=time ! proresd3d11rgb ! "
+                          "appsink name=sink sync=false");
+        auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+        require(source != nullptr, "WARP RGB appsrc missing");
+        gst_app_src_set_caps(GST_APP_SRC(source), caps);
+        pipeline.state(GST_STATE_PLAYING);
+        require(gst_app_src_push_buffer(GST_APP_SRC(source), buffer) == GST_FLOW_OK,
+                "cannot push WARP RGB input buffer");
+        gst_object_unref(source);
+        pipeline.expect_error(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_FAILED,
+                              "software D3D11 adapter");
+        auto* unexpected = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline.sink),
+                                                        200 * GST_MSECOND);
+        if (unexpected) gst_sample_unref(unexpected);
+        require(unexpected == nullptr, "WARP RGB emitted output");
+    }
+    require(gst_buffer_pool_set_active(pool, FALSE), "cannot deactivate WARP RGB input pool");
+    gst_object_unref(pool);
+    gst_caps_unref(caps);
     gst_object_unref(wrapped);
-    auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
-    require(source != nullptr, "WARP test appsrc missing");
-    gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
-    gst_element_set_state(pipeline.pipe, GST_STATE_PLAYING);
-    auto* packet = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
-    require(packet != nullptr, "WARP test packet copy failed");
-    gst_app_src_push_buffer(GST_APP_SRC(source), packet);
-    gst_object_unref(source);
-    pipeline.expect_error(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_FAILED,
-                          "software D3D11 adapter");
 }
 
 static void known_color(GstSample* compressed, bool from_caps) {
@@ -682,7 +730,8 @@ int main(int argc, char** argv) try {
                  "\"retained_buffer_after_destroy\":true,\"shared_device_instances\":2,"
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
-                 "\"software_adapter_rejected\":true,\"error_cases\":10,"
+                 "\"software_adapter_decoder_rejected\":true,"
+                 "\"software_adapter_rgb_rejected\":true,\"error_cases\":11,"
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;

@@ -16,7 +16,7 @@ filesrc → qtdemux → proresd3d11dec → video/x-raw(memory:D3D11Memory)
 
 入力は `video/x-prores,variant=hq` の完全な1フレーム/バッファで、progressive、4:2:2、10bit、alphaなしに限定する。Proxy/LT/Standard、4444/XQ、12bit、alpha、interlaced、RAWは明示的に対象外。CPU/Vulkanへのfallbackはない。
 
-受け取ったD3D11 deviceはDXGI adapterまでたどり、`DXGI_ADAPTER_FLAG_SOFTWARE`が立つWARP等をSM5対応でも拒否する。adapter情報を取得できない場合もGPU実行と推定せず拒否する。ソフトウェアflagがないことだけで物理GPUの動作保証とはしない。専用RGB要素にも同じ判定を適用する。WARPをGStreamer contextに注入した実パイプラインではdecoderが`RESOURCE/FAILED`で停止した。他の物理GPUと実際のdevice lostは未検証。
+受け取ったD3D11 deviceはDXGI adapterまでたどり、`DXGI_ADAPTER_FLAG_SOFTWARE`が立つWARP等をSM5対応でも拒否する。adapter情報を取得できない場合もGPU実行と推定せず拒否する。ソフトウェアflagがないことだけで物理GPUの動作保証とはしない。専用RGB要素にも同じ判定を適用する。WARPをGStreamer contextに注入したdecoderと、WARP製D3D11Memoryを専用RGB要素へ直接渡した実パイプラインは、どちらも`RESOURCE/FAILED`で停止した。他の物理GPUと実際のdevice lostは未検証。
 
 出力は `video/x-raw(memory:D3D11Memory),format=I422_10LE`。Yは幅×高さ、U/Vは幅/2×高さの3枚 `DXGI_FORMAT_R16_UNORM` textureで、全てSRV|UAV。IDCT shaderがpoolのtextureへ直接書くため通常経路の画像GPU copyは0回、画像のCPU読み戻しも0回。圧縮packetのCPU→GPU uploadと、小さいVLDエラーフラグのGPU→CPU検査は行うため、処理全体を無条件に「ゼロコピー」とは呼ばない。
 
@@ -52,6 +52,7 @@ parserとVLD shaderのFFmpeg由来部分はSPDXでLGPL-2.1-or-laterを明記し�
 | 同一pipelineで色のみBT.709→BT.601→BT.709 | 2回の再交渉で出力colorimetry・3面D3D11Memory・PTSが一致。最初と最後の画素も一致 |
 | 正常なHQ出力後に隠れたalpha、または4444 capsへ切替 | alphaは`STREAM/FORMAT`、4444 capsは交渉エラーで停止。追加出力なし、先に出したD3D11Memoryはpipeline停止後も有効 |
 | 外部contextのWARPをdecoderへ提供 | SM5対応でもDXGIソフトウェアadapterとして`RESOURCE/FAILED`。画像出力・CPU fallbackなし |
+| WARP製I422 D3D11Memoryを専用RGB要素へ直接入力 | RGB出力前に`RESOURCE/FAILED`、追加GPU出力なし |
 | BT.601出力をBT.709専用`proresd3d11rgb`へ入力 | サイレント変換せずエラー終了 |
 | 破損signature、隠れたalpha/interlace、4444 caps、存在しないadapter/file | 全てエラー終了 |
 | 定常D3D11Memory供給、6周×3試行中央値 | 1080p 293.8 fps、4K 133.1 fps |
