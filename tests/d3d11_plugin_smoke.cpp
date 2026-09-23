@@ -150,17 +150,24 @@ static void check_caps(GstSample* sample, bool full_bt709) {
 }
 
 static void check_d3d_sample(GstSample* sample, GstClockTime pts, bool full_bt709 = false,
-                             int width = 1920, int height = 1080) {
+                             int width = 1920, int height = 1080,
+                             const GstVideoColorimetry* expected_color = nullptr) {
     auto* buffer = gst_sample_get_buffer(sample);
     require(GST_BUFFER_PTS(buffer) == pts, "PTS mismatch");
     require(GST_BUFFER_DURATION(buffer) > 0 &&
             GST_BUFFER_DURATION(buffer) != GST_CLOCK_TIME_NONE, "duration missing");
-    check_caps(sample, full_bt709);
+    if (!expected_color) check_caps(sample, full_bt709);
     auto* caps = gst_sample_get_caps(sample);
     GstVideoInfo info{};
     require(gst_video_info_from_caps(&info, caps) &&
             GST_VIDEO_INFO_WIDTH(&info) == width && GST_VIDEO_INFO_HEIGHT(&info) == height,
             "D3D11 output caps dimensions mismatch");
+    if (expected_color)
+        require(info.colorimetry.range == expected_color->range &&
+                info.colorimetry.matrix == expected_color->matrix &&
+                info.colorimetry.primaries == expected_color->primaries &&
+                info.colorimetry.transfer == expected_color->transfer,
+                "dynamic color caps mismatch");
     require(gst_caps_features_contains(gst_caps_get_features(caps, 0),
                                        GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY),
             "D3D11Memory caps feature missing");
@@ -178,6 +185,36 @@ static void check_d3d_sample(GstSample* sample, GstClockTime pts, bool full_bt70
                 desc.Height == static_cast<UINT>(height),
                 "unexpected output texture size");
     }
+}
+
+static void check_same_pixels(const GstVideoInfo& info, GstBuffer* before_buffer,
+                              GstBuffer* after_buffer, const char* failure) {
+    GstVideoFrame before{}, after{};
+    require(gst_video_frame_map(&before, &info, before_buffer, GST_MAP_READ),
+            "first D3D11 frame readback failed");
+    if (!gst_video_frame_map(&after, &info, after_buffer, GST_MAP_READ)) {
+        gst_video_frame_unmap(&before);
+        require(false, "final D3D11 frame readback failed");
+    }
+    bool equal = true;
+    for (guint component = 0; component < 3 && equal; ++component) {
+        const auto row_bytes = static_cast<std::size_t>(component ? info.width : info.width * 2);
+        for (int y = 0; y < info.height; ++y) {
+            const auto* before_row = static_cast<const guint8*>(
+                GST_VIDEO_FRAME_PLANE_DATA(&before, component)) +
+                y * GST_VIDEO_FRAME_PLANE_STRIDE(&before, component);
+            const auto* after_row = static_cast<const guint8*>(
+                GST_VIDEO_FRAME_PLANE_DATA(&after, component)) +
+                y * GST_VIDEO_FRAME_PLANE_STRIDE(&after, component);
+            if (std::memcmp(before_row, after_row, row_bytes) != 0) {
+                equal = false;
+                break;
+            }
+        }
+    }
+    gst_video_frame_unmap(&after);
+    gst_video_frame_unmap(&before);
+    require(equal, failure);
 }
 
 static void check_downloaded_sample(GstSample* sample) {
@@ -255,6 +292,76 @@ static void known_color(GstSample* compressed, bool from_caps) {
     require(pipeline.pull() == nullptr, "extra color frame");
 }
 
+static void dynamic_color_caps(GstSample* compressed) {
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! "
+                      "appsink name=sink sync=false max-buffers=4");
+    auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+    require(source != nullptr, "dynamic-color source missing");
+    pipeline.state(GST_STATE_PLAYING);
+    GstBuffer* retained = nullptr;
+    for (guint64 index = 0; index < 3; ++index) {
+        const char* color_name = index == 1 ? "bt601" : "bt709";
+        GstVideoColorimetry expected{};
+        require(gst_video_colorimetry_from_string(&expected, color_name),
+                "dynamic-color fixture is invalid");
+        auto* caps = gst_caps_copy(gst_sample_get_caps(compressed));
+        gst_caps_set_simple(caps, "colorimetry", G_TYPE_STRING, color_name, nullptr);
+        gst_app_src_set_caps(GST_APP_SRC(source), caps);
+        gst_caps_unref(caps);
+
+        auto* packet = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+        require(packet != nullptr, "dynamic-color packet copy failed");
+        const guint8 unspecified_color[] = {2, 2, 2};
+        require(gst_buffer_fill(packet, 22, unspecified_color, sizeof(unspecified_color)) ==
+                    sizeof(unspecified_color), "dynamic-color frame tag write failed");
+        GST_BUFFER_PTS(packet) = gst_util_uint64_scale(index, GST_SECOND, 60);
+        GST_BUFFER_DTS(packet) = GST_BUFFER_PTS(packet);
+        GST_BUFFER_DURATION(packet) = gst_util_uint64_scale(1, GST_SECOND, 60);
+        require(gst_app_src_push_buffer(GST_APP_SRC(source), packet) == GST_FLOW_OK,
+                "dynamic-color input failed");
+
+        auto* output = pipeline.pull();
+        require(output != nullptr, "dynamic-color output missing");
+        check_d3d_sample(output, gst_util_uint64_scale(index, GST_SECOND, 60),
+                         false, 1920, 1080, &expected);
+        if (index == 0) retained = gst_buffer_ref(gst_sample_get_buffer(output));
+        if (index == 2) {
+            GstVideoInfo info{};
+            require(gst_video_info_from_caps(&info, gst_sample_get_caps(output)),
+                    "dynamic-color video info missing");
+            check_same_pixels(info, retained, gst_sample_get_buffer(output),
+                              "pixels changed after color-only caps switch");
+        }
+        gst_sample_unref(output);
+    }
+    require(gst_app_src_end_of_stream(GST_APP_SRC(source)) == GST_FLOW_OK,
+            "dynamic-color EOS failed");
+    gst_object_unref(source);
+    require(pipeline.pull() == nullptr, "extra dynamic-color frame");
+    require(retained != nullptr && gst_buffer_n_memory(retained) == 3,
+            "retained D3D11 buffer invalid after color-only caps changes");
+    gst_buffer_unref(retained);
+}
+
+static void reject_unsupported_rgb_color(GstSample* compressed) {
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! "
+                      "proresd3d11rgb ! fakesink");
+    auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+    auto* caps = gst_caps_copy(gst_sample_get_caps(compressed));
+    gst_caps_set_simple(caps, "colorimetry", G_TYPE_STRING, "bt601", nullptr);
+    gst_app_src_set_caps(GST_APP_SRC(source), caps);
+    gst_caps_unref(caps);
+    auto* packet = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+    const guint8 unspecified_color[] = {2, 2, 2};
+    require(gst_buffer_fill(packet, 22, unspecified_color, sizeof(unspecified_color)) ==
+                sizeof(unspecified_color), "unsupported-RGB frame tag write failed");
+    pipeline.state(GST_STATE_PLAYING);
+    gst_app_src_push_buffer(GST_APP_SRC(source), packet);
+    gst_app_src_end_of_stream(GST_APP_SRC(source));
+    gst_object_unref(source);
+    pipeline.expect_error();
+}
+
 static void dynamic_caps(GstSample* hd, GstSample* uhd) {
     Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! "
                       "appsink name=sink sync=false max-buffers=4");
@@ -288,30 +395,8 @@ static void dynamic_caps(GstSample* hd, GstSample* uhd) {
             GstVideoInfo info{};
             require(gst_video_info_from_caps(&info, gst_sample_get_caps(output)),
                     "dynamic-caps HD video info missing");
-            GstVideoFrame before{}, after{};
-            require(gst_video_frame_map(&before, &info, retained_hd, GST_MAP_READ),
-                    "dynamic-caps first HD download failed");
-            require(gst_video_frame_map(&after, &info, gst_sample_get_buffer(output), GST_MAP_READ),
-                    "dynamic-caps final HD download failed");
-            bool equal = true;
-            for (guint component = 0; component < 3 && equal; ++component) {
-                const auto row_bytes = static_cast<std::size_t>(component ? width : width * 2);
-                for (int y = 0; y < height; ++y) {
-                    const auto* before_row = static_cast<const guint8*>(
-                        GST_VIDEO_FRAME_PLANE_DATA(&before, component)) +
-                        y * GST_VIDEO_FRAME_PLANE_STRIDE(&before, component);
-                    const auto* after_row = static_cast<const guint8*>(
-                        GST_VIDEO_FRAME_PLANE_DATA(&after, component)) +
-                        y * GST_VIDEO_FRAME_PLANE_STRIDE(&after, component);
-                    if (std::memcmp(before_row, after_row, row_bytes) != 0) {
-                        equal = false;
-                        break;
-                    }
-                }
-            }
-            gst_video_frame_unmap(&after);
-            gst_video_frame_unmap(&before);
-            require(equal, "HD pixels changed after dynamic caps switch");
+            check_same_pixels(info, retained_hd, gst_sample_get_buffer(output),
+                              "HD pixels changed after dynamic caps switch");
         }
         gst_sample_unref(output);
     }
@@ -459,6 +544,8 @@ int main(int argc, char** argv) try {
     }
     known_color(compressed, false);
     known_color(compressed, true);
+    dynamic_color_caps(compressed);
+    reject_unsupported_rgb_color(compressed);
     if (argc == 3) {
         Pipeline demux("filesrc name=source ! qtdemux ! appsink name=sink sync=false max-buffers=1");
         demux.file(argv[2]);
@@ -491,11 +578,12 @@ int main(int argc, char** argv) try {
 
     std::cout << "{\"passed\":true,\"eos_cycles\":3,\"frames_per_cycle\":180,"
                  "\"flushing_seeks\":4,\"known_color_cases\":2,"
+                 "\"dynamic_color_caps_changes\":2,"
                  "\"dynamic_caps_changes\":" << (argc == 3 ? 2 : 0) << ","
                  "\"retained_buffer_after_destroy\":true,\"shared_device_instances\":2,"
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
-                 "\"error_cases\":6,"
+                 "\"error_cases\":7,"
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;
