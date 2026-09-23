@@ -72,7 +72,7 @@ public:
           context_(gst_d3d11_device_get_device_context_handle(gst_device)),
           width_(width), height_(height) {
         require(device_ && context_, "missing native D3D11 handles");
-        require_d3d11_hardware_device(device_);
+        require_d3d11_non_software_adapter(device_);
         require(device_->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0,
                 "RGB Compute Shader requires D3D feature level 11_0 or higher");
         UINT input_support = 0;

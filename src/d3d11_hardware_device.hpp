@@ -25,7 +25,7 @@ inline DXGI_ADAPTER_DESC1 d3d11_adapter_description(ID3D11Device* device) {
     return description;
 }
 
-inline void require_d3d11_hardware_device(ID3D11Device* device) {
+inline void require_d3d11_non_software_adapter(ID3D11Device* device) {
     const auto description = d3d11_adapter_description(device);
     if (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
         throw std::runtime_error("software D3D11 adapter is not a ProRes GPU backend");

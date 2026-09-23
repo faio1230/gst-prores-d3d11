@@ -16,7 +16,7 @@ filesrc → qtdemux → proresd3d11dec → video/x-raw(memory:D3D11Memory)
 
 入力は `video/x-prores,variant=hq` の完全な1フレーム/バッファで、progressive、4:2:2、10bit、alphaなしに限定する。Proxy/LT/Standard、4444/XQ、12bit、alpha、interlaced、RAWは明示的に対象外。CPU/Vulkanへのfallbackはない。
 
-受け取ったD3D11 deviceはDXGI adapterまでたどり、`DXGI_ADAPTER_FLAG_SOFTWARE`が立つWARP等をSM5対応でも拒否する。adapter情報を取得できない場合もGPU実行と推定せず拒否する。専用RGB要素にも同じ判定を適用する。WARPをGStreamer contextに注入した実パイプラインではdecoderが`RESOURCE/FAILED`で停止した。他の物理GPUと実際のdevice lostは未検証。
+受け取ったD3D11 deviceはDXGI adapterまでたどり、`DXGI_ADAPTER_FLAG_SOFTWARE`が立つWARP等をSM5対応でも拒否する。adapter情報を取得できない場合もGPU実行と推定せず拒否する。ソフトウェアflagがないことだけで物理GPUの動作保証とはしない。専用RGB要素にも同じ判定を適用する。WARPをGStreamer contextに注入した実パイプラインではdecoderが`RESOURCE/FAILED`で停止した。他の物理GPUと実際のdevice lostは未検証。
 
 出力は `video/x-raw(memory:D3D11Memory),format=I422_10LE`。Yは幅×高さ、U/Vは幅/2×高さの3枚 `DXGI_FORMAT_R16_UNORM` textureで、全てSRV|UAV。IDCT shaderがpoolのtextureへ直接書くため通常経路の画像GPU copyは0回、画像のCPU読み戻しも0回。圧縮packetのCPU→GPU uploadと、小さいVLDエラーフラグのGPU→CPU検査は行うため、処理全体を無条件に「ゼロコピー」とは呼ばない。
 

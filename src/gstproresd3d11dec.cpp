@@ -177,7 +177,7 @@ public:
           token_(gst_d3d11_create_user_token()) {
         if (!device_ || !context_) throw std::runtime_error("GstD3D11Device has no native handles");
         try {
-            require_d3d11_hardware_device(device_);
+            require_d3d11_non_software_adapter(device_);
         } catch (const std::exception& error) {
             throw UnsupportedDevice(error.what());
         }
