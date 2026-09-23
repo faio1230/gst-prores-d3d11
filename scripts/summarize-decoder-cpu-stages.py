@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--presentmon-summary", type=Path,
                         help="同じ試行のPresentMon PTS照合結果をCPU段階と結合")
+    parser.add_argument("--allow-sink-drop", action="store_true",
+                        help="診断試行でdecoder出力後のsink dropを別件として許容")
     args = parser.parse_args()
 
     trial = json.loads(args.trial_json.read_text(encoding="utf-8-sig"))
@@ -84,8 +86,9 @@ def main():
     missing = trial["stages"]["missing_after_decoder"]
     if trial["stages"]["missing_before_decoder"] or trial["stages"]["missing_after_converter"]:
         raise ValueError("欠落段階がdecoder出力前だけではありません")
-    if trial["rendered"] + len(missing) != expected:
-        raise ValueError("renderedと欠落枚数の合計が予定枚数と不一致")
+    sink_drop = trial.get("dropped", 0) if args.allow_sink_drop else 0
+    if trial["rendered"] + len(missing) + sink_drop != expected:
+        raise ValueError("rendered・decoder欠落・sink dropの合計が予定枚数と不一致")
     missing_rows = []
     for loop, pts_ns in missing:
         row = by_position.get((loop, pts_ns))
@@ -109,6 +112,7 @@ def main():
         "cpu_stage_rows": len(rows),
         "rendered": trial["rendered"],
         "missing_after_decoder": len(missing),
+        "sink_dropped": sink_drop,
         "field_ms": {field: distribution(rows, field) for field in FIELDS},
         "missing_rows": missing_rows,
         "qos_association_previous_idct_8ms": {
