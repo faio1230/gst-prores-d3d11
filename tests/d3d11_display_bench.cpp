@@ -278,7 +278,7 @@ int main(int argc, char** argv) try {
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
     if (argc < 4 || argc > 15)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N]]");
+        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
@@ -313,7 +313,8 @@ int main(int argc, char** argv) try {
     const std::string input(argv[1]);
     const bool reference_rgb = input == "testsrc-rgb";
     const bool reference_heavy = input == "testsrc-heavy";
-    const bool reference = reference_rgb || reference_heavy;
+    const bool reference_stress = input == "testsrc-stress";
+    const bool reference = reference_rgb || reference_heavy || reference_stress;
     if (reference && loops != 1)
         throw std::runtime_error("D3D11 test source reference requires one 1440-frame loop");
     if (reference && (native_rgb || predecode_queue || decoder_no_qos))
@@ -328,8 +329,8 @@ int main(int argc, char** argv) try {
         description = "d3d11testsrc name=source num-buffers=1440 ! "
             "video/x-raw(memory:D3D11Memory),format=RGB10A2_LE,"
             "width=3840,height=2160,framerate=60/1,colorimetry=bt709 ! ";
-        if (reference_heavy) {
-            for (int index = 0; index < 2; ++index)
+        if (reference_heavy || reference_stress) {
+            for (int index = 0; index < (reference_stress ? 11 : 2); ++index)
                 description += "d3d11convert ! " + yuv_caps + " ! d3d11convert ! " + rgb_caps + " ! ";
             description += "d3d11convert ! " + yuv_caps + " ! proresd3d11rgb name=converter ! " + rgb_caps + " ! ";
         }
@@ -509,7 +510,7 @@ int main(int argc, char** argv) try {
               << ",\"loops\":" << loops << ",\"preroll_ms\":" << preroll_ms
               << ",\"source_mode\":\"" << (reference ? input : "prores") << "\""
               << ",\"rgb_converter\":\"" << (reference_rgb ? "none" :
-                  (reference_heavy || native_rgb) ? "proresd3d11rgb" : "d3d11convert") << "\""
+                  (reference_heavy || reference_stress || native_rgb) ? "proresd3d11rgb" : "d3d11convert") << "\""
               << ",\"predecode_queue\":" << (predecode_queue ? "true" : "false")
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
               << ",\"trace_sink_return\":" << (trace_sink_return ? "true" : "false")

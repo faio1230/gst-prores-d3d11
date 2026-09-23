@@ -15,7 +15,7 @@ GPU_STATS = runpy.run_path(str(ROOT / 'scripts/benchmark-d3d11-display.py'))['gp
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=('rgb', 'heavy'), required=True)
+    parser.add_argument('--mode', choices=('rgb', 'heavy', 'stress'), required=True)
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--topmost-window', action='store_true')
     parser.add_argument('--out', type=Path, required=True)
