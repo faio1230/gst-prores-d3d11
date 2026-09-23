@@ -15,9 +15,11 @@
 #include <wrl/client.h>
 
 #include <cstring>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 static void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
@@ -266,6 +268,7 @@ static void injected_error(GstSample* compressed, const char* test) {
     gst_caps_unref(caps);
     auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
     guint8 byte = 0;
+    std::string expected_gpu_error = "GPU entropy decoder rejected job";
     if (std::string(test) == "bad-signature") gst_buffer_fill(input, 4, &byte, 1);
     if (std::string(test) == "alpha-hidden-in-caps") {
         byte = 2;
@@ -291,13 +294,42 @@ static void injected_error(GstSample* compressed, const char* test) {
                                 oversized_dc, sizeof(oversized_dc)) == sizeof(oversized_dc),
                 "cannot write oversized first DC code");
     }
+    if (std::string(test) == "ac-run-boundary") {
+        // 固定1080p素材の先頭packet: ASan変異検査で見つけた単一byteの再現例。
+        constexpr gsize offset = 7690;
+        require(gst_buffer_extract(input, offset, &byte, 1) == 1 && byte == 0x14,
+                "AC boundary fixture byte changed");
+        byte = 0x04;
+        require(gst_buffer_fill(input, offset, &byte, 1) == 1,
+                "cannot write AC boundary mutation");
+        GstMapInfo mapped{};
+        require(gst_buffer_map(input, &mapped, GST_MAP_READ), "cannot map AC boundary input");
+        prores::Frame parsed;
+        std::string parse_error;
+        const bool valid = prores::parse_frame(mapped.data, mapped.size, 0, 0,
+                                                parsed, parse_error);
+        std::vector<prores::CoefficientJob> jobs;
+        std::vector<std::int32_t> coefficients;
+        const bool entropy_valid = valid && prores::make_coefficient_reference(
+            mapped.data, mapped.size, parsed, jobs, coefficients, parse_error);
+        gst_buffer_unmap(input, &mapped);
+        require(valid && !entropy_valid &&
+                parse_error.find("AC run reaches coefficient plane end") != std::string::npos,
+                "AC boundary mutation did not reach the target CPU check");
+        unsigned slice = 0, component = 0;
+        require(sscanf_s(parse_error.c_str(), "slice %u component %u:",
+                         &slice, &component) == 2 && component < 3,
+                "AC boundary CPU job could not be identified");
+        expected_gpu_error += " " + std::to_string(slice * 3 + component);
+    }
     pipeline.state(GST_STATE_PLAYING);
     gst_app_src_push_buffer(GST_APP_SRC(source), input);
     gst_app_src_end_of_stream(GST_APP_SRC(source));
     gst_object_unref(source);
-    if (std::string(test) == "oversized-first-dc")
+    if (std::string(test) == "oversized-first-dc" ||
+        std::string(test) == "ac-run-boundary")
         pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE,
-                              "GPU entropy decoder rejected job");
+                              expected_gpu_error.c_str());
     else
         pipeline.expect_error();
 }
@@ -723,7 +755,7 @@ int main(int argc, char** argv) try {
     }
     for (const char* test : {"bad-signature", "alpha-hidden-in-caps",
                              "interlaced-hidden-in-caps", "4444-caps",
-                             "oversized-first-dc"})
+                             "oversized-first-dc", "ac-run-boundary"})
         injected_error(compressed, test);
     gst_sample_unref(compressed);
 
@@ -752,7 +784,7 @@ int main(int argc, char** argv) try {
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
                  "\"software_adapter_decoder_rejected\":true,"
-                 "\"software_adapter_rgb_rejected\":true,\"error_cases\":12,"
+                 "\"software_adapter_rgb_rejected\":true,\"error_cases\":13,"
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;

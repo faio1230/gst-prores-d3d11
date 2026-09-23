@@ -183,6 +183,10 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
             return fail(error, "truncated AC run");
         if (run >= max_coefficients || position > max_coefficients - run - 1)
             return fail(error, "AC run exceeds coefficient plane");
+        // Equality would advance one past the last coefficient and index
+        // kProgressiveScan[64]. Keep a distinct error for the regression case.
+        if (position == max_coefficients - run - 1)
+            return fail(error, "AC run reaches coefficient plane end");
         position += run + 1;
         if (!decode_codeword(bits, kLevelCodebook[std::min<std::uint32_t>(level, 9)], level))
             return fail(error, "truncated AC level");

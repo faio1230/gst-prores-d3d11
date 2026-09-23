@@ -30,6 +30,7 @@ gst-launch-1.0 -e filesrc location=media/synthetic-1080p60-hq.mov ! qtdemux ! pr
 gst-launch-1.0 -e filesrc location=media/reference-proton-rec709-hq.mov ! qtdemux ! proresd3d11dec ! proresd3d11rgb ! d3d11videosink sync=true
 ./scripts/test-dx11.ps1
 ./scripts/test-d3d11-plugin.ps1
+./scripts/test-d3d11-parser-mutations.ps1 -Iterations 500
 ```
 
 成果物は `build/vs18/plugins/Release/gstproresd3d11.dll` と同じディレクトリの `prores_vld.cso`、`prores_idct_unorm.cso`。Windows SDKのfxcでビルド時に `cs_5_0` へ固定し、起動時はbytecodeを読むだけにする。既定ではDLL隣を読み、`shader-directory` propertyまたは `PRORES_DX11_SHADER_DIR` で上書きできる。HLSL sourceも同じ出力先へライセンス確認用に配置する。`adapter=-1` は既定adapter。`rank=NONE` のため要素名を明示する。
@@ -60,6 +61,7 @@ parserとVLD shaderのFFmpeg由来部分はSPDXでLGPL-2.1-or-laterを明記し�
 | BT.601出力をBT.709専用`proresd3d11rgb`へ入力 | サイレント変換せずエラー終了 |
 | 破損signature、隠れたalpha/interlace、4444 caps、存在しないadapter/file | 全てエラー終了 |
 | 構造は正常だが先頭DCが16bit範囲外のProRes frame | GPU VLDエラーフラグで`STREAM/DECODE`、画像を出さず停止。CPU参照も拒否 |
+| 構造は正常だがAC runが係数面末尾の1つ先に達するframe | CPU参照は境界エラー、GPU VLDは同じjobを`STREAM/DECODE`で拒否。画像を出さず停止 |
 | 定常D3D11Memory供給、6周×3試行中央値 | 1080p 293.8 fps、4K 133.1 fps |
 | 検査用downloadでGPU完了を含む定常値 | 1080p 255.7 fps、4K 102.2 fps、p99 4.49/11.63 ms |
 | 4K長時間、GPU完了込み | 30分、182,520フレーム、p99 11.42 ms、エラーなし |

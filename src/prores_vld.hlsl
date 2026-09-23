@@ -208,7 +208,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
         uint left = reader.bit_size - min(reader.position, reader.bit_size);
         if (left == 0 || (left < 32 && show_bits(reader, left) == 0)) break;
         run = decode_codeword(reader, run_codebook[min(run, 15)]);
-        if (run >= max_coefficients || position > max_coefficients - run - 1) {
+        // Equality would advance position beyond the last coefficient.
+        if (run >= max_coefficients || position >= max_coefficients - run - 1) {
             reader.failed = 1;
             break;
         }
