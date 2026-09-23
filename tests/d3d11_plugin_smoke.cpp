@@ -1,4 +1,5 @@
 // 純粋DX11 GStreamer要素のD3D11Memory、時刻、seek、寿命、失敗入力を検証する。
+#include "d3d11_hardware_device.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/d3d11/gstd3d11device.h>
@@ -8,6 +9,7 @@
 #include <gst/video/video.h>
 
 #include <d3d11.h>
+#include <wrl/client.h>
 
 #include <cstring>
 #include <iostream>
@@ -112,7 +114,8 @@ struct Pipeline {
         return sample;
     }
 
-    void expect_error(GQuark expected_domain = 0, int expected_code = -1) {
+    void expect_error(GQuark expected_domain = 0, int expected_code = -1,
+                      const char* expected_debug_text = nullptr) {
         auto* message = gst_bus_timed_pop_filtered(bus, 15 * GST_SECOND,
             static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
         require(message != nullptr, "expected error timed out");
@@ -126,10 +129,13 @@ struct Pipeline {
             const bool expected_type =
                 (!expected_domain || error->domain == expected_domain) &&
                 (expected_code < 0 || error->code == expected_code);
+            const bool expected_debug = !expected_debug_text ||
+                (debug && std::strstr(debug, expected_debug_text));
             g_error_free(error);
             g_free(debug);
             gst_message_unref(message);
             require(expected_type, "unexpected error domain or code");
+            require(expected_debug, "expected error detail missing");
             return;
         }
         gst_message_unref(message);
@@ -272,6 +278,38 @@ static void injected_error(GstSample* compressed, const char* test) {
     gst_app_src_end_of_stream(GST_APP_SRC(source));
     gst_object_unref(source);
     pipeline.expect_error();
+}
+
+static void reject_software_device(GstSample* compressed) {
+    Microsoft::WRL::ComPtr<ID3D11Device> native;
+    const D3D_FEATURE_LEVEL requested[] = {D3D_FEATURE_LEVEL_11_0};
+    D3D_FEATURE_LEVEL actual{};
+    require(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+                                        requested, 1, D3D11_SDK_VERSION, &native,
+                                        &actual, nullptr)), "cannot create WARP test device");
+    require(actual >= D3D_FEATURE_LEVEL_11_0, "WARP test device lacks SM5");
+    const auto description = d3d11_adapter_description(native.Get());
+    require((description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0,
+            "WARP test adapter does not report software flag");
+    auto* wrapped = gst_d3d11_device_new_wrapped(native.Get());
+    require(wrapped != nullptr, "cannot wrap WARP test device for GStreamer");
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec name=decoder ! "
+                      "fakesink name=sink");
+    auto* context = gst_d3d11_context_new(wrapped);
+    require(context != nullptr, "cannot create WARP GStreamer context");
+    gst_element_set_context(pipeline.pipe, context);
+    gst_context_unref(context);
+    gst_object_unref(wrapped);
+    auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+    require(source != nullptr, "WARP test appsrc missing");
+    gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+    gst_element_set_state(pipeline.pipe, GST_STATE_PLAYING);
+    auto* packet = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+    require(packet != nullptr, "WARP test packet copy failed");
+    gst_app_src_push_buffer(GST_APP_SRC(source), packet);
+    gst_object_unref(source);
+    pipeline.expect_error(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_FAILED,
+                          "software D3D11 adapter");
 }
 
 static void known_color(GstSample* compressed, bool from_caps) {
@@ -602,6 +640,7 @@ int main(int argc, char** argv) try {
     known_color(compressed, false);
     known_color(compressed, true);
     dynamic_color_caps(compressed);
+    reject_software_device(compressed);
     dynamic_rejected_input(compressed, false);
     dynamic_rejected_input(compressed, true);
     reject_unsupported_rgb_color(compressed);
@@ -643,7 +682,7 @@ int main(int argc, char** argv) try {
                  "\"retained_buffer_after_destroy\":true,\"shared_device_instances\":2,"
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
-                 "\"error_cases\":9,"
+                 "\"software_adapter_rejected\":true,\"error_cases\":10,"
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;

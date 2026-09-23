@@ -6,7 +6,7 @@
 
 復号出力は `video/x-raw(memory:D3D11Memory),format=I422_10LE` で、3枚のR16_UNORM textureです。通常経路で復号画像をCPUへ読み戻しません。RGB要素はBT.709 limited、中央または未指定のクロマ位置に限り、`RGB10A2_LE(memory:D3D11Memory)` を出力します。
 
-検証済み環境はWindows x64、GStreamer 1.28.2 MSVC x64、Direct3D feature level 11_0以上・R16_UNORM typed UAV対応のRTX 3070です。GStreamer本体とMSVC runtimeは同梱していません。プラグインDLLと3つの`.cso`を同じディレクトリに置いてください。
+検証済み環境はWindows x64、GStreamer 1.28.2 MSVC x64、Direct3D feature level 11_0以上・R16_UNORM typed UAV対応のRTX 3070です。DXGIでソフトウェアと報告されるWARP等のdeviceは、SM5対応でもGPU復号器として受け付けません。他の物理GPUの動作は未検証です。GStreamer本体とMSVC runtimeは同梱していません。プラグインDLLと3つの`.cso`を同じディレクトリに置いてください。
 
 PowerShellでGStreamerの`bin`をPATH先頭に置き、`GST_PLUGIN_PATH`をこのディレクトリへ設定してから、`gst-inspect-1.0 proresd3d11dec` と `gst-inspect-1.0 proresd3d11rgb` で登録を確認できます。独立したパイプライン例：
 

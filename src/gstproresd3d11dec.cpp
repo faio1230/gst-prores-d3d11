@@ -4,6 +4,7 @@
  * there is no libavcodec/Vulkan/software decode fallback in this module.
  */
 #include "prores_parser.hpp"
+#include "d3d11_hardware_device.hpp"
 
 #include <gst/gst.h>
 #include <gst/video/gstvideodecoder.h>
@@ -175,6 +176,11 @@ public:
           context_(gst_d3d11_device_get_device_context_handle(gst_device)),
           token_(gst_d3d11_create_user_token()) {
         if (!device_ || !context_) throw std::runtime_error("GstD3D11Device has no native handles");
+        try {
+            require_d3d11_hardware_device(device_);
+        } catch (const std::exception& error) {
+            throw UnsupportedDevice(error.what());
+        }
         const auto feature_level = device_->GetFeatureLevel();
         if (feature_level < D3D_FEATURE_LEVEL_11_0)
             throw UnsupportedDevice("ProRes SM5 requires D3D feature level 11_0 or higher; actual=" +

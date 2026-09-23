@@ -1,6 +1,7 @@
 /* Native D3D11 I422_10LE -> RGB10A2_LE color converter.
  * The compute shader writes directly into a GstD3D11BufferPool texture.
  */
+#include "d3d11_hardware_device.hpp"
 #include <gst/base/gstbasetransform.h>
 #include <gst/d3d11/gstd3d11bufferpool.h>
 #include <gst/d3d11/gstd3d11device.h>
@@ -71,6 +72,7 @@ public:
           context_(gst_d3d11_device_get_device_context_handle(gst_device)),
           width_(width), height_(height) {
         require(device_ && context_, "missing native D3D11 handles");
+        require_d3d11_hardware_device(device_);
         require(device_->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0,
                 "RGB Compute Shader requires D3D feature level 11_0 or higher");
         UINT input_support = 0;
