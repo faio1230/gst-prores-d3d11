@@ -73,3 +73,16 @@ python scripts/summarize-presentmon-display.py results/present-sync-standard-202
 時計同期なしは2試行で出力前欠落を避けたが、1試行の最大表示間隔38.313msは60Hzの2周期を超える。短い2組だけで滑らかさを保証しない。24fpsでも素材PTSを守れるかを同じ実写経路で確認すると、129枚のwall時間は同期あり5,335ms／なし2,114ms、GStreamerのpresent間隔中央値は41.641ms／16.658ms。PresentMonは両方とも内側127/127枚を捕捉しOS未表示0だったが、時計同期なしは約2.52倍速であり、`Present1(1)`の60Hz pacingは24fpsのPTS同期を代替できない。診断時のEOS後保持は3,000msとし、表示wall値には含めない。
 
 生記録・PTS照合は`results/display-clock-sync-long-2026-09-24/`と`results/display-clock-sync-24fps-hold-2026-09-24/`、再現スクリプトは`scripts/benchmark-display-clock-sync.ps1`。短い24fps試行を同名出力へ再取得した際、PresentMonが短命PIDを識別できず捕捉不足になった記録は採用せず、非コミットの`build/vs18/failed-display-clock-sync-24fps-2026-09-24/`に移して保持した。長い試行・再取得した24fps試行はいずれも要約器の完全捕捉判定を通過。時計同期なしを製品設定へは採用せず、PTSを保ったままsink待ち・decoder QoS欠落とOS未表示を両立して減らす保守可能な経路が必要である。
+
+### 同期値1とRGB後queueの交互診断
+
+`scripts/benchmark-display-queue-sync1.ps1`でDJI実写4K60を480枚×3周、RGB後の4 buffer非leaky queueなし→あり、あり→なしの順に比較した。標準sinkのPTS時計同期と通常decoder/sink QoSを維持し、診断専用の非公開ABI hookでPresent同期値だけを1にした。窓は各Presentで可視・非最小化・非最前面、前面窓との矩形重なり率23%。PresentMonは全試行でPID/QPC/PTS照合・内側捕捉漏れ0を確認した。
+
+| 試行 | queue | GStreamer出力/予定 | decoder QoS欠落 | 内側OS未表示/捕捉 | 最大OS表示間隔 | 最大queue待機 |
+|---|---|---:|---:|---:|---:|---:|
+| r0-q0 | なし | 1438/1440 | 2 | 2/1432 | 33.375ms | — |
+| r0-q1 | あり | 1438/1440 | 2 | 0/1432 | 21.645ms | 79.36ms |
+| r1-q1 | あり | 1437/1440 | 3 | 0/1431 | 21.643ms | 82.30ms |
+| r1-q0 | なし | 1436/1440 | 4 | 0/1430 | 33.333ms | — |
+
+queueあり2試行のOS未表示は0だったが、decoder出力前のQoS欠落は2/3枚残った。queueなしも0/2枚と試行間で変動した。windowの矩形重なりは完全な遮蔽証明ではない。同期値1の非公開hookもqueueも製品経路へ採用しない。行別記録は`results/display-queue-sync1-2026-09-24/`、先行のPresentMonなし単発は`results/display-queue-sync1-pilot-2026-09-24/`に分けた。

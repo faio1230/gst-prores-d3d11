@@ -130,6 +130,19 @@ struct GpuStageTiming {
     double idct_ms = 0;
 };
 
+struct CpuDecodeTiming {
+    double coefficient_jobs_ms = 0;
+    double idct_jobs_ms = 0;
+    double cache_ms = 0;
+    double output_uav_ms = 0;
+    double device_lock_ms = 0;
+    double upload_ms = 0;
+    double vld_submit_ms = 0;
+    double vld_map_ms = 0;
+    std::uint64_t map_attempts = 0;
+    double idct_submit_ms = 0;
+};
+
 ComPtr<ID3D11Query> make_query(ID3D11Device* device, D3D11_QUERY type) {
     D3D11_QUERY_DESC desc{};
     desc.Query = type;
@@ -208,13 +221,25 @@ public:
     }
 
     std::optional<GpuStageTiming> decode(const std::uint8_t* packet, std::size_t packet_size,
-                                         const prores::Frame& parsed, GstBuffer* output) {
+                                         const prores::Frame& parsed, GstBuffer* output,
+                                         CpuDecodeTiming* cpu_timing = nullptr) {
+        auto phase_start = std::chrono::steady_clock::time_point{};
+        if (cpu_timing) phase_start = std::chrono::steady_clock::now();
+        const auto mark = [&](double CpuDecodeTiming::*field) {
+            if (!cpu_timing) return;
+            const auto now = std::chrono::steady_clock::now();
+            cpu_timing->*field = std::chrono::duration<double, std::milli>(
+                now - phase_start).count();
+            phase_start = now;
+        };
         check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed before decode");
-        std::vector<prores::CoefficientJob> coefficient_jobs;
+        auto& coefficient_jobs = coefficient_jobs_;
         std::uint32_t coefficient_count = 0;
         prores::make_coefficient_jobs(parsed, coefficient_jobs, coefficient_count);
-        std::vector<prores::IdctBlockJob> idct_jobs;
+        mark(&CpuDecodeTiming::coefficient_jobs_ms);
+        auto& idct_jobs = idct_jobs_;
         prores::make_idct_jobs(parsed, coefficient_jobs, idct_jobs);
+        mark(&CpuDecodeTiming::idct_jobs_ms);
         if (!coefficient_count || coefficient_jobs.empty() || idct_jobs.empty())
             throw std::runtime_error("empty ProRes GPU job list");
 
@@ -224,6 +249,7 @@ public:
         ensure_cache(parsed, static_cast<UINT>(packet_size),
                      static_cast<UINT>(coefficient_jobs.size()), coefficient_count,
                      static_cast<UINT>(idct_jobs.size()));
+        mark(&CpuDecodeTiming::cache_ms);
 
         if (gst_buffer_n_memory(output) != 3)
             throw std::runtime_error("I422_10LE D3D11 output must have three memories");
@@ -254,8 +280,10 @@ public:
             }
             output_uavs[component] = stored->view;
         }
+        mark(&CpuDecodeTiming::output_uav_ms);
 
         DeviceLock lock(gst_device_);
+        mark(&CpuDecodeTiming::device_lock_ms);
         D3D11_MAPPED_SUBRESOURCE mapped_packet{};
         check_hr(context_->Map(cache_.packet.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_packet),
                  "Map compressed packet upload");
@@ -285,6 +313,7 @@ public:
         const UINT zeros[4]{};
         context_->ClearUnorderedAccessViewUint(cache_.coefficient_uav.Get(), zeros);
         context_->ClearUnorderedAccessViewUint(cache_.error_uav.Get(), zeros);
+        mark(&CpuDecodeTiming::upload_ms);
         ID3D11ShaderResourceView* vld_srvs[] = {cache_.packet_srv.Get(), cache_.coefficient_job_srv.Get()};
         ID3D11UnorderedAccessView* vld_uavs[] = {cache_.coefficient_uav.Get(), cache_.error_uav.Get()};
         ID3D11Buffer* vld_constants[] = {cache_.vld_parameters.Get()};
@@ -303,9 +332,11 @@ public:
         context_->CSSetUnorderedAccessViews(0, 2, null_vld_uavs, nullptr);
         context_->CSSetShaderResources(0, 2, null_vld_srvs);
         context_->CopyResource(cache_.error_staging.Get(), cache_.errors.Get());
+        mark(&CpuDecodeTiming::vld_submit_ms);
         D3D11_MAPPED_SUBRESOURCE mapped_errors{};
         const auto map_result = prores::bounded_staging_map(
             [&] {
+                if (cpu_timing) ++cpu_timing->map_attempts;
                 return context_->Map(cache_.error_staging.Get(), 0, D3D11_MAP_READ,
                                      D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped_errors);
             },
@@ -326,6 +357,7 @@ public:
             if (timing_) context_->End(timing_->disjoint.Get());
             throw std::runtime_error("GPU entropy decoder rejected job " + std::to_string(failed_job));
         }
+        mark(&CpuDecodeTiming::vld_map_ms);
 
         ID3D11ShaderResourceView* idct_srvs[] = {
             cache_.coefficient_srv.Get(), cache_.idct_job_srv.Get(), cache_.quant_srv.Get()};
@@ -355,6 +387,7 @@ public:
             GST_MEMORY_FLAG_UNSET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
             GST_MINI_OBJECT_FLAG_SET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
         }
+        mark(&CpuDecodeTiming::idct_submit_ms);
         if (timing_) return collect_timing();
         return std::nullopt;
     }
@@ -494,6 +527,8 @@ private:
     ComPtr<ID3D11ComputeShader> idct_;
     std::unique_ptr<GpuTimingQueries> timing_;
     Cache cache_;
+    std::vector<prores::CoefficientJob> coefficient_jobs_;
+    std::vector<prores::IdctBlockJob> idct_jobs_;
 };
 
 }  // namespace
@@ -511,6 +546,8 @@ typedef struct _GstProresD3D11Dec {
     gint color_primaries;
     gint color_trc;
     gint color_matrix;
+    gboolean cpu_timing;
+    guint64 cpu_timing_sequence;
 } GstProresD3D11Dec;
 
 typedef struct _GstProresD3D11DecClass { GstVideoDecoderClass parent_class; } GstProresD3D11DecClass;
@@ -539,6 +576,8 @@ static gboolean start(GstVideoDecoder* decoder) {
     auto* self = SELF(decoder);
     self->failed = FALSE;
     self->negotiated = FALSE;
+    self->cpu_timing = g_strcmp0(g_getenv("PRORES_DX11_CPU_TIMING"), "1") == 0;
+    self->cpu_timing_sequence = 0;
     g_atomic_int_set(&self->flushing, 0);
     if (!gst_d3d11_ensure_element_data(GST_ELEMENT(self), self->adapter, &self->device)) {
         GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("Cannot create D3D11 device"),
@@ -673,6 +712,18 @@ static gboolean decide_allocation(GstVideoDecoder* decoder, GstQuery* query) {
 
 static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* frame) {
     auto* self = SELF(decoder);
+    const auto cpu_timing = self->cpu_timing;
+    const auto sequence = cpu_timing ? self->cpu_timing_sequence++ : 0;
+    auto phase_start = std::chrono::steady_clock::time_point{};
+    if (cpu_timing) phase_start = std::chrono::steady_clock::now();
+    const auto phase_ms = [&] {
+        if (!cpu_timing) return 0.0;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration<double, std::milli>(
+            now - phase_start).count();
+        phase_start = now;
+        return elapsed;
+    };
     if (self->failed || !self->backend || !self->input) {
         gst_video_decoder_drop_frame(decoder, frame);
         return GST_FLOW_ERROR;
@@ -698,20 +749,25 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
         gst_video_decoder_drop_frame(decoder, frame);
         return GST_FLOW_ERROR;
     }
+    const auto parse_ms = phase_ms();
     if (!negotiate_output(self, parsed)) {
         gst_buffer_unmap(frame->input_buffer, &input);
         gst_video_decoder_drop_frame(decoder, frame);
         return GST_FLOW_NOT_NEGOTIATED;
     }
+    const auto negotiate_ms = phase_ms();
     auto flow = gst_video_decoder_allocate_output_frame(decoder, frame);
     if (flow != GST_FLOW_OK) {
         gst_buffer_unmap(frame->input_buffer, &input);
         gst_video_decoder_drop_frame(decoder, frame);
         return flow;
     }
+    const auto allocate_ms = phase_ms();
+    CpuDecodeTiming decode_timing{};
     try {
         const auto timing = self->backend->decode(input.data, input.size, parsed,
-                                                  frame->output_buffer);
+                                                  frame->output_buffer,
+                                                  cpu_timing ? &decode_timing : nullptr);
         if (timing) {
             const auto pts = GST_BUFFER_PTS(frame->input_buffer);
             if (timing->disjoint)
@@ -737,8 +793,28 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
         return GST_FLOW_ERROR;
     }
     gst_buffer_unmap(frame->input_buffer, &input);
+    const auto backend_ms = phase_ms();
+    const auto pts = GST_BUFFER_PTS(frame->input_buffer);
     GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT(frame);
-    return gst_video_decoder_finish_frame(decoder, frame);
+    flow = gst_video_decoder_finish_frame(decoder, frame);
+    const auto finish_ms = phase_ms();
+    if (cpu_timing)
+        GST_INFO_OBJECT(self, "CPU_STAGE seq=%" G_GUINT64_FORMAT
+                        " pts_ns=%" G_GUINT64_FORMAT
+                        " parse_ms=%.6f negotiate_ms=%.6f allocate_ms=%.6f"
+                        " coefficient_jobs_ms=%.6f idct_jobs_ms=%.6f cache_ms=%.6f"
+                        " output_uav_ms=%.6f device_lock_ms=%.6f"
+                        " upload_ms=%.6f vld_submit_ms=%.6f vld_map_ms=%.6f"
+                        " map_attempts=%" G_GUINT64_FORMAT " idct_submit_ms=%.6f"
+                        " backend_ms=%.6f finish_ms=%.6f", sequence, pts,
+                        parse_ms, negotiate_ms, allocate_ms,
+                        decode_timing.coefficient_jobs_ms, decode_timing.idct_jobs_ms,
+                        decode_timing.cache_ms, decode_timing.output_uav_ms,
+                        decode_timing.device_lock_ms, decode_timing.upload_ms,
+                        decode_timing.vld_submit_ms, decode_timing.vld_map_ms,
+                        decode_timing.map_attempts, decode_timing.idct_submit_ms,
+                        backend_ms, finish_ms);
+    return flow;
 }
 
 static gboolean flush(GstVideoDecoder*) { return TRUE; }
