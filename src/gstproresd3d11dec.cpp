@@ -21,13 +21,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -234,17 +237,12 @@ public:
             timing_ = std::make_unique<GpuTimingQueries>(device_);
     }
 
+    ~Dx11Backend() { stop_error_worker(); }
+
     std::optional<GpuStageTiming> decode(const std::uint8_t* packet, std::size_t packet_size,
                                          const prores::Frame& parsed, GstBuffer* output,
                                          GstClockTime pts,
                                          CpuDecodeTiming* cpu_timing = nullptr) {
-        if (pending_errors_.size() >= kErrorRingSize) {
-            const auto retire_start = std::chrono::steady_clock::now();
-            retire_one(cpu_timing);
-            if (cpu_timing)
-                cpu_timing->retire_wait_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - retire_start).count();
-        }
         auto phase_start = std::chrono::steady_clock::time_point{};
         if (cpu_timing) phase_start = std::chrono::steady_clock::now();
         const auto mark = [&](double CpuDecodeTiming::*field) {
@@ -309,6 +307,12 @@ public:
             output_uavs[component] = stored->view;
         }
         mark(&CpuDecodeTiming::output_uav_ms);
+
+        const auto slot_wait_start = std::chrono::steady_clock::now();
+        wait_for_error_slot();
+        if (cpu_timing)
+            cpu_timing->retire_wait_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - slot_wait_start).count();
 
         std::optional<DeviceLock> lock(std::in_place, gst_device_);
         mark(&CpuDecodeTiming::device_lock_ms);
@@ -394,27 +398,45 @@ public:
             GST_MEMORY_FLAG_UNSET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
             GST_MINI_OBJECT_FLAG_SET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
         }
-        pending_errors_.push_back({staging, static_cast<UINT>(coefficient_jobs.size()),
-                                   frame_sequence_++, pts});
-        next_staging_index_ = (next_staging_index_ + 1) % kErrorRingSize;
         mark(&CpuDecodeTiming::idct_submit_ms);
         lock.reset();
+        {
+            std::lock_guard<std::mutex> queue_lock(error_mutex_);
+            if (!error_failure_.empty()) throw std::runtime_error(error_failure_);
+            pending_errors_.push_back({staging, static_cast<UINT>(coefficient_jobs.size()),
+                                       frame_sequence_++, pts});
+            next_staging_index_ = (next_staging_index_ + 1) % kErrorRingSize;
+        }
+        error_cv_.notify_all();
         if (timing_) return collect_timing();
         return std::nullopt;
     }
 
     void drain_errors() {
-        while (!pending_errors_.empty()) retire_one(nullptr);
+        std::unique_lock<std::mutex> queue_lock(error_mutex_);
+        if (!error_cv_.wait_for(queue_lock, std::chrono::seconds(10), [&] {
+                return pending_errors_.empty() || !error_failure_.empty();
+            })) {
+            queue_lock.unlock();
+            check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed during VLD drain");
+            throw std::runtime_error("delayed VLD error drain exceeded 10 seconds");
+        }
+        if (!error_failure_.empty()) throw std::runtime_error(error_failure_);
     }
 
     void discard_errors() {
+        stop_error_worker();
         // flushing seekでは旧segmentの検査結果を新segmentへ持ち込まない。
         // GPU命令は同じimmediate context上で順序付きなので再利用先のcopyより先に完了する。
-        if (!pending_errors_.empty()) {
+        {
             DeviceLock lock(gst_device_);
             context_->Flush();
         }
-        pending_errors_.clear();
+        {
+            std::lock_guard<std::mutex> queue_lock(error_mutex_);
+            pending_errors_.clear();
+            error_failure_.clear();
+        }
         next_staging_index_ = 0;
     }
 
@@ -428,23 +450,22 @@ private:
         GstClockTime pts;
     };
 
-    void retire_one(CpuDecodeTiming* cpu_timing) {
-        if (pending_errors_.empty()) return;
-        const auto pending = pending_errors_.front();
+    bool inspect_error(const PendingError& pending, std::string& failure) {
+        if (stop_error_worker_.load(std::memory_order_acquire)) return false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         {
             DeviceLock lock(gst_device_);
             context_->Flush();
         }
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         std::size_t failed_job = pending.job_count;
         for (;;) {
+            if (stop_error_worker_.load(std::memory_order_acquire)) return false;
             HRESULT result;
             {
                 DeviceLock lock(gst_device_);
                 D3D11_MAPPED_SUBRESOURCE mapped{};
                 result = context_->Map(pending.staging.Get(), 0, D3D11_MAP_READ,
                                        D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-                if (cpu_timing) ++cpu_timing->retire_map_attempts;
                 if (result == S_OK) {
                     const auto* errors = static_cast<const std::uint32_t*>(mapped.pData);
                     for (std::size_t i = 0; i < pending.job_count; ++i) {
@@ -459,14 +480,75 @@ private:
             check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed while retiring VLD errors");
             if (std::chrono::steady_clock::now() >= deadline)
                 throw std::runtime_error("delayed VLD error readback exceeded 10 seconds");
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
-        pending_errors_.pop_front();
         if (failed_job != pending.job_count)
-            throw std::runtime_error("GPU entropy decoder rejected job " +
+            failure = "GPU entropy decoder rejected job " +
                 std::to_string(failed_job) + " frame=" +
                 std::to_string(pending.frame_sequence) + " pts_ns=" +
-                std::to_string(pending.pts));
+                std::to_string(pending.pts);
+        return true;
+    }
+
+    void error_worker_loop() noexcept {
+        for (;;) {
+            PendingError pending;
+            {
+                std::unique_lock<std::mutex> queue_lock(error_mutex_);
+                error_cv_.wait(queue_lock, [&] {
+                    return stop_error_worker_.load(std::memory_order_acquire) ||
+                           !pending_errors_.empty();
+                });
+                if (stop_error_worker_.load(std::memory_order_acquire)) return;
+                pending = pending_errors_.front();
+            }
+            std::string failure;
+            bool completed = false;
+            try {
+                completed = inspect_error(pending, failure);
+            } catch (const std::exception& error) {
+                failure = error.what();
+                completed = true;
+            } catch (...) {
+                failure = "unknown failure while retiring VLD errors";
+                completed = true;
+            }
+            const bool failed = !failure.empty();
+            {
+                std::lock_guard<std::mutex> queue_lock(error_mutex_);
+                if (stop_error_worker_.load(std::memory_order_acquire)) return;
+                if (!completed) return;
+                pending_errors_.pop_front();
+                if (!failure.empty()) error_failure_ = std::move(failure);
+            }
+            error_cv_.notify_all();
+            if (failed) return;
+        }
+    }
+
+    void start_error_worker() {
+        if (error_worker_.joinable()) return;
+        stop_error_worker_.store(false, std::memory_order_release);
+        error_worker_ = std::thread([this] { error_worker_loop(); });
+    }
+
+    void stop_error_worker() {
+        stop_error_worker_.store(true, std::memory_order_release);
+        error_cv_.notify_all();
+        if (error_worker_.joinable()) error_worker_.join();
+    }
+
+    void wait_for_error_slot() {
+        start_error_worker();
+        std::unique_lock<std::mutex> queue_lock(error_mutex_);
+        if (!error_cv_.wait_for(queue_lock, std::chrono::seconds(10), [&] {
+                return pending_errors_.size() < kErrorRingSize || !error_failure_.empty();
+            })) {
+            queue_lock.unlock();
+            check_hr(device_->GetDeviceRemovedReason(), "D3D11 device removed waiting for VLD ring");
+            throw std::runtime_error("delayed VLD error ring wait exceeded 10 seconds");
+        }
+        if (!error_failure_.empty()) throw std::runtime_error(error_failure_);
     }
 
     template <typename T>
@@ -691,7 +773,12 @@ private:
     ComPtr<ID3D11ComputeShader> idct_;
     std::unique_ptr<GpuTimingQueries> timing_;
     Cache cache_;
+    std::mutex error_mutex_;
+    std::condition_variable error_cv_;
+    std::atomic<bool> stop_error_worker_{false};
+    std::thread error_worker_;
     std::deque<PendingError> pending_errors_;
+    std::string error_failure_;
     std::size_t next_staging_index_ = 0;
     std::uint64_t frame_sequence_ = 0;
     std::vector<prores::CoefficientJob> coefficient_jobs_;

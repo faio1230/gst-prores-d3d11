@@ -17,3 +17,9 @@ RTX 3070、固定GStreamer 1.28.2でビルド、係数完全一致、合成1080p
 同じ実写素材のCPU段階ログ付き交互4組では、旧版Map待ち対新版回収待ちのp99中央値が4.188→0.536ms、backend/decode全体のp99中央値が8.066→4.391msへ改善した。しかし**待機最大値は未達**で、試行別最大値の中央値が6.397→8.172ms、全試行最大値が12.222→44.401msへ悪化した。新版の44.401ms行は`retire_map_attempts=1`で、複数回のMapポーリングによるものではない。直前フレームの`finish_ms`は113.292msで、lock取得・Flush・1回のMapの内訳まではこのログから断定できない。診断の新版1試行にはsink dropが4枚あったが、decoder出力・RGB出力・sink push/returnは各4800枚、decoder QoS欠落は0枚だった。通常比較4組のsink dropは0枚であり、診断ログのsink dropをdecoder欠落に混ぜない。
 
 採用ゲートは**不合格**。次の実装変更は、3面stagingの回収をdecoder呼び出しから分離した専用完了ワーカーに移すこと。ワーカーがdevice lockを短時間ずつ取得して結果を回収・順序付きで`STREAM/DECODE`を通知し、decoderは3面が全て未回収の場合だけ空きを待つ設計を試す。今回の最大44.401msがlock競合かOSスケジューリングかは未確定で、この変更で解消するとはまだ主張しない。OS/DWM未表示はdecoder採用ゲート外の参考値であり、この比較では測定しなかった。集計は`results/vld-async-gate-summary-2026-09-24.json`、行別記録は`results/display-vld-async-ab-2026-09-24/`、`results/vld-async-direct-ab-2026-09-24/`、`results/vld-async-wait-ab*-2026-09-24/`。
+
+## 専用完了ワーカー版（採用判定前）
+
+3面stagingとGPUのVLD→IDCT→error copy順は維持し、error copyの`Flush()`・`Map(DO_NOT_WAIT)`・job別検査を専用ワーカーへ移した。ワーカーは古いフレームから順に処理し、各D3D11呼び出しの間はdevice lockを離す。decoderはCPUのjob準備後、3面すべてが未回収の場合だけ空きを待つ。GPU拒否またはdevice異常は共有状態へ記録し、次のdecoder呼び出しまたはEOS/drainで例外として`STREAM/DECODE`または`RESOURCE/FAILED`へ変換する。したがって破損フレームを含む数枚が通知より先にdownstreamへ渡り得るし、入力停止時にEOS/drainも次フレームもなければ通知は保留される。flushing seekと停止ではワーカーを中断・joinして旧segmentの結果を破棄し、再開時に新しいワーカーを開始する。回収・空き待ち・drainの10秒期限とdevice removedの確認を残す。
+
+RTX 3070でビルド、係数完全一致、合成1080p/4Kの画素差最大1 code、EOS×3・flushing seek×4・RGB・破損14例、公開実素材779枚のD3D11Memory/EOS、ASan変異2,000件（AC境界9件拒否）を通過した。通常QoS・Present(0)の実写4K60×10周パイロットは4800/4800枚、decoder QoS欠落・sink dropとも0枚。この単発値を独立ステージ交互4組の代わりにはしない。`results/verification-vld-worker-2026-09-24/`と`results/display-vld-worker-pilot-2026-09-24/`に記録した。
