@@ -101,25 +101,55 @@ static std::uint64_t sink_stat(GstElement* sink, const char* name) {
     return value;
 }
 
+struct InjectedStall {
+    Clock::time_point origin{};
+    guint delay_ms = 0;
+    bool fired = false;
+    double start_ms = 0;
+    double end_ms = 0;
+};
+
+static GstPadProbeReturn on_sink_stall(GstPad*, GstPadProbeInfo* info, gpointer data) {
+    auto* stall = static_cast<InjectedStall*>(data);
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (buffer && !stall->fired && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer)) &&
+        GST_BUFFER_PTS(buffer) >= GST_SECOND) {
+        stall->fired = true;
+        stall->start_ms = ms(stall->origin, Clock::now());
+        Sleep(stall->delay_ms);
+        stall->end_ms = ms(stall->origin, Clock::now());
+    }
+    return GST_PAD_PROBE_OK;
+}
+
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
-    if (argc < 4 || argc > 8)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb]]");
+    if (argc < 4 || argc > 11)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
+    bool predecode_queue = false;
+    bool decoder_no_qos = false;
+    guint sink_stall_ms = 0;
     for (int i = 5; i < argc; ++i) {
         const std::string option(argv[i]);
         if (option == "preroll") preroll = true;
         else if (option == "lossless") lossless = true;
         else if (option == "native-rgb") native_rgb = true;
+        else if (option == "queue-before-decoder") predecode_queue = true;
+        else if (option == "decoder-no-qos") decoder_no_qos = true;
+        else if (option.rfind("sink-stall-ms=", 0) == 0)
+            sink_stall_ms = static_cast<guint>(std::stoi(option.substr(14)));
         else throw std::runtime_error("unknown display option: " + option);
     }
+    if (sink_stall_ms > 1000) throw std::runtime_error("sink stall must be at most 1000ms");
     const int loops = std::stoi(argv[2]);
     if (loops < 1) throw std::runtime_error("loops must be positive");
     GError* error = nullptr;
-    const std::string description = std::string(
-        "filesrc name=source ! qtdemux ! proresd3d11dec name=decoder ! ") +
+    const std::string description = std::string("filesrc name=source ! qtdemux ! ") +
+        (predecode_queue ? "queue name=predecode max-size-buffers=32 max-size-bytes=0 max-size-time=0 ! " : "") +
+        "proresd3d11dec name=decoder ! " +
         (native_rgb ? "proresd3d11rgb" : "d3d11convert") +
         " name=converter ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! "
         "d3d11videosink name=sink sync=true emit-present=true qos=true";
@@ -130,23 +160,38 @@ int main(int argc, char** argv) try {
         throw std::runtime_error(text);
     }
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline), "source");
+    auto* predecode = predecode_queue ? gst_bin_get_by_name(GST_BIN(pipeline), "predecode") : nullptr;
     auto* decoder = gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
     auto* converter = gst_bin_get_by_name(GST_BIN(pipeline), "converter");
     auto* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     auto* bus = gst_element_get_bus(pipeline);
-    if (!source || !decoder || !converter || !sink || !bus)
+    if (!source || (predecode_queue && !predecode) || !decoder || !converter || !sink || !bus)
         throw std::runtime_error("pipeline endpoint missing");
     g_object_set(source, "location", argv[1], nullptr);
+    if (decoder_no_qos) g_object_set(decoder, "qos", FALSE, nullptr);
     if (lossless) g_object_set(sink, "qos", FALSE, "max-lateness", gint64(-1), nullptr);
     gst_object_unref(source);
     PresentLog presents;
     presents.origin = Clock::now();
+    InjectedStall stall;
+    stall.origin = presents.origin;
+    stall.delay_ms = sink_stall_ms;
+    if (sink_stall_ms) {
+        auto* pad = gst_element_get_static_pad(sink, "sink");
+        if (!pad) throw std::runtime_error("sink pad missing for stall probe");
+        const auto probe = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
+                                            on_sink_stall, &stall, nullptr);
+        gst_object_unref(pad);
+        if (!probe) throw std::runtime_error("cannot add sink stall probe");
+    }
     StageLog stages;
     stages.origin = presents.origin;
+    StageTap demuxed{&stages, "demuxed"};
     StageTap compressed{&stages, "compressed"};
     StageTap decoded{&stages, "decoded"};
     StageTap rgb{&stages, "rgb"};
     if (argc >= 5) {
+        if (predecode) add_stage_probe(predecode, "sink", &demuxed);
         add_stage_probe(decoder, "sink", &compressed);
         add_stage_probe(decoder, "src", &decoded);
         add_stage_probe(converter, "src", &rgb);
@@ -241,6 +286,11 @@ int main(int argc, char** argv) try {
     std::cout << std::fixed << std::setprecision(3)
               << "{\"loops\":" << loops << ",\"preroll_ms\":" << preroll_ms
               << ",\"rgb_converter\":\"" << (native_rgb ? "proresd3d11rgb" : "d3d11convert") << "\""
+              << ",\"predecode_queue\":" << (predecode_queue ? "true" : "false")
+              << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
+              << ",\"injected_sink_stall_ms\":" << sink_stall_ms
+              << ",\"injected_stall_start_ms\":" << stall.start_ms
+              << ",\"injected_stall_end_ms\":" << stall.end_ms
               << ",\"lossless_sink_policy\":" << (lossless ? "true" : "false")
               << ",\"present_count\":" << presents.times.size()
               << ",\"rendered\":" << total_rendered << ",\"dropped\":" << total_dropped
@@ -263,6 +313,7 @@ int main(int argc, char** argv) try {
     }
     std::cout << "]}\n";
     gst_object_unref(bus);
+    if (predecode) gst_object_unref(predecode);
     gst_object_unref(decoder);
     gst_object_unref(converter);
     gst_object_unref(sink);

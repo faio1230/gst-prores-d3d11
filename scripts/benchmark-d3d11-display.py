@@ -40,7 +40,8 @@ def gpu_stats(path):
 def stage_stats(path, expected_frames, loops, rendered):
     events = {}
     counts = Counter()
-    wall_by_stage = {name: {} for name in ('compressed', 'decoded', 'rgb')}
+    stage_names = ('demuxed', 'compressed', 'decoded', 'rgb')
+    wall_by_stage = {name: {} for name in stage_names}
     widest_gaps = {}
     with path.open(newline='', encoding='utf-8-sig') as stream:
         for row in csv.DictReader(stream):
@@ -58,11 +59,15 @@ def stage_stats(path, expected_frames, loops, rendered):
             counts[(name, loop, pts)] += 1
             wall_by_stage[name][(loop, pts)] = wall
     by_stage = {name: {(loop, pts) for stage, loop, pts in counts if stage == name}
-                for name in ('compressed', 'decoded', 'rgb')}
+                for name in stage_names}
+    missing_before_decoder = sorted(by_stage['demuxed'] - by_stage['compressed'])
     missing_after_decoder = sorted(by_stage['compressed'] - by_stage['decoded'])
     missing_after_converter = sorted(by_stage['decoded'] - by_stage['rgb'])
     latencies = {}
-    for before, after in (('compressed', 'decoded'), ('decoded', 'rgb')):
+    pairs = [('compressed', 'decoded'), ('decoded', 'rgb')]
+    if by_stage['demuxed']:
+        pairs.insert(0, ('demuxed', 'compressed'))
+    for before, after in pairs:
         durations = sorted(wall_by_stage[after][key] - wall_by_stage[before][key]
                            for key in by_stage[before] & by_stage[after])
         latencies[f'{before}_to_{after}_ms'] = {
@@ -71,11 +76,14 @@ def stage_stats(path, expected_frames, loops, rendered):
             'max': durations[-1] if durations else None}
     expected = expected_frames * loops
     return {'expected_frames': expected,
+            'demuxed': len(by_stage['demuxed']) if by_stage['demuxed'] else None,
             'compressed': len(by_stage['compressed']),
             'decoded': len(by_stage['decoded']),
             'rgb': len(by_stage['rgb']),
             'rendered': rendered,
             'end_to_end_missing': expected - rendered,
+            'missing_before_decoder': missing_before_decoder[:32],
+            'missing_before_decoder_count': len(missing_before_decoder),
             'missing_after_decoder': missing_after_decoder[:32],
             'missing_after_decoder_count': len(missing_after_decoder),
             'missing_after_converter': missing_after_converter[:32],
@@ -94,10 +102,18 @@ def main():
                         help='診断用: sink QoSを止めmax-lateness=-1にする')
     parser.add_argument('--native-rgb', action='store_true',
                         help='標準d3d11convertの代わりに専用DX11 RGB要素を表示する')
+    parser.add_argument('--queue-before-decoder', action='store_true',
+                        help='qtdemuxとdecoderを32 bufferのqueueで分離し前後のPTS到達時刻を記録する')
+    parser.add_argument('--decoder-no-qos', action='store_true',
+                        help='診断用: decoderだけQoSによる遅延フレーム破棄を無効化する')
+    parser.add_argument('--sink-stall-ms', type=int, default=0,
+                        help='診断用: PTS 1秒のsink入力を一度だけN ms止める（最大1000）')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
     args = parser.parse_args()
     if args.loops < 1 or args.repeats < 1:
         parser.error('loops/repeats must be positive')
+    if not 0 <= args.sink_stall_ms <= 1000:
+        parser.error('--sink-stall-ms は0～1000を指定する')
     args.out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env['PATH'] = str(GST) + os.pathsep + env.get('PATH', '')
@@ -130,6 +146,12 @@ def main():
                         command.append('lossless')
                     if args.native_rgb:
                         command.append('native-rgb')
+                    if args.queue_before_decoder:
+                        command.append('queue-before-decoder')
+                    if args.decoder_no_qos:
+                        command.append('decoder-no-qos')
+                    if args.sink_stall_ms:
+                        command.append(f'sink-stall-ms={args.sink_stall_ms}')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:
                         process = subprocess.run(command, env=env, text=True,
                                                  stdout=subprocess.PIPE, stderr=errors,

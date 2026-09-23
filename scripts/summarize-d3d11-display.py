@@ -34,6 +34,10 @@ def main():
             presents = list(csv.DictReader(stream))
         max_present_gap = max(float(row['interval_ms']) for row in presents)
         trials.append({'input': record['input'], 'repeat': record['repeat'],
+                       'rgb_converter': record.get('rgb_converter', 'd3d11convert'),
+                       'predecode_queue': record.get('predecode_queue', False),
+                       'decoder_no_qos': record.get('decoder_no_qos', False),
+                       'injected_sink_stall_ms': record.get('injected_sink_stall_ms', 0),
                        'expected': stages['expected_frames'], 'rendered': record['rendered'],
                        'sink_dropped': record['dropped'], 'qos': record['qos_messages'],
                        'end_to_end_missing': stages['end_to_end_missing'],
@@ -50,11 +54,22 @@ def main():
                        'stages': stages})
     if len({trial['input'] for trial in trials}) != 1:
         parser.error('複数素材は別々に集計する')
+    for field in ('rgb_converter', 'predecode_queue', 'decoder_no_qos',
+                  'injected_sink_stall_ms',
+                  'lossless_sink_policy'):
+        if len({trial[field] for trial in trials}) != 1:
+            parser.error(f'異なる{field}条件は別々に集計する')
     trials.sort(key=lambda trial: trial['repeat'])
     def median(name):
         values = [trial[name] for trial in trials if trial[name] is not None]
         return statistics.median(values) if values else None
-    summary = {'input': trials[0]['input'], 'repeats': len(trials),
+    summary = {'input': trials[0]['input'],
+               'rgb_converter': trials[0]['rgb_converter'],
+               'predecode_queue': trials[0]['predecode_queue'],
+               'decoder_no_qos': trials[0]['decoder_no_qos'],
+               'injected_sink_stall_ms': trials[0]['injected_sink_stall_ms'],
+               'lossless_sink_policy': trials[0]['lossless_sink_policy'],
+               'repeats': len(trials),
                'total_expected': sum(trial['expected'] for trial in trials),
                'total_rendered': sum(trial['rendered'] for trial in trials),
                'total_sink_dropped': sum(trial['sink_dropped'] for trial in trials),
