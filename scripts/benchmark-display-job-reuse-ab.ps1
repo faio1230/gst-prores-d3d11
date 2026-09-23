@@ -3,6 +3,7 @@
 param(
     [ValidateRange(1, 5)][int]$Pairs = 2,
     [ValidateRange(1, 20)][int]$Loops = 10,
+    [switch]$CaptureOS,
     [string]$OutDir = 'results/display-job-reuse-ab-2026-09-24',
     [string]$Source = 'media/reference-dji-nature-4k60-rec709-hq.mov',
     [string]$OldStage = 'build/vs18/stage-ac-boundary-fdff052',
@@ -13,8 +14,12 @@ $root = Split-Path $PSScriptRoot -Parent
 $out = Join-Path $root $OutDir
 $sourcePath = Join-Path $root $Source
 $python = (Get-Command python -ErrorAction Stop).Source
+$presentMon = Join-Path $root 'build/vs18/diagnostic-tools/PresentMon-2.6.0-x64.exe'
 if (Test-Path -LiteralPath $out) { throw "既存の結果を上書きしません: $out" }
 if (!(Test-Path -LiteralPath $sourcePath)) { throw "素材がありません: $sourcePath" }
+if ($CaptureOS -and !(Test-Path -LiteralPath $presentMon)) {
+    throw "PresentMonがありません: $presentMon"
+}
 $stages = @{
     old = Join-Path $root $OldStage
     new = Join-Path $root $NewStage
@@ -59,12 +64,31 @@ try {
         foreach ($label in $order) {
             $tag = "p$pair-$label"
             $trial = Join-Path $out $tag
-            & $python scripts/benchmark-d3d11-display.py $sourcePath `
-                --loops $Loops --repeats 1 --preroll --native-rgb `
-                --trace-sink-return --trace-window-state --settle-ms 150 `
-                --plugin-dir $stages[$label] --out $trial `
-                *> (Join-Path $out "$tag-benchmark.log")
-            if ($LASTEXITCODE) { throw "表示試行に失敗: $tag" }
+            $monitor = $null
+            $session = 'IC' + (Get-Date -Format 'MMddHHmmss') + $pair + $label.Substring(0, 1)
+            $capture = Join-Path $out "$tag-presentmon.csv"
+            $trialCompleted = $false
+            try {
+                if ($CaptureOS) {
+                    $duration = 10 + 8 * $Loops
+                    $monitor = Start-Process -FilePath $presentMon -ArgumentList @(
+                        '--process_name', 'd3d11_display_bench.exe', '--output_file', $capture,
+                        '--qpc_time_ms', '--write_display_metadata', '--set_circular_buffer_size', '32768',
+                        '--timed', [string]$duration, '--terminate_after_timed', '--no_console_stats',
+                        '--session_name', $session
+                    ) -WindowStyle Hidden -PassThru `
+                        -RedirectStandardOutput (Join-Path $out "$tag-presentmon.log") `
+                        -RedirectStandardError (Join-Path $out "$tag-presentmon-error.log")
+                    Start-Sleep -Milliseconds 1200
+                }
+                & $python scripts/benchmark-d3d11-display.py $sourcePath `
+                    --loops $Loops --repeats 1 --preroll --native-rgb `
+                    --trace-sink-return --trace-window-state --settle-ms 150 `
+                    --plugin-dir $stages[$label] --out $trial `
+                    *> (Join-Path $out "$tag-benchmark.log")
+                if ($LASTEXITCODE) { throw "表示試行に失敗: $tag" }
+                if ($CaptureOS -and (!$monitor.WaitForExit(30000) -or $monitor.ExitCode -ne 0 -or
+                    !(Test-Path -LiteralPath $capture))) { throw "PresentMon取得失敗: $tag" }
             $trialJson = Get-ChildItem -LiteralPath $trial -Filter '*.json' |
                 Select-Object -First 1 -ExpandProperty FullName
             if (!$trialJson) { throw "試行JSONがありません: $tag" }
@@ -79,6 +103,19 @@ try {
                 $metrics.stages.missing_after_converter_count -ne 0) {
                 throw "試行条件またはPTS枚数が不一致: $tag"
             }
+            $present = $null
+            if ($CaptureOS) {
+                $presentSummary = Join-Path $out "$tag-presentmon-summary.json"
+                & $python scripts/summarize-presentmon-display.py $capture $trial `
+                    --out $presentSummary *> (Join-Path $out "$tag-presentmon-summary.log")
+                if ($LASTEXITCODE) { throw "PresentMon PTS照合失敗: $tag" }
+                $present = Get-Content -LiteralPath $presentSummary -Raw | ConvertFrom-Json
+                if ($present.coverage_sufficient_trials -ne 1 -or
+                    $present.pts_aligned_trials -ne 1 -or
+                    $present.interior_uncaptured_aligned -ne 0) {
+                    throw "PresentMon内側捕捉が不完全: $tag"
+                }
+            }
             $records += [pscustomobject]@{
                 tag = $tag
                 version = $label
@@ -89,10 +126,20 @@ try {
                 qos_messages = $metrics.qos_messages
                 p99_present_interval_ms = $metrics.interval_p99_ms
                 max_sink_push_ms = $metrics.stages.stage_latency.sink_push_to_sink_return_ms.max
+                os_not_displayed_interior = if ($present) { $present.interior_captured_but_not_displayed_aligned } else { $null }
+                os_interior_frames = if ($present) { $present.interior_source_frames_aligned } else { $null }
+                max_os_display_gap_ms = if ($present) { $present.max_display_gap_ms } else { $null }
             }
             $records | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath `
                 (Join-Path $out 'trial-summary.json') -Encoding utf8
             Write-Host "$tag`: $($metrics.rendered)/$expected、decoder QoS欠落=$($metrics.stages.end_to_end_missing)"
+                $trialCompleted = $true
+            } finally {
+                if ($CaptureOS -and !$trialCompleted -and $monitor) {
+                    if (!$monitor.HasExited) { Stop-Process -Id $monitor.Id -ErrorAction SilentlyContinue }
+                    & logman stop $session -ets *> $null
+                }
+            }
         }
     }
 } finally {
