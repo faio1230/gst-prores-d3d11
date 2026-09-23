@@ -23,3 +23,7 @@ RTX 3070、固定GStreamer 1.28.2でビルド、係数完全一致、合成1080p
 3面stagingとGPUのVLD→IDCT→error copy順は維持し、error copyの`Flush()`・`Map(DO_NOT_WAIT)`・job別検査を専用ワーカーへ移した。ワーカーは古いフレームから順に処理し、各D3D11呼び出しの間はdevice lockを離す。decoderはCPUのjob準備後、3面すべてが未回収の場合だけ空きを待つ。GPU拒否またはdevice異常は共有状態へ記録し、次のdecoder呼び出しまたはEOS/drainで例外として`STREAM/DECODE`または`RESOURCE/FAILED`へ変換する。したがって破損フレームを含む数枚が通知より先にdownstreamへ渡り得るし、入力停止時にEOS/drainも次フレームもなければ通知は保留される。flushing seekと停止ではワーカーを中断・joinして旧segmentの結果を破棄し、再開時に新しいワーカーを開始する。回収・空き待ち・drainの10秒期限とdevice removedの確認を残す。
 
 RTX 3070でビルド、係数完全一致、合成1080p/4Kの画素差最大1 code、EOS×3・flushing seek×4・RGB・破損14例、公開実素材779枚のD3D11Memory/EOS、ASan変異2,000件（AC境界9件拒否）を通過した。通常QoS・Present(0)の実写4K60×10周パイロットは4800/4800枚、decoder QoS欠落・sink dropとも0枚。この単発値を独立ステージ交互4組の代わりにはしない。`results/verification-vld-worker-2026-09-24/`と`results/display-vld-worker-pilot-2026-09-24/`に記録した。
+
+旧3面リング版`b981a32`とワーカー版`0c41803`のcleanな独立ステージによる通常QoS・Present(0)・実写4K60×10周の交互4組は、decoder QoS欠落が旧11/0/1/0枚、新0/0/0/0枚（各4800枚）で、中央値は双方0枚。sink dropは全試行0枚。旧基準版`a3b4315`と新版の合成direct交互4組では、1080p中央値が392.646→314.561fps（**−19.89%**）で、許容下限−3%を超えて悪化した。4Kは213.217→254.027fps（+19.14%）。1080pの新版4試行は311.56～319.12fpsで一貫して低く、単発の外れ値だけでは説明できない。ステージDLLは異なり、shader 3種は同一SHA256。採用ゲートはこのdirect条件で**不合格**とし、旧基準版との表示交互4組および回収待ちp99・最大値の追加計測は実施しない。
+
+次に試す実装変更は、ワーカーが1枚目の投入直後からGPU完了をポーリングする動作をやめ、未回収が2枚に達した時点（またはEOS/drain）で最古の検査を開始すること。GPU copyに進む時間を与え、短い素材の連続direct復号でworkerの頻繁なdevice lock取得を減らす狙いである。3面上限、FIFO、破損拒否、EOS回収は維持する。これで性能と最大待機の両条件を満たすかは未検証。比較記録は`results/display-vld-worker-ab-2026-09-24/`と`results/vld-worker-direct-a3-ab-2026-09-24/`。

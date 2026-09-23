@@ -4,7 +4,10 @@ param(
     [ValidateRange(1, 5)][int]$Pairs = 4,
     [string]$OutDir = 'results/vld-async-direct-ab-2026-09-24',
     [string]$OldStage = 'build/vs18/stage-vld-async-old-a3b4315',
-    [string]$NewStage = 'build/vs18/stage-vld-async-new-b981a32'
+    [string]$NewStage = 'build/vs18/stage-vld-async-new-b981a32',
+    [string]$OldHead = 'a3b43158534d56449877049e42cce355f40de326',
+    [string]$NewHead = 'b981a32dded81a3ac315a391a3459c8bbe281296',
+    [ValidatePattern('^[a-z0-9-]+$')][string]$BuildLabel = 'vld-async-direct'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -15,8 +18,7 @@ $python = (Get-Command python -ErrorAction Stop).Source
 $sources = @((Join-Path $root 'media/synthetic-1080p60-hq.mov'),
              (Join-Path $root 'media/synthetic-2160p60-hq.mov'))
 $stages = @{ old = Join-Path $root $OldStage; new = Join-Path $root $NewStage }
-$heads = @{ old = 'a3b43158534d56449877049e42cce355f40de326';
-            new = 'b981a32dded81a3ac315a391a3459c8bbe281296' }
+$heads = @{ old = $OldHead; new = $NewHead }
 $names = @('gstproresd3d11.dll', 'prores_vld.cso', 'prores_idct_unorm.cso', 'prores_rgb.cso')
 if (Test-Path -LiteralPath $out) { throw "既存結果を上書きしません: $out" }
 foreach ($file in @($bench) + $sources) {
@@ -32,7 +34,7 @@ foreach ($variant in @('old', 'new')) {
         $manifest.working_tree_dirty_at_staging -or !$manifest.source_rebuild.passed) {
         throw "独立ステージの由来を確認できません: $variant"
     }
-    $variantBuild = Join-Path $build "vld-async-direct-$variant"
+    $variantBuild = Join-Path $build "${BuildLabel}-$variant"
     if (Test-Path -LiteralPath $variantBuild) { throw "既存配置を上書きしません: $variantBuild" }
     $pluginDir = Join-Path $variantBuild 'plugins/Release'
     $exeDir = Join-Path $variantBuild 'Release'

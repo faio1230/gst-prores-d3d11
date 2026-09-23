@@ -6,7 +6,9 @@ param(
     [switch]$Resume,
     [string]$OutDir = 'results/vld-async-wait-ab-2026-09-24',
     [string]$OldStage = 'build/vs18/stage-vld-async-old-a3b4315',
-    [string]$NewStage = 'build/vs18/stage-vld-async-new-b981a32'
+    [string]$NewStage = 'build/vs18/stage-vld-async-new-b981a32',
+    [string]$OldHead = 'a3b43158534d56449877049e42cce355f40de326',
+    [string]$NewHead = 'b981a32dded81a3ac315a391a3459c8bbe281296'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -14,8 +16,7 @@ $out = Join-Path $root $OutDir
 $source = Join-Path $root 'media/reference-dji-nature-4k60-rec709-hq.mov'
 $python = (Get-Command python -ErrorAction Stop).Source
 $stages = @{ old = Join-Path $root $OldStage; new = Join-Path $root $NewStage }
-$heads = @{ old = 'a3b43158534d56449877049e42cce355f40de326';
-            new = 'b981a32dded81a3ac315a391a3459c8bbe281296' }
+$heads = @{ old = $OldHead; new = $NewHead }
 if ((Test-Path -LiteralPath $out) -and !$Resume) {
     throw "既存結果を上書きしません: $out"
 }
