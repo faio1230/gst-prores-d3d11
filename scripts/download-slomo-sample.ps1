@@ -1,4 +1,4 @@
-# 公開4K HQサンプルをRange分割で取得する。利用先アプリには触れない。
+# 公開4K HQサンプルをRange分割で取得する。
 [CmdletBinding()]
 param([string]$Url = 'https://cloud.slomo.tv/s/6CnFDpArBb5KzRB/download')
 $ErrorActionPreference = 'Stop'

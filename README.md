@@ -1,6 +1,6 @@
 # Windows向けGStreamer ProRes GPUデコーダー
 
-**最終目標は、純粋なDirect3D 11で通常のProResをGPUデコードし、復号画像をGPUメモリのままGStreamerへ出力する独立プラグインです。** DX11デコードとGPUメモリ出力の両方を必須の完成条件とします。利用先アプリのコードは変更せず、LTC・プレイリスト・Spout・管理UIは含めません。
+**最終目標は、外部アプリケーションから独立したGStreamer用ProRes GPUデコーダーです。** 純粋なDirect3D 11 Compute ShaderでProResを復号し、復号画像をCPUへ読み戻さず `GstD3D11Memory` のまま出力することを、両立必須の完成条件とします。専用の動画デコード回路を使う方式ではありません。このリポジトリの要件、採用判定、配布物はGStreamerプラグインとその検証に限定し、外部アプリ固有の同期・再生制御・UI・入出力機能を前提にしません。
 
 完成形は `video/x-prores → DX11 Compute Shaderによる復号 → video/x-raw(memory:D3D11Memory)`。復号画像をCPUへ読み戻さず、Vulkanに依存しない経路を目指します。現在の `proresvkdec` はFFmpeg Vulkanを使う比較・検証用の中間成果で、最終成果物ではありません。以後の主実装はDX11ネイティブ復号とD3D11Memory出力に置きます。
 

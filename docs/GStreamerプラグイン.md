@@ -2,7 +2,7 @@
 
 主実装は純粋DX11の `proresd3d11dec`。比較用にFFmpeg Vulkanの `proresvkdec` も保持する。限定対象で最終アーキテクチャは成立した。実素材1080p/4K、長時間、複数instance、表示／合成を検証済みだが、色の採用許容値、安定した実表示、他GPUを含む完成判定は[開発計画](プラグイン化計画.md)に従って継続する。
 
-2026-09-23更新。利用先アプリを外し、GStreamer標準のパイプラインで使える `GstVideoDecoder` 派生の独立DLLとして検査した。環境はRTX 3070 / NVIDIA 591.86 / Windows 11 / GStreamer 1.28.2 MSVC x64。CPU画質参照にだけリポジトリ内固定FFmpeg 8.1.3を使う。最新の実素材・表示結果は[実素材と表示検証](実素材と表示検証.md)。
+2026-09-24更新。GStreamer標準のパイプラインで使える `GstVideoDecoder` 派生の独立DLLとして検査した。環境はRTX 3070 / NVIDIA 591.86 / Windows 11 / GStreamer 1.28.2 MSVC x64。CPU画質参照にだけリポジトリ内固定FFmpeg 8.1.3を使う。最新の実素材・表示結果は[実素材と表示検証](実素材と表示検証.md)。
 
 ## 純粋DX11版：proresd3d11dec
 
@@ -82,7 +82,7 @@ GPU復号後にGPU→CPU転送とCPU上のバッファコピーがある。ゼ�
 
 入力はdemux済みの `video/x-prores`、1バッファに完全な1フレーム。variantは `proxy / lt / standard / hq`、progressive、4:2:2、アルファなし。幅は偶数、幅・高さは16〜8192の範囲で受け付けるが、上限の実機保証はない。実検査は320×180、1920×1080、3840×2160。capsだけでなくフレームヘッダーの形式・長さ・寸法も検査し、不一致をエラーにする。
 
-出力は `video/x-raw,format=I422_10LE`、system memory。10bitのY/U/Vを16bit little endian容器で保持する。色変換・8bit化・スケーリングは行わない。MOVの読み込み、表示、LTC、Spoutは別要素・別アプリの役割。
+出力は `video/x-raw,format=I422_10LE`、system memory。10bitのY/U/Vを16bit little endian容器で保持する。色変換・8bit化・スケーリングは行わない。MOVの読み込みと表示は別のGStreamer要素で行う。
 
 4444/4444 XQ、アルファ、12bit、インターレース、RAWは対象外。既存の4444検証で輝度異常を確認したため、この比較版で対応を宣言しない。純粋DX11版の結果とは分けて扱う。
 

@@ -43,7 +43,7 @@ def main():
     composition=ROOT/'results/compose-final/summary.json'
     if composition.exists():
         comp=read(composition)
-        lines += ['', '## D3D11合成込み', '', '同じフレームをBT.709 limited→RGBA16Fへ変換し、4層draw/blendするオフスクリーン負荷モデル。3試行の中央値。fullscreen、Present、LTC、Spoutは含まない。','',
+        lines += ['', '## D3D11合成込み', '', '同じフレームをBT.709 limited→RGBA16Fへ変換し、4層draw/blendするオフスクリーン負荷モデル。3試行の中央値。画面へのPresentと表示同期は含まない。','',
                   '| 素材 | モード | 成功/試行 | fps | 供給p99 ms | CPU全体 % |', '|---|---|---:|---:|---:|---:|']
         for source in sorted({r['input'] for r in comp}):
             for mode in ['cpu-d3d11','interop']:
