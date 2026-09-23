@@ -76,9 +76,13 @@ def align_pts(rows, record, present_csv, stage_csv, display_column):
     if signals[0].get('window_found') not in (None, '', '-1'):
         for row in signals:
             key = (int(row['loop']), int(row['pts_ns']))
-            window_states[key].add(
-                'found={window_found} visible={window_visible} minimized={window_minimized} '
-                'foreground={window_foreground} size={window_width}x{window_height}'.format(**row))
+            state = ('found={window_found} visible={window_visible} minimized={window_minimized} '
+                     'foreground={window_foreground} size={window_width}x{window_height}').format(**row)
+            if row.get('window_foreground_overlap_percent') not in (None, '', '-1'):
+                state += f" foreground_overlap={row['window_foreground_overlap_percent']}%"
+            if row.get('window_topmost') not in (None, '', '-1'):
+                state += f" topmost={row['window_topmost']}"
+            window_states[key].add(state)
     used = set()
     captured = set()
     displayed = set()

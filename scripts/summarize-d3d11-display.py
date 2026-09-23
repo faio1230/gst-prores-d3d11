@@ -39,6 +39,10 @@ def main():
                        'decoder_no_qos': record.get('decoder_no_qos', False),
                        'trace_sink_return': record.get('trace_sink_return', False),
                        'trace_window_state': record.get('trace_window_state', False),
+                       'topmost_window': record.get('topmost_window', False),
+                       'topmost_request_ok': record.get('topmost_request_ok', False),
+                       'topmost_present_count': sum(
+                           row.get('window_topmost') == '1' for row in presents),
                        'sink_ts_offset_ms': record.get('sink_ts_offset_ms', 0),
                        'injected_sink_stall_ms': record.get('injected_sink_stall_ms', 0),
                        'expected': stages['expected_frames'], 'rendered': record['rendered'],
@@ -62,7 +66,8 @@ def main():
     if len({trial['input'] for trial in trials}) != 1:
         parser.error('複数素材は別々に集計する')
     for field in ('rgb_converter', 'predecode_queue', 'decoder_no_qos',
-                  'trace_sink_return', 'trace_window_state', 'sink_ts_offset_ms',
+                  'trace_sink_return', 'trace_window_state', 'topmost_window',
+                  'sink_ts_offset_ms',
                   'injected_sink_stall_ms',
                   'lossless_sink_policy'):
         if len({trial[field] for trial in trials}) != 1:
@@ -77,6 +82,9 @@ def main():
                'decoder_no_qos': trials[0]['decoder_no_qos'],
                'trace_sink_return': trials[0]['trace_sink_return'],
                'trace_window_state': trials[0]['trace_window_state'],
+               'topmost_window': trials[0]['topmost_window'],
+               'topmost_request_ok_trials': sum(trial['topmost_request_ok'] for trial in trials),
+               'topmost_present_count': sum(trial['topmost_present_count'] for trial in trials),
                'sink_ts_offset_ms': trials[0]['sink_ts_offset_ms'],
                'injected_sink_stall_ms': trials[0]['injected_sink_stall_ms'],
                'lossless_sink_policy': trials[0]['lossless_sink_policy'],

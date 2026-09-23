@@ -116,6 +116,8 @@ def main():
                         help='診断用: RGB出力の下流pushが戻るまでをPTSごとに記録する')
     parser.add_argument('--trace-window-state', action='store_true',
                         help='診断用: present通知時に自プロセスのD3D11ウィンドウ状態を読む')
+    parser.add_argument('--topmost-window', action='store_true',
+                        help='診断用: 検査ウィンドウだけを一時的に最前面へ置く')
     parser.add_argument('--sink-ts-offset-ms', type=int, default=0,
                         help='診断用: sink同期時刻の相対移動（負値は早い提出、単位ms）')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/d3d11-display')
@@ -168,6 +170,8 @@ def main():
                         command.append('trace-sink-return')
                     if args.trace_window_state:
                         command.append('trace-window-state')
+                    if args.topmost_window:
+                        command.append('topmost-window')
                     if args.sink_ts_offset_ms:
                         command.append(f'sink-ts-offset-ms={args.sink_ts_offset_ms}')
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:

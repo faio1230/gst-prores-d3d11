@@ -50,10 +50,15 @@ struct PresentLog {
         int visible = -1;
         int minimized = -1;
         int foreground = -1;
+        int foreground_overlap_percent = -1;
+        int topmost = -1;
         int width = -1;
         int height = -1;
     };
     bool trace_window_state = false;
+    bool topmost_window = false;
+    bool topmost_requested = false;
+    bool topmost_request_ok = false;
     HWND window_handle = nullptr;
     std::vector<WindowState> windows;
 };
@@ -177,11 +182,27 @@ static void sample_d3d11_window(HWND hwnd, PresentLog::WindowState* state) {
     state->found = 1;
     state->visible = IsWindowVisible(hwnd) ? 1 : 0;
     state->minimized = IsIconic(hwnd) ? 1 : 0;
-    state->foreground = GetForegroundWindow() == hwnd ? 1 : 0;
+    const HWND foreground = GetForegroundWindow();
+    state->foreground = foreground == hwnd ? 1 : 0;
+    state->topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) ? 1 : 0;
     RECT rect{};
     if (GetWindowRect(hwnd, &rect)) {
         state->width = rect.right - rect.left;
         state->height = rect.bottom - rect.top;
+        if (foreground == hwnd) {
+            state->foreground_overlap_percent = 100;
+        } else {
+            RECT front{}, overlap{};
+            if (foreground && GetWindowRect(foreground, &front)) {
+                const auto area = static_cast<std::int64_t>(state->width) * state->height;
+                const auto covered = IntersectRect(&overlap, &rect, &front)
+                    ? static_cast<std::int64_t>(overlap.right - overlap.left) *
+                          (overlap.bottom - overlap.top)
+                    : 0;
+                if (area > 0)
+                    state->foreground_overlap_percent = static_cast<int>(100 * covered / area);
+            }
+        }
     }
 }
 
@@ -206,6 +227,11 @@ static void on_present(GstElement*, GstObject*, gpointer, gpointer data) {
         else {
             EnumWindows(find_d3d11_window, reinterpret_cast<LPARAM>(&window));
             log->window_handle = window.hwnd;
+        }
+        if (log->topmost_window && window.found == 1 && !log->topmost_requested) {
+            log->topmost_requested = true;
+            log->topmost_request_ok = SetWindowPos(window.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) != 0;
         }
     }
     const auto now = Clock::now();
@@ -251,8 +277,8 @@ int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
-    if (argc < 4 || argc > 14)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [sink-ts-offset-ms=N]]");
+    if (argc < 4 || argc > 15)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
@@ -260,6 +286,7 @@ int main(int argc, char** argv) try {
     bool decoder_no_qos = false;
     bool trace_sink_return = false;
     bool trace_window_state = false;
+    bool topmost_window = false;
     guint sink_stall_ms = 0;
     int sink_ts_offset_ms = 0;
     for (int i = 5; i < argc; ++i) {
@@ -271,6 +298,7 @@ int main(int argc, char** argv) try {
         else if (option == "decoder-no-qos") decoder_no_qos = true;
         else if (option == "trace-sink-return") trace_sink_return = true;
         else if (option == "trace-window-state") trace_window_state = true;
+        else if (option == "topmost-window") { topmost_window = true; trace_window_state = true; }
         else if (option.rfind("sink-ts-offset-ms=", 0) == 0)
             sink_ts_offset_ms = std::stoi(option.substr(std::string("sink-ts-offset-ms=").size()));
         else if (option.rfind("sink-stall-ms=", 0) == 0)
@@ -319,6 +347,7 @@ int main(int argc, char** argv) try {
     PresentLog presents;
     presents.origin = Clock::now();
     presents.trace_window_state = trace_window_state;
+    presents.topmost_window = topmost_window;
     LARGE_INTEGER qpc_origin{}, qpc_frequency{};
     if (!QueryPerformanceFrequency(&qpc_frequency) || !QueryPerformanceCounter(&qpc_origin))
         throw std::runtime_error("QueryPerformanceCounter failed");
@@ -408,7 +437,7 @@ int main(int argc, char** argv) try {
                               sizeof(memory))) throw std::runtime_error("GetProcessMemoryInfo failed");
     std::ofstream csv(argv[3]);
     if (!csv) throw std::runtime_error("cannot open present CSV");
-    csv << "loop,present_index,wall_ms,interval_ms,pts_ns,window_found,window_visible,window_minimized,window_foreground,window_width,window_height\n";
+    csv << "loop,present_index,wall_ms,interval_ms,pts_ns,window_found,window_visible,window_minimized,window_foreground,window_foreground_overlap_percent,window_topmost,window_width,window_height\n";
     std::vector<double> intervals;
     for (int loop = 0; loop < loops; ++loop) {
         for (std::size_t i = endpoints[loop]; i < endpoints[loop + 1]; ++i) {
@@ -417,7 +446,8 @@ int main(int argc, char** argv) try {
             if (GST_CLOCK_TIME_IS_VALID(presents.pts[i])) csv << presents.pts[i];
             const auto& window = presents.windows[i];
             csv << ',' << window.found << ',' << window.visible << ',' << window.minimized
-                << ',' << window.foreground << ',' << window.width << ',' << window.height;
+                << ',' << window.foreground << ',' << window.foreground_overlap_percent
+                << ',' << window.topmost << ',' << window.width << ',' << window.height;
             csv << '\n';
             if (i > endpoints[loop] + 30) intervals.push_back(interval);
         }
@@ -449,6 +479,8 @@ int main(int argc, char** argv) try {
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
               << ",\"trace_sink_return\":" << (trace_sink_return ? "true" : "false")
               << ",\"trace_window_state\":" << (trace_window_state ? "true" : "false")
+              << ",\"topmost_window\":" << (topmost_window ? "true" : "false")
+              << ",\"topmost_request_ok\":" << (presents.topmost_request_ok ? "true" : "false")
               << ",\"sink_ts_offset_ms\":" << sink_ts_offset_ms
               << ",\"injected_sink_stall_ms\":" << sink_stall_ms
               << ",\"injected_stall_start_ms\":" << stall.start_ms

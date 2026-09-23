@@ -4,7 +4,7 @@
 
 完成形は `video/x-prores → DX11 Compute Shaderによる復号 → video/x-raw(memory:D3D11Memory)`。復号画像をCPUへ読み戻さず、Vulkanに依存しない経路を目指します。現在の `proresvkdec` はFFmpeg Vulkanを使う比較・検証用の中間成果で、最終成果物ではありません。以後の主実装はDX11ネイティブ復号とD3D11Memory出力に置きます。
 
-**progressive ProRes 422 HQ / 10bitに限定した最初の純粋DX11経路が動作していますが、採用完了ではありません。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTを行い、GStreamerの3面D3D11Memoryへ直接出力します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodec、画像のGPU内コピーはありません。RTX 3070で1080p/4Kの全係数がCPU参照と完全一致し、FFmpeg CPU画素との差は最大1でした。EOS、seek、再起動、バッファ寿命、4K 30分、複数instance、D3D11変換・合成も検査済みです。公開カメラ由来1080p実写50フレームと4K実写129フレームの全画素比較も最大差1で通過しましたが、4K実表示にdrop事例があり、RGBの採用許容値と他GPUも未確定です。
+**progressive ProRes 422 HQ / 10bitに限定した最初の純粋DX11経路が動作していますが、採用完了ではありません。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTを行い、GStreamerの3面D3D11Memoryへ直接出力します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodec、画像のGPU内コピーはありません。RTX 3070で1080p/4Kの全係数がCPU参照と完全一致し、FFmpeg CPU画素との差は最大1でした。EOS、seek、再起動、バッファ寿命、4K 30分、複数instance、D3D11変換・合成も検査済みです。公開カメラ由来1080p実写50フレーム、4K実写129フレーム、4K60実写480フレームの全画素比較も最大差1で通過しましたが、4K実表示にはdropとOS未表示が残り、RGBの採用許容値と他GPUも未確定です。
 
 ```powershell
 ./scripts/bootstrap.ps1
