@@ -394,7 +394,7 @@ int main(int argc, char** argv) try {
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
     if (argc < 4)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [queue-after-rgb] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [present-sync1] [settle-ms=N]]");
+        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [queue-after-rgb] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [sink-processing-deadline-ms=N] [present-sync1] [settle-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
@@ -409,6 +409,7 @@ int main(int argc, char** argv) try {
     guint sink_stall_ms = 0;
     guint settle_ms = 0;
     int sink_ts_offset_ms = 0;
+    int sink_processing_deadline_ms = 15;
     for (int i = 5; i < argc; ++i) {
         const std::string option(argv[i]);
         if (option == "preroll") preroll = true;
@@ -424,6 +425,8 @@ int main(int argc, char** argv) try {
         else if (option == "sink-no-clock-sync") sink_clock_sync = false;
         else if (option.rfind("sink-ts-offset-ms=", 0) == 0)
             sink_ts_offset_ms = std::stoi(option.substr(std::string("sink-ts-offset-ms=").size()));
+        else if (option.rfind("sink-processing-deadline-ms=", 0) == 0)
+            sink_processing_deadline_ms = std::stoi(option.substr(std::string("sink-processing-deadline-ms=").size()));
         else if (option.rfind("sink-stall-ms=", 0) == 0)
             sink_stall_ms = static_cast<guint>(std::stoi(option.substr(14)));
         else if (option.rfind("settle-ms=", 0) == 0)
@@ -434,6 +437,8 @@ int main(int argc, char** argv) try {
     if (settle_ms > 5000) throw std::runtime_error("settle time must be at most 5000ms");
     if (sink_ts_offset_ms < -100 || sink_ts_offset_ms > 100)
         throw std::runtime_error("sink ts offset must be between -100 and 100ms");
+    if (sink_processing_deadline_ms < 0 || sink_processing_deadline_ms > 100)
+        throw std::runtime_error("sink processing deadline must be between 0 and 100ms");
     if (present_sync1 && !preroll)
         throw std::runtime_error("present-sync1 requires preroll before installing the diagnostic hook");
     const int loops = std::stoi(argv[2]);
@@ -505,10 +510,16 @@ int main(int argc, char** argv) try {
     if (lossless) g_object_set(sink, "qos", FALSE, "max-lateness", gint64(-1), nullptr);
     if (sink_ts_offset_ms)
         g_object_set(sink, "ts-offset", static_cast<gint64>(sink_ts_offset_ms) * GST_MSECOND, nullptr);
+    g_object_set(sink, "processing-deadline",
+                 static_cast<guint64>(sink_processing_deadline_ms) * GST_MSECOND, nullptr);
     gint64 actual_sink_ts_offset = 0;
     g_object_get(sink, "ts-offset", &actual_sink_ts_offset, nullptr);
     if (actual_sink_ts_offset != static_cast<gint64>(sink_ts_offset_ms) * GST_MSECOND)
         throw std::runtime_error("sink ts-offset was not applied");
+    guint64 actual_processing_deadline = 0;
+    g_object_get(sink, "processing-deadline", &actual_processing_deadline, nullptr);
+    if (actual_processing_deadline != static_cast<guint64>(sink_processing_deadline_ms) * GST_MSECOND)
+        throw std::runtime_error("sink processing-deadline was not applied");
     PresentLog presents;
     presents.origin = Clock::now();
     presents.trace_window_state = trace_window_state;
@@ -669,6 +680,7 @@ int main(int argc, char** argv) try {
               << ",\"topmost_window\":" << (topmost_window ? "true" : "false")
               << ",\"topmost_request_ok\":" << (presents.topmost_request_ok ? "true" : "false")
               << ",\"sink_ts_offset_ms\":" << sink_ts_offset_ms
+              << ",\"sink_processing_deadline_ms\":" << sink_processing_deadline_ms
               << ",\"present_sync_interval\":" << (present_sync1 ? 1 : 0)
               << ",\"sink_clock_sync\":" << (sink_clock_sync ? "true" : "false")
               << ",\"present_sync_hook_calls\":" << sync_hook_calls.load()

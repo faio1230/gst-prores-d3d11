@@ -135,6 +135,8 @@ def main():
                         help='診断用: 検査ウィンドウだけを一時的に最前面へ置く')
     parser.add_argument('--sink-ts-offset-ms', type=int, default=0,
                         help='診断用: sink同期時刻の相対移動（負値は早い提出、単位ms）')
+    parser.add_argument('--sink-processing-deadline-ms', type=int, default=15,
+                        help='診断用: sinkの処理期限。既定15msとの比較に用いる')
     parser.add_argument('--present-sync-interval', type=int, choices=(0, 1), default=0,
                         help='診断用: 固定GStreamer 1.28.2 sinkのPresent1同期値を1にする')
     parser.add_argument('--sink-no-clock-sync', action='store_true',
@@ -149,6 +151,8 @@ def main():
         parser.error('--sink-stall-ms は0～1000を指定する')
     if not -100 <= args.sink_ts_offset_ms <= 100:
         parser.error('--sink-ts-offset-ms は-100～100を指定する')
+    if not 0 <= args.sink_processing_deadline_ms <= 100:
+        parser.error('--sink-processing-deadline-ms は0～100を指定する')
     if args.present_sync_interval == 1 and not args.preroll:
         parser.error('--present-sync-interval 1 には--prerollが必要')
     if not 0 <= args.settle_ms <= 5000:
@@ -206,6 +210,7 @@ def main():
                         command.append('topmost-window')
                     if args.sink_ts_offset_ms:
                         command.append(f'sink-ts-offset-ms={args.sink_ts_offset_ms}')
+                    command.append(f'sink-processing-deadline-ms={args.sink_processing_deadline_ms}')
                     if args.present_sync_interval == 1:
                         command.append('present-sync1')
                     if args.sink_no_clock_sync:
