@@ -393,12 +393,13 @@ int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
-    if (argc < 4 || argc > 18)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [present-sync1] [settle-ms=N]]");
+    if (argc < 4)
+        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [queue-after-rgb] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [present-sync1] [settle-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
     bool predecode_queue = false;
+    bool postrgb_queue = false;
     bool decoder_no_qos = false;
     bool trace_sink_return = false;
     bool trace_window_state = false;
@@ -414,6 +415,7 @@ int main(int argc, char** argv) try {
         else if (option == "lossless") lossless = true;
         else if (option == "native-rgb") native_rgb = true;
         else if (option == "queue-before-decoder") predecode_queue = true;
+        else if (option == "queue-after-rgb") postrgb_queue = true;
         else if (option == "decoder-no-qos") decoder_no_qos = true;
         else if (option == "trace-sink-return") trace_sink_return = true;
         else if (option == "trace-window-state") trace_window_state = true;
@@ -443,7 +445,7 @@ int main(int argc, char** argv) try {
     const bool reference = reference_rgb || reference_heavy || reference_stress;
     if (reference && loops != 1)
         throw std::runtime_error("D3D11 test source reference requires one 1440-frame loop");
-    if (reference && (native_rgb || predecode_queue || decoder_no_qos))
+    if (reference && (native_rgb || predecode_queue || postrgb_queue || decoder_no_qos))
         throw std::runtime_error("ProRes-only decoder options cannot be used with D3D11 test source reference");
     GError* error = nullptr;
     const std::string rgb_caps =
@@ -467,6 +469,8 @@ int main(int argc, char** argv) try {
             (native_rgb ? "proresd3d11rgb" : "d3d11convert") +
             " name=converter ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! ";
     }
+    if (postrgb_queue)
+        description += "queue name=postrgb max-size-buffers=4 max-size-bytes=0 max-size-time=0 ! ";
     description += (trace_sink_return ? "d3d11pushmeter name=pushmeter ! " : "") +
         std::string("d3d11videosink name=sink sync=true emit-present=true qos=true");
     auto* pipeline = gst_parse_launch(description.c_str(), &error);
@@ -477,12 +481,14 @@ int main(int argc, char** argv) try {
     }
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline), "source");
     auto* predecode = predecode_queue ? gst_bin_get_by_name(GST_BIN(pipeline), "predecode") : nullptr;
+    auto* postrgb = postrgb_queue ? gst_bin_get_by_name(GST_BIN(pipeline), "postrgb") : nullptr;
     auto* decoder = reference ? nullptr : gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
     auto* converter = reference_rgb ? nullptr : gst_bin_get_by_name(GST_BIN(pipeline), "converter");
     auto* pushmeter = trace_sink_return ? gst_bin_get_by_name(GST_BIN(pipeline), "pushmeter") : nullptr;
     auto* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     auto* bus = gst_element_get_bus(pipeline);
-    if (!source || (predecode_queue && !predecode) || (!reference && !decoder) ||
+    if (!source || (predecode_queue && !predecode) || (postrgb_queue && !postrgb) ||
+        (!reference && !decoder) ||
         (!reference_rgb && !converter) ||
         (trace_sink_return && !pushmeter) || !sink || !bus)
         throw std::runtime_error("pipeline endpoint missing");
@@ -528,6 +534,7 @@ int main(int argc, char** argv) try {
     StageTap compressed{&stages, "compressed"};
     StageTap decoded{&stages, "decoded"};
     StageTap rgb{&stages, "rgb"};
+    StageTap rgb_dequeued{&stages, "rgb_dequeued"};
     StageTap generated{&stages, "generated"};
     if (argc >= 5) {
         if (reference) {
@@ -538,6 +545,7 @@ int main(int argc, char** argv) try {
             add_stage_probe(decoder, "sink", &compressed);
             add_stage_probe(decoder, "src", &decoded);
             add_stage_probe(converter, "src", &rgb);
+            if (postrgb) add_stage_probe(postrgb, "src", &rgb_dequeued);
         }
     }
     g_signal_connect(sink, "present", G_CALLBACK(on_present), &presents);
@@ -654,6 +662,7 @@ int main(int argc, char** argv) try {
               << ",\"rgb_converter\":\"" << (reference_rgb ? "none" :
                   (reference_heavy || reference_stress || native_rgb) ? "proresd3d11rgb" : "d3d11convert") << "\""
               << ",\"predecode_queue\":" << (predecode_queue ? "true" : "false")
+              << ",\"postrgb_queue\":" << (postrgb_queue ? "true" : "false")
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
               << ",\"trace_sink_return\":" << (trace_sink_return ? "true" : "false")
               << ",\"trace_window_state\":" << (trace_window_state ? "true" : "false")

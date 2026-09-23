@@ -40,10 +40,11 @@ def gpu_stats(path):
     return result
 
 
-def stage_stats(path, expected_frames, loops, rendered):
+def stage_stats(path, expected_frames, loops, rendered, postrgb_queue=False):
     events = {}
     counts = Counter()
-    stage_names = ('demuxed', 'compressed', 'decoded', 'rgb', 'sink_push', 'sink_return')
+    stage_names = ('demuxed', 'compressed', 'decoded', 'rgb', 'rgb_dequeued',
+                   'sink_push', 'sink_return')
     wall_by_stage = {name: {} for name in stage_names}
     widest_gaps = {}
     with path.open(newline='', encoding='utf-8-sig') as stream:
@@ -66,12 +67,17 @@ def stage_stats(path, expected_frames, loops, rendered):
     missing_before_decoder = sorted(by_stage['demuxed'] - by_stage['compressed'])
     missing_after_decoder = sorted(by_stage['compressed'] - by_stage['decoded'])
     missing_after_converter = sorted(by_stage['decoded'] - by_stage['rgb'])
+    missing_in_postrgb_queue = (sorted(by_stage['rgb'] - by_stage['rgb_dequeued'])
+                                if postrgb_queue else [])
     latencies = {}
     pairs = [('compressed', 'decoded'), ('decoded', 'rgb')]
     if by_stage['demuxed']:
         pairs.insert(0, ('demuxed', 'compressed'))
+    if postrgb_queue:
+        pairs.append(('rgb', 'rgb_dequeued'))
     if by_stage['sink_push']:
-        pairs.extend((('rgb', 'sink_push'), ('sink_push', 'sink_return')))
+        pairs.append(('rgb_dequeued' if postrgb_queue else 'rgb', 'sink_push'))
+        pairs.append(('sink_push', 'sink_return'))
     for before, after in pairs:
         durations = sorted(wall_by_stage[after][key] - wall_by_stage[before][key]
                            for key in by_stage[before] & by_stage[after])
@@ -85,6 +91,7 @@ def stage_stats(path, expected_frames, loops, rendered):
             'compressed': len(by_stage['compressed']),
             'decoded': len(by_stage['decoded']),
             'rgb': len(by_stage['rgb']),
+            'rgb_dequeued': len(by_stage['rgb_dequeued']) if postrgb_queue else None,
             'sink_push': len(by_stage['sink_push']) if by_stage['sink_push'] else None,
             'sink_return': len(by_stage['sink_return']) if by_stage['sink_return'] else None,
             'rendered': rendered,
@@ -95,6 +102,9 @@ def stage_stats(path, expected_frames, loops, rendered):
             'missing_after_decoder_count': len(missing_after_decoder),
             'missing_after_converter': missing_after_converter[:32],
             'missing_after_converter_count': len(missing_after_converter),
+            'missing_in_postrgb_queue': missing_in_postrgb_queue[:32],
+            'missing_in_postrgb_queue_count': (len(missing_in_postrgb_queue)
+                                               if postrgb_queue else None),
             'widest_same_loop_gap': widest_gaps,
             'stage_latency': latencies}
 
@@ -111,6 +121,8 @@ def main():
                         help='標準d3d11convertの代わりに専用DX11 RGB要素を表示する')
     parser.add_argument('--queue-before-decoder', action='store_true',
                         help='qtdemuxとdecoderを32 bufferのqueueで分離し前後のPTS到達時刻を記録する')
+    parser.add_argument('--queue-after-rgb', action='store_true',
+                        help='RGBとsinkの間を4 bufferのqueueで分離しPTS到達時刻を記録する')
     parser.add_argument('--decoder-no-qos', action='store_true',
                         help='診断用: decoderだけQoSによる遅延フレーム破棄を無効化する')
     parser.add_argument('--sink-stall-ms', type=int, default=0,
@@ -180,6 +192,8 @@ def main():
                         command.append('native-rgb')
                     if args.queue_before_decoder:
                         command.append('queue-before-decoder')
+                    if args.queue_after_rgb:
+                        command.append('queue-after-rgb')
                     if args.decoder_no_qos:
                         command.append('decoder-no-qos')
                     if args.sink_stall_ms:
@@ -214,7 +228,7 @@ def main():
                           source_frames=int(probe['nb_frames']), gpu=gpu_stats(monitor_path),
                           stages=stage_stats(stem.with_suffix('.stages.csv'),
                                              int(probe['nb_frames']), args.loops,
-                                             record['rendered']),
+                                             record['rendered'], args.queue_after_rgb),
                           command=command)
             stem.with_suffix('.json').write_text(json.dumps(record, ensure_ascii=False, indent=2),
                                                  encoding='utf-8')
