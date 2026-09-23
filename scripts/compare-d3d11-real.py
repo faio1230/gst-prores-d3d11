@@ -179,6 +179,8 @@ def main():
     parser.add_argument('--frames', type=int, help='先頭Nフレーム。省略時は全フレーム')
     parser.add_argument('--diagnostic-dir', type=Path,
                         help='RGB先頭1フレームのI422・CPU RGB・GPU RGB rawを保存')
+    parser.add_argument('--scratch-dir', type=Path,
+                        help='大きな中間raw用の一時領域。省略時はbuild/')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     if args.diagnostic_dir and (args.mode not in ('rgb', 'rgb_native', 'rgb_element')
@@ -197,13 +199,21 @@ def main():
         raise ValueError('odd width is not supported by this raw comparator')
     args.out.parent.mkdir(parents=True, exist_ok=True)
     (ROOT / 'build').mkdir(exist_ok=True)
+    scratch = (args.scratch_dir or ROOT / 'build').resolve()
+    if not scratch.is_dir():
+        parser.error(f'一時領域が存在しない: {scratch}')
+    raw_bytes = width * height * 4 * expected_frames * 2
+    free_bytes = shutil.disk_usage(scratch).free
+    if free_bytes < raw_bytes + 1024 ** 3:
+        parser.error(f'一時領域が不足: 必要約{(raw_bytes + 1024 ** 3) / 1024 ** 3:.1f} GiB、'
+                     f'空き{free_bytes / 1024 ** 3:.1f} GiB ({scratch})')
     env = dict(os.environ)
     env['PATH'] = str(GST) + os.pathsep + env.get('PATH', '')
     env['GST_PLUGIN_PATH'] = str(PLUGIN)
     env['GST_REGISTRY'] = str(ROOT / 'build/vs18/plugin-real-quality-registry.bin')
     env.pop('PRORES_DX11_SHADER_DIR', None)
     runs = []
-    with tempfile.TemporaryDirectory(prefix='real-quality-', dir=ROOT / 'build') as directory:
+    with tempfile.TemporaryDirectory(prefix='real-quality-', dir=scratch) as directory:
         temp = Path(directory)
         left, right = temp / 'reference.raw', temp / 'dx11.raw'
         if args.mode == 'yuv':
