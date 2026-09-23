@@ -278,7 +278,7 @@ int main(int argc, char** argv) try {
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
     if (argc < 4 || argc > 15)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N]]");
+        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [decoder-no-qos] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
@@ -310,14 +310,38 @@ int main(int argc, char** argv) try {
         throw std::runtime_error("sink ts offset must be between -100 and 100ms");
     const int loops = std::stoi(argv[2]);
     if (loops < 1) throw std::runtime_error("loops must be positive");
+    const std::string input(argv[1]);
+    const bool reference_rgb = input == "testsrc-rgb";
+    const bool reference_heavy = input == "testsrc-heavy";
+    const bool reference = reference_rgb || reference_heavy;
+    if (reference && loops != 1)
+        throw std::runtime_error("D3D11 test source reference requires one 1440-frame loop");
+    if (reference && (native_rgb || predecode_queue || decoder_no_qos))
+        throw std::runtime_error("ProRes-only decoder options cannot be used with D3D11 test source reference");
     GError* error = nullptr;
-    const std::string description = std::string("filesrc name=source ! qtdemux ! ") +
-        (predecode_queue ? "queue name=predecode max-size-buffers=32 max-size-bytes=0 max-size-time=0 ! " : "") +
-        "proresd3d11dec name=decoder ! " +
-        (native_rgb ? "proresd3d11rgb" : "d3d11convert") +
-        " name=converter ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! " +
-        (trace_sink_return ? "d3d11pushmeter name=pushmeter ! " : "") +
-        "d3d11videosink name=sink sync=true emit-present=true qos=true";
+    const std::string rgb_caps =
+        "video/x-raw(memory:D3D11Memory),format=RGB10A2_LE,colorimetry=1:1:5:1";
+    const std::string yuv_caps =
+        "video/x-raw(memory:D3D11Memory),format=I422_10LE,colorimetry=bt709,chroma-site=jpeg";
+    std::string description;
+    if (reference) {
+        description = "d3d11testsrc name=source num-buffers=1440 ! "
+            "video/x-raw(memory:D3D11Memory),format=RGB10A2_LE,"
+            "width=3840,height=2160,framerate=60/1,colorimetry=bt709 ! ";
+        if (reference_heavy) {
+            for (int index = 0; index < 2; ++index)
+                description += "d3d11convert ! " + yuv_caps + " ! d3d11convert ! " + rgb_caps + " ! ";
+            description += "d3d11convert ! " + yuv_caps + " ! proresd3d11rgb name=converter ! " + rgb_caps + " ! ";
+        }
+    } else {
+        description = std::string("filesrc name=source ! qtdemux ! ") +
+            (predecode_queue ? "queue name=predecode max-size-buffers=32 max-size-bytes=0 max-size-time=0 ! " : "") +
+            "proresd3d11dec name=decoder ! " +
+            (native_rgb ? "proresd3d11rgb" : "d3d11convert") +
+            " name=converter ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! ";
+    }
+    description += (trace_sink_return ? "d3d11pushmeter name=pushmeter ! " : "") +
+        std::string("d3d11videosink name=sink sync=true emit-present=true qos=true");
     auto* pipeline = gst_parse_launch(description.c_str(), &error);
     if (error || !pipeline) {
         const std::string text = error ? error->message : "cannot construct pipeline";
@@ -326,16 +350,20 @@ int main(int argc, char** argv) try {
     }
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline), "source");
     auto* predecode = predecode_queue ? gst_bin_get_by_name(GST_BIN(pipeline), "predecode") : nullptr;
-    auto* decoder = gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
-    auto* converter = gst_bin_get_by_name(GST_BIN(pipeline), "converter");
+    auto* decoder = reference ? nullptr : gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
+    auto* converter = reference_rgb ? nullptr : gst_bin_get_by_name(GST_BIN(pipeline), "converter");
     auto* pushmeter = trace_sink_return ? gst_bin_get_by_name(GST_BIN(pipeline), "pushmeter") : nullptr;
     auto* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     auto* bus = gst_element_get_bus(pipeline);
-    if (!source || (predecode_queue && !predecode) || !decoder || !converter ||
+    if (!source || (predecode_queue && !predecode) || (!reference && !decoder) ||
+        (!reference_rgb && !converter) ||
         (trace_sink_return && !pushmeter) || !sink || !bus)
         throw std::runtime_error("pipeline endpoint missing");
-    g_object_set(source, "location", argv[1], nullptr);
-    if (decoder_no_qos) g_object_set(decoder, "qos", FALSE, nullptr);
+    if (!reference) g_object_set(source, "location", argv[1], nullptr);
+    if (decoder_no_qos) {
+        if (!decoder) throw std::runtime_error("decoder-no-qos requires ProRes input");
+        g_object_set(decoder, "qos", FALSE, nullptr);
+    }
     if (lossless) g_object_set(sink, "qos", FALSE, "max-lateness", gint64(-1), nullptr);
     if (sink_ts_offset_ms)
         g_object_set(sink, "ts-offset", static_cast<gint64>(sink_ts_offset_ms) * GST_MSECOND, nullptr);
@@ -343,7 +371,6 @@ int main(int argc, char** argv) try {
     g_object_get(sink, "ts-offset", &actual_sink_ts_offset, nullptr);
     if (actual_sink_ts_offset != static_cast<gint64>(sink_ts_offset_ms) * GST_MSECOND)
         throw std::runtime_error("sink ts-offset was not applied");
-    gst_object_unref(source);
     PresentLog presents;
     presents.origin = Clock::now();
     presents.trace_window_state = trace_window_state;
@@ -369,11 +396,17 @@ int main(int argc, char** argv) try {
     StageTap compressed{&stages, "compressed"};
     StageTap decoded{&stages, "decoded"};
     StageTap rgb{&stages, "rgb"};
+    StageTap generated{&stages, "generated"};
     if (argc >= 5) {
-        if (predecode) add_stage_probe(predecode, "sink", &demuxed);
-        add_stage_probe(decoder, "sink", &compressed);
-        add_stage_probe(decoder, "src", &decoded);
-        add_stage_probe(converter, "src", &rgb);
+        if (reference) {
+            add_stage_probe(source, "src", &generated);
+            add_stage_probe(converter ? converter : source, "src", &rgb);
+        } else {
+            if (predecode) add_stage_probe(predecode, "sink", &demuxed);
+            add_stage_probe(decoder, "sink", &compressed);
+            add_stage_probe(decoder, "src", &decoded);
+            add_stage_probe(converter, "src", &rgb);
+        }
     }
     g_signal_connect(sink, "present", G_CALLBACK(on_present), &presents);
     double preroll_ms = 0;
@@ -474,7 +507,9 @@ int main(int argc, char** argv) try {
               << static_cast<double>(qpc_origin.QuadPart) * 1000.0 / qpc_frequency.QuadPart
               << std::setprecision(3)
               << ",\"loops\":" << loops << ",\"preroll_ms\":" << preroll_ms
-              << ",\"rgb_converter\":\"" << (native_rgb ? "proresd3d11rgb" : "d3d11convert") << "\""
+              << ",\"source_mode\":\"" << (reference ? input : "prores") << "\""
+              << ",\"rgb_converter\":\"" << (reference_rgb ? "none" :
+                  (reference_heavy || native_rgb) ? "proresd3d11rgb" : "d3d11convert") << "\""
               << ",\"predecode_queue\":" << (predecode_queue ? "true" : "false")
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
               << ",\"trace_sink_return\":" << (trace_sink_return ? "true" : "false")
@@ -509,8 +544,9 @@ int main(int argc, char** argv) try {
     gst_object_unref(bus);
     if (predecode) gst_object_unref(predecode);
     if (pushmeter) gst_object_unref(pushmeter);
-    gst_object_unref(decoder);
-    gst_object_unref(converter);
+    if (decoder) gst_object_unref(decoder);
+    if (converter) gst_object_unref(converter);
+    gst_object_unref(source);
     gst_object_unref(sink);
     gst_object_unref(pipeline);
     return 0;
