@@ -35,7 +35,7 @@ try {
     $env:GST_REGISTRY = Join-Path $build 'plugin-d3d11-test-registry.bin'
     Remove-Item Env:PRORES_DX11_SHADER_DIR -ErrorAction SilentlyContinue
 
-    $smokeOutput = & $smoke $input1080 2>&1
+    $smokeOutput = & $smoke $input1080 $input2160 2>&1
     $smokeCode = $LASTEXITCODE
     $smokeOutput | Set-Content -LiteralPath (Join-Path $out 'proresd3d11-smoke.log') -Encoding utf8
     $smokeOutput | Write-Host
