@@ -42,3 +42,23 @@ RTX 3070でビルド、係数完全一致、合成1080p/4Kの画素差最大1 co
 3面の各error stagingに`D3D11_QUERY_EVENT`を対応させ、copy直後に`End(query)`を投入した。ワーカーを再び1枚目から動かし、明示`Flush()`後の`GetData(DONOTFLUSH)`が`S_OK`になってからstagingを非blocking Mapする。[Microsoftのevent query仕様](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_query)ではGPUの先行命令完了を`S_OK`で示し、[DONOTFLUSHの仕様](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_async_getdata_flag)は未提出命令への無限待ちを警告するため、Flushを維持した。待機中はdevice lockを保持しない。ビルドとプラグイン試験（EOS×3、seek×4、RGB、破損14例）は通過。係数・画素、公開素材779枚、ASan変異はこの候補では再実行していない。
 
 合成1080p direct単独3反復は431.772/445.199/448.019fps。ただし旧版との交互比較ではない。通常QoS・Present(0)の実写4K60×10周パイロットは**4780/4800枚**で、20枚がすべてdecoder出力前、sink dropは0枚。decoder欠落全試行0枚に反するので独立ステージ交互4組と待機p99・最大値は実施せず、採用しない。次の実装変更は、利用可能なD3D11.3の`ID3D11DeviceContext3::Flush1`によるWin32完了イベント通知に回収ワーカーを切り替え、`GetData`のdevice lock付き反復をなくすこと。非対応deviceは明示的に停止し、CPU/Vulkan fallbackは置かない。効果・互換性は未検証。記録は`results/vld-worker-event-direct-pilot-2026-09-24/`と`results/display-vld-worker-event-pilot-2026-09-24/`。
+
+## 3面リング版の再判定（採用）
+
+上記ワーカー系の次案は撤回した。`b981a32`の3面リング・decoderスレッド回収へソースを戻し、診断時のみ回収のdevice lock取得、`Flush()`、`Map()`呼出し時間を分離した。通常復号の制御・GPU命令順・エラー通知は変更していない。最大値単独ゲートを撤回し、分布と内部待ち20ms超が4試行中2試行以上かで判定した。Map時間は各`Map()`呼出しの合計で、余りは反復・走査・スケジューリング等を含む。
+
+RTX 3070の全回帰は、係数完全一致、合成1080p/4Kの画素差最大1 code、EOS×3、flushing seek×4、RGB、動的caps、buffer寿命、破損14例（EOSを送らない4枚目リング再利用を含む）を通過した。公開実素材50+129+480+120=779枚はD3D11MemoryのままEOSまで完走。固定FFmpeg SDKで抽出した4素材×500件のASan変異2,000件を通過し、AC境界の単一byte再現例はGPUでも`STREAM/DECODE`で拒否した。`results/verification-vld-ring-restored-2026-09-24/`に生ログを保存した。
+
+旧基準`a3b4315`と復元版`b08e1d9`をcleanなソースから独立再ビルドし、DLL差分・shader同一性を確認した。通常QoS・Present(0)・標準sinkの実写4K60×10周を交互4組で測ると、decoder QoS欠落は旧22/0/0/0枚、新0/0/0/0枚、sink dropは全試行0。合成directの中央値は1080pで392.35→443.60fps（+13.06%）、4Kで211.08→259.17fps（+22.78%）。CPU段階ログ付きの別の交互4組では、待ちp99中央値が4.240→0.510ms、p99.9が4.604→0.837ms、backend p99が7.823→4.564ms。新版の内部lock/Flush/Map合計20ms超は4試行とも0件。**decoder側の全採用条件を通過**した。最大値は合否に算入しない。
+
+新版の回収待ち上位5行を全4試行から抽出した。sink時刻は同一試行のCSVを`(loop, PTS)`で結合した開始後経過msであり、直前フレームの`finish_ms`は所要時間なので絶対時刻ではない。時刻の近接だけから待ちの原因は断定しない。
+
+| 試行/seq/loop | 当該PTS(ns) | 回収/lock/Flush/Map/余り(ms) | 直前PTS(ns) / finish(ms) | sink直前 push→return(ms) | sink当該 push→return(ms) |
+|---|---:|---:|---:|---:|---:|
+| p1-new/687/1 | 3450000000 | 2.892 / 0.003 / 2.841 / 0.010 / 0.038 | 3433333333 / 12.699 | 11539.8→11551.5 | 11561.7→11568.0 |
+| p0-new/2305/4 | 6416666666 | 1.573 / 0.005 / 1.520 / 0.008 / 0.040 | 6400000000 / 13.332 | 38481.1→38493.4 | 38503.7→38509.6 |
+| p2-new/2787/5 | 6450000000 | 1.235 / 0.003 / 1.165 / 0.009 / 0.058 | 6433333333 / 13.679 | 46511.4→46524.9 | 46531.4→46542.8 |
+| p0-new/906/1 | 7100000000 | 1.224 / 0.007 / 1.141 / 0.013 / 0.064 | 7083333333 / 13.089 | 15183.1→15196.0 | 15205.4→15212.5 |
+| p3-new/842/1 | 6033333333 | 1.150 / 0.005 / 1.078 / 0.009 / 0.059 | 6016666666 / 13.220 | 14121.6→14134.6 | 14143.5→14151.4 |
+
+集計は`results/vld-ring-restored-gate-2026-09-24.json`、試行別のPTS・CPUログ・sink時刻は`results/vld-ring-restored-{display,direct,wait}-ab-2026-09-24/`を参照。OS/DWM未表示はdecoder側ゲートに含めず、既存の表示側参考記録として残す。対応GPUはRTX 3070のみの実機確認であり、公開配布認定や他GPUでの動作保証ではない。
