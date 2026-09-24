@@ -41,7 +41,7 @@ struct Packet {
     std::uint32_t codec_tag = 0;
 };
 
-Packet read_first_video_packet(const char* path) {
+Packet read_video_packet(const char* path, std::size_t target_index) {
     AVFormatContext* raw_format = nullptr;
     int result = avformat_open_input(&raw_format, path, nullptr, nullptr);
     if (result < 0) throw std::runtime_error("avformat_open_input failed");
@@ -63,18 +63,21 @@ Packet read_first_video_packet(const char* path) {
         void operator()(AVPacket* value) const { av_packet_free(&value); }
     };
     std::unique_ptr<AVPacket, PacketCloser> packet(raw_packet);
+    std::size_t video_index = 0;
     while (av_read_frame(format.get(), packet.get()) >= 0) {
         if (packet->stream_index == stream) {
-            Packet output;
-            output.bytes.assign(packet->data, packet->data + packet->size);
-            output.width = parameters->width;
-            output.height = parameters->height;
-            output.codec_tag = parameters->codec_tag;
-            return output;
+            if (video_index++ == target_index) {
+                Packet output;
+                output.bytes.assign(packet->data, packet->data + packet->size);
+                output.width = parameters->width;
+                output.height = parameters->height;
+                output.codec_tag = parameters->codec_tag;
+                return output;
+            }
         }
         av_packet_unref(packet.get());
     }
-    throw std::runtime_error("video packet missing");
+    throw std::runtime_error("video packet index missing");
 }
 
 struct CpuFrame {
@@ -202,6 +205,14 @@ ComPtr<ID3DBlob> compile_shader(const wchar_t* path) {
         std::cerr.write(static_cast<const char*>(diagnostics->GetBufferPointer()),
                         diagnostics->GetBufferSize());
     check(result, "D3DCompileFromFile");
+    return bytecode;
+}
+
+ComPtr<ID3DBlob> load_or_compile_shader(const wchar_t* path) {
+    if (std::filesystem::path(path).extension() != L".cso")
+        return compile_shader(path);
+    ComPtr<ID3DBlob> bytecode;
+    check(D3DReadFileToBlob(path, &bytecode), "D3DReadFileToBlob");
     return bytecode;
 }
 
@@ -348,9 +359,19 @@ std::size_t verify_entropy_rejections(const Packet& packet, const prores::Frame&
 }  // namespace
 
 int main(int argc, char** argv) try {
-    if (argc < 2 || argc > 4)
-        throw std::runtime_error("usage: prores_dx11_coeff input.mov [prores_vld.hlsl] [downloaded.raw]");
-    const auto packet = read_first_video_packet(argv[1]);
+    if (argc < 2 || argc > 5)
+        throw std::runtime_error("usage: prores_dx11_coeff input.mov [prores_vld.hlsl] [downloaded.raw] [--frame=N]");
+    std::size_t frame_index = 0;
+    const char* frame_argument = argc == 5 ? argv[4] :
+        (argc == 4 && std::string(argv[3]).rfind("--frame=", 0) == 0 ? argv[3] : nullptr);
+    if (frame_argument) {
+        const std::string option(frame_argument);
+        if (option.rfind("--frame=", 0) != 0) throw std::runtime_error("expected --frame=N");
+        std::size_t consumed = 0;
+        frame_index = std::stoull(option.substr(8), &consumed);
+        if (consumed != option.size() - 8) throw std::runtime_error("invalid frame index");
+    }
+    const auto packet = read_video_packet(argv[1], frame_index);
     prores::Frame frame;
     std::string parse_error;
     if (!prores::parse_frame(packet.bytes.data(), packet.bytes.size(),
@@ -389,14 +410,14 @@ int main(int argc, char** argv) try {
 
     const wchar_t* shader_path = L"src/prores_vld.hlsl";
     std::wstring converted_path;
-    if (argc == 3) {
+    if (argc >= 3) {
         const int length = MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, nullptr, 0);
         if (length <= 0) throw std::runtime_error("invalid UTF-8 shader path");
         converted_path.resize(static_cast<std::size_t>(length));
         MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, converted_path.data(), length);
         shader_path = converted_path.c_str();
     }
-    auto bytecode = compile_shader(shader_path);
+    auto bytecode = load_or_compile_shader(shader_path);
     ComPtr<ID3D11ComputeShader> shader;
     check(device->CreateComputeShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
                                       nullptr, &shader), "CreateComputeShader");
@@ -455,8 +476,13 @@ int main(int argc, char** argv) try {
     context->CSSetUnorderedAccessViews(0, 2, null_uavs, nullptr);
     context->CSSetShaderResources(0, 2, null_srvs);
 
-    const auto idct_path = std::filesystem::path(shader_path).parent_path() / L"prores_idct.hlsl";
-    auto idct_bytecode = compile_shader(idct_path.c_str());
+    // The production IDCT CSO targets R16_UNORM; this validator uses R16_UINT
+    // to compare integer code values. Load the production VLD CSO but compile
+    // the validator's R16_UINT IDCT source for the pixel cross-check.
+    const auto idct_path = std::filesystem::path(shader_path).extension() == L".cso" ?
+        std::filesystem::path(L"src/prores_idct.hlsl") :
+        std::filesystem::path(shader_path).parent_path() / L"prores_idct.hlsl";
+    auto idct_bytecode = load_or_compile_shader(idct_path.c_str());
     ComPtr<ID3D11ComputeShader> idct_shader;
     check(device->CreateComputeShader(idct_bytecode->GetBufferPointer(), idct_bytecode->GetBufferSize(),
                                       nullptr, &idct_shader), "Create IDCT shader");
@@ -584,7 +610,7 @@ int main(int argc, char** argv) try {
     }
     PixelDifference external_difference{};
     bool external_compared = false;
-    if (argc == 4) {
+    if (argc == 5 || (argc == 4 && !frame_argument)) {
         std::ifstream raw(argv[3], std::ios::binary | std::ios::ate);
         if (!raw) throw std::runtime_error("cannot open external raw output");
         const auto expected_bytes = static_cast<std::streamoff>(
@@ -625,6 +651,7 @@ int main(int argc, char** argv) try {
                         malformed_rejections == 12 && entropy_rejections == 1 &&
                         (!external_compared || external_difference.maximum <= pixel_tolerance);
     std::cout << "{\"passed\":" << (passed ? "true" : "false")
+              << ",\"frame_index\":" << frame_index
               << ",\"adapter\":\"" << adapter_name << "\""
               << ",\"feature_level\":" << feature_level
               << ",\"width\":" << frame.width << ",\"height\":" << frame.height

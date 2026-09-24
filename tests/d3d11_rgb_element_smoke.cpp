@@ -77,7 +77,9 @@ int main(int argc, char** argv) try {
         gst_sample_unref(sample);
     }
     require(gst_app_sink_is_eos(GST_APP_SINK(sink)), "RGB pipeline ended before EOS");
-    require(frames == expected_frames, "RGB frame count mismatch");
+    if (frames != expected_frames)
+        throw std::runtime_error("RGB frame count mismatch: " + std::to_string(frames) +
+                                 "/" + std::to_string(expected_frames));
     require(gst_element_seek_simple(pipeline, GST_FORMAT_TIME,
                 static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0),
             "RGB seek failed");

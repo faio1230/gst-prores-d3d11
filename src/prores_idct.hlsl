@@ -71,7 +71,9 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID) {
     // ProRes coefficients are defined for a 12-bit transform domain.  The
     // orthogonal 8x8 inverse transform contributes 1/4 and conversion from the
     // 12-bit domain to the requested 10-bit samples contributes another 1/4.
-    int value = clamp(int(round(512.0 + sum * (1.0 / 16.0))), 0, 1023);
+    // FFmpeg's 10-bit ProRes reference limits decoded codes to 4..1019.
+    // Lower-bitrate 422 profiles reach this range at high-contrast edges.
+    int value = clamp(int(round(512.0 + sum * (1.0 / 16.0))), 4, 1019);
     uint2 destination = uint2(job.destination_x + x, job.destination_y + y);
     uint plane_width = job.component == 0 ? output_width : output_width >> 1;
     if (destination.x >= plane_width || destination.y >= output_height) return;

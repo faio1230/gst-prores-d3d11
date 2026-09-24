@@ -191,8 +191,8 @@ def main():
         str(SDK / 'ffprobe.exe'), '-v', 'error', '-select_streams', 'v:0',
         '-show_streams', '-of', 'json', str(source)]))['streams'][0]
     if (probe['codec_name'] != 'prores' or probe['pix_fmt'] != 'yuv422p10le'
-            or probe.get('profile') != 'HQ'):
-        raise ValueError(f'not supported ProRes 422 HQ: {probe}')
+            or probe.get('profile', '').lower() not in ('proxy', 'lt', 'standard', 'hq')):
+        raise ValueError(f'not supported ProRes 422 profile: {probe}')
     expected_frames = min(args.frames or int(probe['nb_frames']), int(probe['nb_frames']))
     width, height = probe['width'], probe['height']
     if width % 2:

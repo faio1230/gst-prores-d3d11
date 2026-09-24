@@ -1,5 +1,5 @@
 /*
- * Minimal native D3D11 ProRes 422 HQ decoder for GStreamer.
+ * Native D3D11 ProRes 422 decoder for GStreamer.
  * Entropy and transform code is implemented by the companion SM5 shaders;
  * there is no libavcodec/Vulkan/software decode fallback in this module.
  */
@@ -749,7 +749,7 @@ enum { PROP_0, PROP_ADAPTER, PROP_SHADER_DIRECTORY };
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
     "sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("video/x-prores, variant=(string)hq, width=(int)[16,8192], "
+    GST_STATIC_CAPS("video/x-prores, variant=(string){ proxy, lt, standard, hq }, width=(int)[16,8192], "
                     "height=(int)[16,8192], interlace-mode=(string)progressive"));
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src", GST_PAD_SRC, GST_PAD_ALWAYS,
@@ -822,11 +822,13 @@ static gboolean set_format(GstVideoDecoder* decoder, GstVideoCodecState* state) 
     const char* interlace = gst_structure_get_string(structure, "interlace-mode");
     const int width = GST_VIDEO_INFO_WIDTH(&state->info);
     const int height = GST_VIDEO_INFO_HEIGHT(&state->info);
-    if (g_strcmp0(variant, "hq") != 0 ||
+    if (!variant ||
+        (g_strcmp0(variant, "proxy") != 0 && g_strcmp0(variant, "lt") != 0 &&
+         g_strcmp0(variant, "standard") != 0 && g_strcmp0(variant, "hq") != 0) ||
         (interlace && g_strcmp0(interlace, "progressive") != 0) ||
         width < 16 || width > 8192 || height < 16 || height > 8192 || (width & 1)) {
         GST_ELEMENT_ERROR(self, STREAM, FORMAT,
-            ("Only progressive, alpha-free ProRes 422 HQ 10-bit is supported"),
+            ("Only progressive, alpha-free ProRes 422 Proxy/LT/Standard/HQ 10-bit is supported"),
             ("caps: %" GST_PTR_FORMAT, state->caps));
         return FALSE;
     }
@@ -1133,7 +1135,7 @@ static void gst_prores_d3d11_dec_class_init(GstProresD3D11DecClass* klass) {
     auto* element = GST_ELEMENT_CLASS(klass);
     element->set_context = set_context;
     gst_element_class_set_static_metadata(element, "Native D3D11 ProRes decoder",
-        "Codec/Decoder/Video/Hardware", "Progressive ProRes 422 HQ to D3D11Memory without image readback",
+        "Codec/Decoder/Video/Hardware", "Progressive ProRes 422 to D3D11Memory without image readback",
         "ProRes GPU project");
     gst_element_class_add_static_pad_template(element, &sink_template);
     gst_element_class_add_static_pad_template(element, &src_template);
@@ -1168,5 +1170,5 @@ static gboolean plugin_init(GstPlugin* plugin) {
 }
 
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, proresd3d11,
-    "Native D3D11 ProRes 422 HQ decoder and RGB converter", plugin_init, "0.1.0", "LGPL",
+    "Native D3D11 ProRes 422 decoder and RGB converter", plugin_init, "0.1.0", "LGPL",
     "prores-gpu-lab", "https://example.invalid/prores-gpu-lab")

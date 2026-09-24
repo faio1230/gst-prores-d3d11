@@ -3,7 +3,8 @@
 param(
     [string]$BuildDir = 'build/parser-asan',
     [string]$OutDir = 'results/verification-parser-mutation-2026-09-24',
-    [ValidateRange(1, 100000)][int]$Iterations = 500
+    [ValidateRange(1, 100000)][int]$Iterations = 500,
+    [string[]]$AdditionalInputs = @()
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -39,7 +40,7 @@ $sources = @(
     'synthetic-2160p60-hq.mov',
     'reference-proton-rec709-hq.mov',
     'reference-dji-nature-4k60-rec709-hq.mov'
-)
+) + $AdditionalInputs
 $packets = @()
 $hashes = @()
 foreach ($name in $sources) {
@@ -87,7 +88,7 @@ for ($i = 0; $i -lt $originalBytes.Length; $i++) {
 }
 if ($differences -ne 1) { throw 'GPU回帰用packetが単一バイト変異ではありません' }
 [pscustomobject]@{
-    status = '対象4素材の決定的変異・ASan検査。網羅的fuzzの保証ではない'
+    status = "対象$($sources.Count)素材の決定的変異・ASan検査。網羅的fuzzの保証ではない"
     result = $result
     sources = $hashes
     boundary_packet_sha256 = (Get-FileHash -LiteralPath $boundaryPacket -Algorithm SHA256).Hash.ToLowerInvariant()

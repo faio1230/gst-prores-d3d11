@@ -26,3 +26,5 @@ __pycache__/
 /results/feature-matrix-2026-09-24/*.log
 /results/feature-matrix-2026-09-24/*.framemd5
 /results/feature-matrix-2026-09-24/*.mov
+# CSO版へ切り替える前の逐次検査ログ（未完・再現用にローカル保持）。
+/results/profile-422-coefficients-all-2026-09-24/
