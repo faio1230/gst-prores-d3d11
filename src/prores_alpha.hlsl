@@ -51,11 +51,9 @@ uint get_bits(inout BitReader bits, uint count) {
     return value;
 }
 
-uint scaled_alpha(uint value, uint alpha_info, uint depth) {
-    if (alpha_info == 2)
-        return value >> (16u - depth);
-    return depth == 10 ? ((value << 2) | (value >> 6)) :
-                         ((value << 4) | (value >> 4));
+uint expanded_alpha(uint value, uint alpha_info) {
+    // Keep the source's 16 bits; expand 8 bits to the full UNORM range.
+    return alpha_info == 2u ? value : ((value << 8) | value);
 }
 
 void write_alpha(uint position, uint sample, AlphaJob job) {
@@ -73,7 +71,6 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     if (job_index >= job_count) return;
     AlphaJob job = jobs[job_index];
     uint alpha_info = alpha_info_and_depth & 255u;
-    uint depth = alpha_info_and_depth >> 8;
     uint source_bits = alpha_info == 2 ? 16u : 8u;
     uint mask = (1u << source_bits) - 1u;
     uint sample_count = job.mb_count * 256u;
@@ -93,7 +90,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
             }
             if (bits.failed) break;
             previous = (previous + uint(delta)) & mask;
-            write_alpha(position++, scaled_alpha(previous, alpha_info, depth), job);
+            write_alpha(position++, expanded_alpha(previous, alpha_info), job);
             if (position >= sample_count) break;
             if (bits.position >= bits.bit_size || get_bits(bits, 1) == 0) break;
         }
@@ -104,7 +101,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
             bits.failed = 1;
             break;
         }
-        uint sample = scaled_alpha(previous, alpha_info, depth);
+        uint sample = expanded_alpha(previous, alpha_info);
         [loop] for (uint i = 0; i < repeat; ++i)
             write_alpha(position++, sample, job);
     }

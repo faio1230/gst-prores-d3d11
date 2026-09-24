@@ -231,11 +231,22 @@ int main(int argc, char** argv) try {
         const auto* row = reinterpret_cast<const std::uint16_t*>(
             static_cast<const std::uint8_t*>(mapped.pData) + static_cast<std::size_t>(y) * mapped.RowPitch);
         for (int x = 0; x < packet.width; ++x) {
-            const auto expected = reference[static_cast<std::size_t>(y) * packet.width + x];
+            const auto decoded = reference[static_cast<std::size_t>(y) * packet.width + x];
             const auto actual = row[x];
-            const auto difference = actual > expected ? actual - expected : expected - actual;
+            // FFmpeg drops the low 6/4 bits of 16-bit alpha in 10/12-bit output.
+            // Its 8-bit path replicates into the output depth; recover the 8-bit source.
+            const auto expected = parsed.alpha_info == 2 ?
+                static_cast<std::uint16_t>(decoded << (16 - bit_depth)) :
+                static_cast<std::uint16_t>(((decoded >> (bit_depth - 8)) << 8) |
+                                           (decoded >> (bit_depth - 8)));
+            const auto comparable = parsed.alpha_info == 2 ?
+                static_cast<std::uint16_t>(actual >> (16 - bit_depth)) : actual;
+            const auto reference_value = parsed.alpha_info == 2 ? decoded : expected;
+            const auto difference = comparable > reference_value ?
+                comparable - reference_value : reference_value - comparable;
             max_difference = std::max(max_difference, static_cast<unsigned>(difference));
             mismatches += difference != 0;
+            if (parsed.alpha_info == 1) mismatches += actual != expected;
         }
     }
     context->Unmap(staging.Get(), 0);

@@ -409,7 +409,7 @@ public:
                 static_cast<std::uint32_t>((parsed.bit_depth << 8) | parsed.alpha_info),
                 static_cast<std::uint32_t>(coefficient_jobs.size())};
             const AlphaPackParameters pack_values{
-                parsed.width, parsed.height, parsed.chroma_shift};
+                parsed.width, parsed.height, parsed.chroma_shift, parsed.bit_depth};
             context_->UpdateSubresource(cache_.alpha_jobs.Get(), 0, nullptr,
                                         alpha_jobs.data(), 0, 0);
             context_->UpdateSubresource(cache_.alpha_parameters.Get(), 0, nullptr,
@@ -1037,12 +1037,6 @@ static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& p
     }
     if (state->caps) gst_caps_unref(state->caps);
     state->caps = gst_video_info_to_caps(&state->info);
-    if (parsed.alpha_info) {
-        gst_structure_set(gst_caps_get_structure(state->caps, 0), "prores-depth",
-                          G_TYPE_INT, static_cast<int>(parsed.bit_depth), nullptr);
-        gst_structure_set(gst_caps_get_structure(state->caps, 0), "prores-chroma-shift",
-                          G_TYPE_INT, static_cast<int>(parsed.chroma_shift), nullptr);
-    }
     gst_caps_set_features(state->caps, 0,
         gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY, nullptr));
     gst_video_codec_state_unref(state);

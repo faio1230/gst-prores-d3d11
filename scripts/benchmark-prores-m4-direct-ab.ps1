@@ -1,25 +1,27 @@
 # M3採用版とM4作業版のHQ directを同一GPU・交互4組で比較する。
 [CmdletBinding()]
 param([string]$OutDir = 'results/m4-hq-direct-ab-2026-09-24',
-      [string]$NewBuildName = 'prores-m4-direct-ab-new')
+      [string]$NewBuildName = 'prores-m4-direct-ab-new',
+      [string]$OldBuildName = 'prores-m3-direct-ab-new',
+      [string]$PriorSummary = 'results/m3-alpha-hq-direct-ab-2026-09-24/summary.json')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root 'build/vs18'
-$oldBuild = Join-Path $build 'prores-m3-direct-ab-new'
+$oldBuild = Join-Path $build $OldBuildName
 $newBuild = Join-Path $build $NewBuildName
 $out = Join-Path $root $OutDir
 $files = @('gstproresd3d11.dll','prores_vld.cso','prores_idct_unorm.cso',
     'prores_rgb.cso','prores_alpha.cso','prores_pack_alpha.cso','prores_rgb_alpha.cso')
 $sources = @((Join-Path $root 'media/synthetic-1080p60-hq.mov'),
              (Join-Path $root 'media/synthetic-2160p60-hq.mov'))
-$prior = Get-Content (Join-Path $root 'results/m3-alpha-hq-direct-ab-2026-09-24/summary.json') -Raw |
+$prior = Get-Content (Join-Path $root $PriorSummary) -Raw |
     ConvertFrom-Json
 if ((Test-Path -LiteralPath $out) -or (Test-Path -LiteralPath $newBuild)) {
     throw '既存M4測定結果・配置は上書きしません'
 }
 $oldHash = (Get-FileHash -LiteralPath (Join-Path $oldBuild 'plugins/Release/gstproresd3d11.dll') `
     -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($oldHash -ne $prior.new_plugin_sha256) { throw 'M3採用版のSHA256が不一致' }
+if ($oldHash -ne $prior.new_plugin_sha256) { throw '旧採用版のSHA256が不一致' }
 $newPlugin = Join-Path $newBuild 'plugins/Release'
 $newExe = Join-Path $newBuild 'Release'
 New-Item -ItemType Directory -Path $newPlugin, $newExe, $out | Out-Null

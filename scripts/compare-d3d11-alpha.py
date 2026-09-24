@@ -46,6 +46,11 @@ def read_exact(stream, size):
     return b''.join(chunks)
 
 
+def expand_yuv(values, depth):
+    codes = values.astype(np.uint32)
+    return ((codes << (16 - depth)) | (codes >> (2 * depth - 16))).astype(np.uint16)
+
+
 def compare(path, out, temp, rgb, streaming):
     info = probe(path)
     pixel_format = info['pix_fmt']
@@ -61,6 +66,15 @@ def compare(path, out, temp, rgb, streaming):
     frame_samples = y_samples * 2 + chroma_samples * 2
     dx_frame_samples = download_stride_pixels * height * 4
     name = path.stem
+    packet = temp / 'alpha-mode.packet'
+    run([FFMPEG / 'ffmpeg.exe', '-hide_banner', '-loglevel', 'error',
+         '-i', path, '-map', '0:v:0', '-frames:v', '1', '-c', 'copy',
+         '-f', 'data', '-y', packet], out / f'{name}-packet.log')
+    header = packet.read_bytes()
+    if len(header) < 26 or header[4:8] != b'icpf' or header[25] & 15 not in (1, 2):
+        raise RuntimeError(f'alpha modeをProRes headerから取得できない: {path}')
+    alpha_bits = 8 if header[25] & 15 == 1 else 16
+    depth = 12 if '12le' in pixel_format else 10
     env = os.environ.copy()
     env['PATH'] = str(GST) + os.pathsep + env.get('PATH', '')
     env['GST_PLUGIN_PATH'] = str(PLUGIN)
@@ -84,8 +98,22 @@ def compare(path, out, temp, rgb, streaming):
         if chroma_width != width:
             u_plane = np.repeat(u_plane, 2, axis=2)
             v_plane = np.repeat(v_plane, 2, axis=2)
-        reference = np.stack((a_plane, y_plane, u_plane, v_plane), axis=3)
-        delta = np.abs(dx_words.astype(np.int32) - reference.astype(np.int32))
+        shift = 16 - depth
+        decoded_yuv = dx_words[..., 1:].astype(np.uint32) >> shift
+        cpu_yuv = np.stack((y_plane, u_plane, v_plane), axis=3)
+        yuv_delta = np.abs(decoded_yuv.astype(np.int32) - cpu_yuv.astype(np.int32))
+        if not np.array_equal(dx_words[..., 1:], expand_yuv(decoded_yuv, depth)):
+            raise RuntimeError(f'AYUV64 YUVが16bitビット複製でない: {path}')
+        if alpha_bits == 8:
+            source_alpha = a_plane.astype(np.uint32) >> (depth - 8)
+            expected_alpha = ((source_alpha << 8) | source_alpha).astype(np.uint16)
+            alpha_delta = np.abs(dx_words[..., 0].astype(np.int32) -
+                                 expected_alpha.astype(np.int32))
+        else:
+            # FFmpeg's yuva output discards the original low 6/4 alpha bits.
+            alpha_delta = np.abs((dx_words[..., 0].astype(np.uint32) >> shift).astype(np.int32)
+                                 - a_plane.astype(np.int32))
+        delta = np.concatenate((alpha_delta[..., None], yuv_delta), axis=3)
         return dx_words, y_plane, u_plane, v_plane, a_plane, delta
 
     if streaming:
@@ -155,6 +183,8 @@ def compare(path, out, temp, rgb, streaming):
         'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
         'fourcc': info['codec_tag_string'],
         'pixel_format': pixel_format,
+        'alpha_bits': alpha_bits,
+        'ayuv64_packing': 'YUV bit-replicated to 16-bit; alpha8 replicated; alpha16 raw',
         'frames': int(frames),
         'pixels': int(frames * y_samples),
         'max_difference_ayuv': max_by_component,
@@ -177,41 +207,26 @@ def compare(path, out, temp, rgb, streaming):
         if rgba.size != frames * dx_frame_samples:
             raise RuntimeError(f'RGBA64 rawサイズが異なる: {path}')
         rgba = rgba.reshape(frames, height, download_stride_pixels, 4)[:, :, :width, :]
-        depth = 12 if '12le' in pixel_format else 10
-        expected_alpha = np.rint(a.astype(np.float64) * 65535 / ((1 << depth) - 1))
-        alpha_difference = np.abs(rgba[..., 3].astype(np.int32) - expected_alpha.astype(np.int32))
+        alpha_difference = np.abs(rgba[..., 3].astype(np.int32) - dx[..., 0].astype(np.int32))
         result['rgba64_alpha_max_difference'] = int(alpha_difference.max())
         result['rgba64_alpha_mismatches'] = int(np.count_nonzero(alpha_difference))
         if result['rgba64_alpha_max_difference'] > 1:
             raise RuntimeError(f'RGBA64 alpha差が1を超える: {path}')
-        scale = 4 if depth == 12 else 1
         def expected_rgb_codes(y_code, u_code, v_code):
-            yy = (y_code.astype(np.float64) / scale - 64.0) / 876.0
-            cb = (u_code.astype(np.float64) / scale - 512.0) / 896.0
-            cr = (v_code.astype(np.float64) / scale - 512.0) / 896.0
+            yy = (y_code.astype(np.float64) - 4096.0) / 56064.0
+            cb = (u_code.astype(np.float64) - 32768.0) / 57344.0
+            cr = (v_code.astype(np.float64) - 32768.0) / 57344.0
             channels = np.stack((yy + 1.5748 * cr,
                                  yy - 0.187324 * cb - 0.468124 * cr,
                                  yy + 1.8556 * cb), axis=3)
             return np.rint(np.clip(channels, 0.0, 1.0) * 65535).astype(np.int32)
 
-        def centered_chroma(plane):
-            if chroma_width == width:
-                return plane
-            location = (np.arange(width, dtype=np.float64) - 0.5) * 0.5
-            floor = np.floor(location)
-            raw_low = floor.astype(np.int32)
-            low = np.clip(raw_low, 0, chroma_width - 1)
-            high = np.clip(raw_low + 1, 0, chroma_width - 1)
-            fraction = location - floor
-            even = plane[:, :, ::2].astype(np.float64)
-            return even[:, :, low] * (1.0 - fraction) + even[:, :, high] * fraction
-
-        expected_rgb = expected_rgb_codes(dx[..., 1], centered_chroma(dx[..., 2]),
-                                          centered_chroma(dx[..., 3]))
+        expected_rgb = expected_rgb_codes(dx[..., 1], dx[..., 2], dx[..., 3])
         rgb_difference = np.abs(rgba[..., :3].astype(np.int32) - expected_rgb)
         result['rgba64_rgb_formula_max_difference'] = int(rgb_difference.max())
         result['rgba64_rgb_formula_mismatches'] = int(np.count_nonzero(rgb_difference))
-        cpu_rgb = expected_rgb_codes(y, centered_chroma(u), centered_chroma(v))
+        cpu_rgb = expected_rgb_codes(expand_yuv(y, depth), expand_yuv(u, depth),
+                                     expand_yuv(v, depth))
         result['rgba64_rgb_cpu_formula_max_difference'] = int(
             np.abs(rgba[..., :3].astype(np.int32) - cpu_rgb).max())
     return result

@@ -31,3 +31,7 @@ __pycache__/
 # M2の大量な生ログ・フレーム別結果はローカル保持。採用要約と素材ハッシュのみ明示追跡する。
 /results/m2-*
 /results/prores-m2-2026-09-24/
+# AYUV64標準化の途中ログ・全画素の個別結果はローカルのみ保持。採用根拠は明示指定して追跡する。
+/results/alpha-standard-*/
+/results/alpha-standard-*.log
+/results/alpha-standard-*.json

@@ -15,11 +15,11 @@ filesrc → qtdemux → proresd3d11dec → video/x-raw(memory:D3D11Memory)
                          └ GPU: alpha付きはalpha復号後にAYUV64へGPU内でpack
 ```
 
-入力は`video/x-prores`の完全な1フレーム/バッファ。M3採用時点ではapco/apcs/apcn/apchの10bitとap4h/ap4xの12bitを、フレームヘッダーに応じた4:2:2または4:4:4、alphaなし/8/16bitで復号する。progressiveを対象とし、interlacedとRAW、範囲外のalpha modeは明示的に拒否する。CPU/Vulkanへのfallbackはない。対応表と検査結果は[機能対応表](機能対応表.md)と[アルファ拡張](アルファ拡張.md)。
+入力は`video/x-prores`の完全な1フレーム/バッファ。apco/apcs/apcn/apchの10bitとap4h/ap4xの12bitを、フレームヘッダーに応じた4:2:2または4:4:4、alphaなし/8/16bitで復号する。M4でTFF/BFFも採用し、RAWと範囲外のalpha modeは明示的に拒否する。CPU/Vulkanへのfallbackはない。対応表と検査結果は[機能対応表](機能対応表.md)、[アルファ拡張](アルファ拡張.md)、[インターレース拡張](インターレース拡張.md)。
 
 受け取ったD3D11 deviceはDXGI adapterまでたどり、`DXGI_ADAPTER_FLAG_SOFTWARE`が立つWARP等をSM5対応でも拒否する。adapter情報を取得できない場合もGPU実行と推定せず拒否する。ソフトウェアflagがないことだけで物理GPUの動作保証とはしない。専用RGB要素にも同じ判定を適用する。WARPをGStreamer contextに注入したdecoderと、WARP製D3D11Memoryを専用RGB要素へ直接渡した実パイプラインは、どちらも`RESOURCE/FAILED`で停止した。他の物理GPUと実際のdevice lostは未検証。
 
-alphaなしの出力は`video/x-raw(memory:D3D11Memory)`の`I422_10LE`、`Y444_10LE`、`I422_12LE`、`Y444_12LE`。Y/U/Vの3枚の`DXGI_FORMAT_R16_UNORM` texture（全てSRV|UAV）へ、IDCT shaderがpoolから受け取ったtextureに直接書く。alpha付きはGPUでalpha面を復号し、`AYUV64`の単一`R16G16B16A16_UNORM` textureへpackする。4面planarのD3D11プールはGStreamer 1.28.2で確保できないため、alphaはpacked画像の第1成分に保持する。capsの`prores-depth`と`prores-chroma-shift`は下位bitの深度と元の422/444を表す。通常経路の画像CPU読み戻しは0回。圧縮packetのCPU→GPU uploadと小さいVLD/alphaエラーフラグのGPU→CPU検査は行うため、処理全体を無条件に「ゼロコピー」とは呼ばない。
+alphaなしの出力は`video/x-raw(memory:D3D11Memory)`の`I422_10LE`、`Y444_10LE`、`I422_12LE`、`Y444_12LE`。Y/U/Vの3枚の`DXGI_FORMAT_R16_UNORM` texture（全てSRV|UAV）へ、IDCT shaderがpoolから受け取ったtextureに直接書く。alpha付きはGPUでalpha面を復号し、標準`AYUV64`の単一`R16G16B16A16_UNORM` textureへ全成分16bit UNORMとしてpackする。4面planarのD3D11プールはGStreamer 1.28.2で確保できないため、alphaはpacked画像の第1成分に保持する。M3採用時の独自capsフィールド`prores-depth`/`prores-chroma-shift`は廃止し、下流の標準`d3d11convert`と`videoconvert`の全画素互換性を確認した。通常経路の画像CPU読み戻しは0回。圧縮packetのCPU→GPU uploadと小さいVLD/alphaエラーフラグのGPU→CPU検査は行うため、処理全体を無条件に「ゼロコピー」とは呼ばない。
 
 VLDエラーフラグのstaging readは、[Microsoftの`Map`仕様](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-map)に従い`D3D11_MAP_FLAG_DO_NOT_WAIT`で処理中を判定し、10秒のポーリング期限を設けた。各処理中応答で`GetDeviceRemovedReason()`も確認する。期限超過やHRESULT失敗は画像を出さずGStreamerエラーへ進む。期限・device lost・通常完了の分岐はGPUを失わせない単体試験で確認し、実GPUの復号/EOS/seekと公開素材779枚を回帰した。ただし実際のdevice lost、driver内部でAPI呼出し自体が停止する事態、全GPUでの期限保証は未検証。画像のCPU読み戻しは増やしていない。
 
@@ -83,7 +83,7 @@ VLDを1-bit反復loadから32-bit windowへ変更する前の検査用download�
 
 D3D11下流検査ではdecoderの3面I422_10LEからd3d11convertのRGB10A2_LE、d3d11compositor出力まで `memory:D3D11Memory` を維持した。RGB10A2の全画素比較は実写1080p/4Kで行ったが、表示機器の色管理と素材のクロマ位置は未確定。compositor内部のrender/copy回数も未計測なので、この下流全体をゼロコピーとは呼ばない。保存ログは `results/proresd3d11-compositor-caps.log`。
 
-`proresd3d11rgb`はalphaなしの3面D3D11Memoryを`prores_rgb.hlsl`で`RGB10A2_LE`へ、alpha付き`AYUV64`を`prores_rgb_alpha.hlsl`で`RGBA64_LE`へCompute Shaderで直接書く。CPU読み戻しは検査経路だけで、通常経路にはない。入力はprogressive・limited BT.709に限定し、422では元のクロマ位置を中央補間し、444では各画素のクロマを使う。公開HQ実写1080p全50枚／4K全129枚／4K60全480枚とM2の18素材780枚で、alphaなしの独立BT.709式とのR/G/B最大差は各1 code。M3のalpha付き24条件48枚では、DX11が復号したAYUV値から独立に計算したRGB式との差最大1、alpha差0。EOS、seek、停止・破棄後のbuffer寿命も検査した。capsだけではSRV bind flagが保証されず、外部ソースの別構成は拒否し得る。表示機器の色管理、他GPUのtyped UAV対応、BT.709以外のRGBAは未達。詳細は[実素材と表示検証](実素材と表示検証.md)、[444・12bit拡張](444・12bit拡張.md)、[アルファ拡張](アルファ拡張.md)。
+`proresd3d11rgb`はalphaなしの3面D3D11Memoryを`prores_rgb.hlsl`で`RGB10A2_LE`へ、alpha付きの標準`AYUV64`を`prores_rgb_alpha.hlsl`で`RGBA64_LE`へCompute Shaderで直接書く。CPU読み戻しは検査経路だけで、通常経路にはない。入力はprogressive・limited BT.709に限定する。alphaなしの422では元のクロマ位置を中央補間し、444では各画素のクロマを使う。alpha付きAYUV64は既に4:4:4へ隣接複製した値を16bit UNORMとして扱い、元の422/444情報には依存しない。公開HQ実写1080p全50枚／4K全129枚／4K60全480枚とM2の18素材780枚で、alphaなしの独立BT.709式とのR/G/B最大差は各1 code。M3のalpha付き24条件48枚では、DX11が復号したAYUV値から独立に計算したRGB式との差最大1、alpha差0。EOS、seek、停止・破棄後のbuffer寿命も検査した。capsだけではSRV bind flagが保証されず、外部ソースの別構成は拒否し得る。表示機器の色管理、他GPUのtyped UAV対応、BT.709以外のRGBAは未達。詳細は[実素材と表示検証](実素材と表示検証.md)、[444・12bit拡張](444・12bit拡張.md)、[アルファ拡張](アルファ拡張.md)。
 
 ## 比較用Vulkan版：proresvkdec
 

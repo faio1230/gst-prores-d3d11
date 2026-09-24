@@ -257,8 +257,6 @@ static GstCaps* transform_caps(GstBaseTransform*, GstPadDirection direction,
                 gst_structure_set_value(structure, "format", &formats);
                 g_value_unset(&formats);
             }
-            gst_structure_remove_field(structure, "prores-depth");
-            gst_structure_remove_field(structure, "prores-chroma-shift");
         } else {
             GValue formats = G_VALUE_INIT;
             g_value_init(&formats, GST_TYPE_LIST);
@@ -297,20 +295,12 @@ static gboolean set_caps(GstBaseTransform* transform, GstCaps* input, GstCaps* o
         return FALSE;
     const auto format = GST_VIDEO_INFO_FORMAT(&in);
     const bool alpha = format == GST_VIDEO_FORMAT_AYUV64;
-    int alpha_depth = 0;
-    int alpha_chroma_shift = -1;
-    if (alpha) gst_structure_get_int(gst_caps_get_structure(input, 0),
-                                     "prores-depth", &alpha_depth);
-    if (alpha) gst_structure_get_int(gst_caps_get_structure(input, 0),
-                                     "prores-chroma-shift", &alpha_chroma_shift);
     if ((format != GST_VIDEO_FORMAT_I422_10LE &&
          format != GST_VIDEO_FORMAT_Y444_10LE &&
          format != GST_VIDEO_FORMAT_I422_12LE &&
          format != GST_VIDEO_FORMAT_Y444_12LE && !alpha) ||
         GST_VIDEO_INFO_FORMAT(&out) != (alpha ? GST_VIDEO_FORMAT_RGBA64_LE :
                                         GST_VIDEO_FORMAT_RGB10A2_LE) ||
-        (alpha && alpha_depth != 10 && alpha_depth != 12) ||
-        (alpha && alpha_chroma_shift != 0 && alpha_chroma_shift != 1) ||
         in.width != out.width || in.height != out.height || (in.width & 1) ||
         in.interlace_mode != GST_VIDEO_INTERLACE_MODE_PROGRESSIVE ||
         out.interlace_mode != GST_VIDEO_INTERLACE_MODE_PROGRESSIVE ||
@@ -336,9 +326,9 @@ static gboolean set_caps(GstBaseTransform* transform, GstCaps* input, GstCaps* o
     self->input_info = in;
     self->output_info = out;
     self->input_has_alpha = alpha;
-    self->input_bit_depth = alpha ? static_cast<guint>(alpha_depth) :
+    self->input_bit_depth = alpha ? 16u :
         (format == GST_VIDEO_FORMAT_I422_12LE || format == GST_VIDEO_FORMAT_Y444_12LE ? 12u : 10u);
-    self->input_chroma_shift = alpha ? static_cast<guint>(alpha_chroma_shift) :
+    self->input_chroma_shift = alpha ? 0u :
         (format == GST_VIDEO_FORMAT_I422_10LE || format == GST_VIDEO_FORMAT_I422_12LE ? 1u : 0u);
     return TRUE;
 }

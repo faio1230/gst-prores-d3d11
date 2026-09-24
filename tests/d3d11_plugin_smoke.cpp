@@ -763,6 +763,11 @@ static void interlaced_output(const char* path, GstVideoFieldOrder order, bool a
         require(GST_VIDEO_INFO_FORMAT(&info) == (alpha ? GST_VIDEO_FORMAT_AYUV64 :
                                                    GST_VIDEO_FORMAT_I422_10LE),
                 "interlaced output format mismatch");
+        if (alpha) require(!gst_structure_has_field(gst_caps_get_structure(caps, 0),
+                                                     "prores-depth") &&
+                           !gst_structure_has_field(gst_caps_get_structure(caps, 0),
+                                                     "prores-chroma-shift"),
+                           "interlaced AYUV64 must use standard caps only");
         require(gst_caps_features_contains(gst_caps_get_features(caps, 0),
                                            GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY),
                 "interlaced D3D11Memory caps missing");

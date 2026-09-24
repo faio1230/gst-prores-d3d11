@@ -169,10 +169,9 @@ static StreamContract verify_sample(GstSample* sample, const std::string& mode,
             require(gst_is_d3d11_memory(gst_buffer_peek_memory(buffer, plane)),
                     "non-D3D11 memory in direct mode");
         if (format == GST_VIDEO_FORMAT_AYUV64) {
-            int depth = 0;
-            require(gst_structure_get_int(gst_caps_get_structure(caps, 0),
-                                          "prores-depth", &depth) && (depth == 10 || depth == 12),
-                    "packed alpha output has no ProRes depth tag");
+            require(!gst_structure_has_field(gst_caps_get_structure(caps, 0), "prores-depth") &&
+                    !gst_structure_has_field(gst_caps_get_structure(caps, 0), "prores-chroma-shift"),
+                    "standard AYUV64 output contains private ProRes caps fields");
         }
     }
     if (info.fps_n > 0) {
