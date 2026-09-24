@@ -1,5 +1,6 @@
 """build/に残したM5の詳細ログから、文書で参照する単一の判定JSONを作る。"""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,6 +15,67 @@ def read_json(path):
 
 def last_json(path):
     return json.loads(path.read_text(encoding='utf-8', errors='replace').splitlines()[-1])
+
+
+def regression_checks():
+    m1 = read_json(PROBES / 'm1/summary-1080.json') + read_json(
+        PROBES / 'm1/summary-4k.json')
+    m2 = read_json(PROBES / 'm2/summary.json')
+    m3 = read_json(PROBES / 'm3-alpha/summary.json')
+    m4_alpha = read_json(PROBES / 'm4-alpha/summary.json')
+    m4_yuv = [read_json(PROBES / f'{name}-pixels.json') for name in (
+        'apch-tff-1080p30', 'apch-bff-1080p30',
+        'apch-tff-4k60', 'apch-bff-4k60')]
+    public = read_json(PROBES / 'hq-public/summary.json')
+    performance = read_json(PROBES / 'hq-ab/summary.json')
+    current_plugin = ROOT / 'build/vs18/plugins/Release/gstproresd3d11.dll'
+    current_hash = hashlib.sha256(current_plugin.read_bytes()).hexdigest()
+    m1_max = max(item['pixel_max_abs'] for item in m1)
+    m2_max = max(item['cpu_dx11_pixel_max'] for item in m2)
+    m4_yuv_max = max(channel['max_abs'] for item in m4_yuv
+                     for channel in item['channels'])
+    outcome = {
+        'm1': {'files': len(m1), 'frames': sum(item['pixel_frames'] for item in m1),
+               'pixel_max': m1_max,
+               'passed': len(m1) == 11 and sum(item['pixel_frames'] for item in m1) == 420 and
+               m1_max <= 1 and all(item['passed'] and item['coefficient_mismatches'] == 0
+                                   and item['shader_errors'] == 0 and item['vulkan_frames'] ==
+                                   item['pixel_frames'] for item in m1)},
+        'm2': {'files': len(m2), 'frames': sum(item['frames'] for item in m2),
+               'pixel_max': m2_max,
+               'passed': len(m2) == 18 and sum(item['frames'] for item in m2) == 780 and
+               m2_max <= 1 and all(item['cpu_dx11_all_planes_passed'] for item in m2)},
+        'm3_alpha': {'files': m3['files'], 'frames': m3['frames'],
+                     'ayuv_max': m3['max_difference_ayuv'],
+                     'passed': m3['files'] == 24 and m3['frames'] == 48 and
+                     m3['max_difference_ayuv'][0] == 0 and
+                     max(m3['max_difference_ayuv'][1:]) <= 1},
+        'm4_yuv': {'files': len(m4_yuv), 'frames': sum(item['frames'] for item in m4_yuv),
+                   'pixel_max': m4_yuv_max,
+                   'passed': len(m4_yuv) == 4 and
+                   sum(item['frames'] for item in m4_yuv) == 180 and
+                   m4_yuv_max <= 1 and all(item['passed'] for item in m4_yuv)},
+        'm4_alpha': {'files': m4_alpha['files'], 'frames': m4_alpha['frames'],
+                     'ayuv_max': m4_alpha['max_difference_ayuv'],
+                     'passed': m4_alpha['files'] == 4 and m4_alpha['frames'] == 180 and
+                     m4_alpha['max_difference_ayuv'][0] == 0 and
+                     max(m4_alpha['max_difference_ayuv'][1:]) <= 1},
+        'public_hq': {'files': len(public), 'frames': sum(item['frames'] for item in public),
+                      'passed': len(public) == 4 and
+                      sum(item['frames'] for item in public) == 779 and
+                      all(item['passed'] and item['eos'] and item['direct_d3d11memory']
+                          and item['d3d11memory_frames'] == item['frames'] for item in public)},
+        'hq_direct_ab': {'pairs': performance['pairs'],
+                         'old_plugin_sha256': performance['old_plugin_sha256'],
+                         'new_plugin_sha256': performance['new_plugin_sha256'],
+                         'results': performance['results'],
+                         'passed': performance['pairs'] == 4 and
+                         performance['new_plugin_sha256'] == current_hash and
+                         len(performance['results']) == 2 and
+                         all(item['passed'] and item['change_percent'] >= -3
+                             for item in performance['results'])},
+    }
+    return outcome
 
 
 def main():
@@ -64,6 +126,7 @@ def main():
                                                        'bt2100-pq', 'bt2100-hlg'))
     asan_result = asan['result']
     asan_sources = [item['source'] for item in asan['sources']]
+    regressions = regression_checks()
     passed = (dynamic['passed'] and all(item['passed'] for item in rgb.values()) and
               all(item['passed'] and item['coefficient_mismatches'] == 0 and
                   item['shader_errors'] == 0 and item['pixel_max_difference'] <= 1
@@ -74,14 +137,16 @@ def main():
               asan_result['cases'] == 24000 and asan_result['seed_count'] == 6 and
               any('ap4h-odd.mov' in item for item in asan_sources) and
               any('apch-non16.mov' in item for item in asan_sources) and
-              all(converted.values()) and all(dynamic_convert.values()))
+              all(converted.values()) and all(dynamic_convert.values()) and
+              all(item['passed'] for item in regressions.values()))
     summary = {'milestone': 'M5', 'reference': 'fixed FFmpeg SDK CPU',
                'dynamic': dynamic['scenarios'], 'rgb': rgb,
                'coefficients': coefficients,
                'regression': {'smoke': smoke, 'asan': asan_result,
                               'asan_sources': asan_sources,
                               'standard_d3d11convert': converted,
-                              'dynamic_color_d3d11convert': dynamic_convert},
+                              'dynamic_color_d3d11convert': dynamic_convert,
+                              'full': regressions},
                'passed': passed}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n',
