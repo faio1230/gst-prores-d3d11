@@ -30,7 +30,7 @@ void require(bool value, const char* label) {
     if (!value) throw std::runtime_error(label);
 }
 struct AlphaJob {
-    std::uint32_t data_offset, data_size, mb_x, mb_y, mb_count, reserved;
+    std::uint32_t data_offset, data_size, mb_x, mb_y, mb_count, field_layout;
 };
 struct Parameters {
     std::uint32_t job_count, width, height, alpha_info_and_depth;
@@ -131,7 +131,9 @@ int main(int argc, char** argv) try {
     std::vector<AlphaJob> jobs;
     for (const auto& slice : parsed.slices) {
         const auto& alpha = slice.planes[3];
-        jobs.push_back({alpha.offset, alpha.size, slice.mb_x, slice.mb_y, slice.mb_count, 0});
+        jobs.push_back({alpha.offset, alpha.size, slice.mb_x, slice.mb_y, slice.mb_count,
+                        (parsed.frame_type ? 2u : 1u) |
+                            (static_cast<std::uint32_t>(slice.field_parity) << 8)});
     }
 
     std::ifstream shader_file(argv[2], std::ios::binary | std::ios::ate);

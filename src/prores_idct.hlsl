@@ -29,7 +29,7 @@ cbuffer Parameters : register(b0) {
     uint block_count;
     uint output_width;
     uint output_height;
-    uint mode; // low bit: chroma horizontal shift; bits 8..15: output depth
+    uint mode; // bit0: chroma shift; bit1: interlaced; bits 8..15: output depth
 };
 
 static const float basis[64] = {
@@ -75,7 +75,10 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID) {
     float bias = bit_depth == 12u ? 2048.0 : 512.0;
     int maximum = bit_depth == 12u ? 4091 : 1019;
     int value = clamp(int(round(bias + sum * scale)), 4, maximum);
-    uint2 destination = uint2(job.destination_x + x, job.destination_y + y);
+    uint field_row = (job.destination_y & 0xffffu) + y;
+    uint parity = job.destination_y >> 16;
+    uint2 destination = uint2(job.destination_x + x,
+        field_row * (1u + ((mode >> 1) & 1u)) + parity);
     uint plane_width = job.component == 0 ? output_width : output_width >> (mode & 1u);
     if (destination.x >= plane_width || destination.y >= output_height) return;
 #ifdef PRORES_OUTPUT_UNORM

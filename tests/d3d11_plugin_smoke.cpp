@@ -744,10 +744,91 @@ static void shared_device_instances(const char* path) {
     gst_object_unref(device);
 }
 
+static void interlaced_output(const char* path, GstVideoFieldOrder order, bool alpha,
+                              guint expected_frames) {
+    Pipeline pipeline(direct_pipeline);
+    pipeline.file(path);
+    pipeline.state(GST_STATE_PLAYING);
+    guint frames = 0;
+    while (auto* sample = pipeline.pull()) {
+        auto* caps = gst_sample_get_caps(sample);
+        auto* buffer = gst_sample_get_buffer(sample);
+        GstVideoInfo info{};
+        require(GST_BUFFER_PTS(buffer) == gst_util_uint64_scale(frames, GST_SECOND, 30),
+                "interlaced sequential PTS mismatch");
+        require(gst_video_info_from_caps(&info, caps), "interlaced caps invalid");
+        require(info.interlace_mode == GST_VIDEO_INTERLACE_MODE_INTERLEAVED &&
+                GST_VIDEO_INFO_FIELD_ORDER(&info) == order,
+                "interlaced field order mismatch");
+        require(GST_VIDEO_INFO_FORMAT(&info) == (alpha ? GST_VIDEO_FORMAT_AYUV64 :
+                                                   GST_VIDEO_FORMAT_I422_10LE),
+                "interlaced output format mismatch");
+        require(gst_caps_features_contains(gst_caps_get_features(caps, 0),
+                                           GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY),
+                "interlaced D3D11Memory caps missing");
+        require(GST_BUFFER_FLAG_IS_SET(buffer, GST_VIDEO_BUFFER_FLAG_INTERLACED) &&
+                GST_BUFFER_FLAG_IS_SET(buffer, GST_VIDEO_BUFFER_FLAG_TFF) ==
+                    (order == GST_VIDEO_FIELD_ORDER_TOP_FIELD_FIRST),
+                "interlaced buffer flags mismatch");
+        require(gst_buffer_n_memory(buffer) == (alpha ? 1u : 3u),
+                "interlaced D3D11 memory count mismatch");
+        for (guint i = 0; i < gst_buffer_n_memory(buffer); ++i)
+            require(gst_is_d3d11_memory(gst_buffer_peek_memory(buffer, i)),
+                    "interlaced output contains CPU memory");
+        gst_sample_unref(sample);
+        ++frames;
+    }
+    require(frames == expected_frames, "interlaced EOS count mismatch");
+    Pipeline seeking(direct_pipeline);
+    seeking.file(path);
+    seeking.state(GST_STATE_PLAYING);
+    auto* first = seeking.pull();
+    require(first != nullptr, "interlaced seek preroll missing");
+    gst_sample_unref(first);
+    require(gst_element_seek_simple(seeking.pipe, GST_FORMAT_TIME,
+        static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
+        gst_util_uint64_scale(15, GST_SECOND, 30)), "interlaced seek rejected");
+    for (guint i = 15; i < 18; ++i) {
+        auto* sample = seeking.pull();
+        require(sample != nullptr, "interlaced seek sample missing");
+        require(GST_BUFFER_PTS(gst_sample_get_buffer(sample)) ==
+                gst_util_uint64_scale(i, GST_SECOND, 30),
+                "interlaced seek PTS mismatch");
+        gst_sample_unref(sample);
+    }
+}
+
+static void reject_corrupt_second_field(GstSample* compressed) {
+    auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+    guint8 header_size[2]{};
+    require(gst_buffer_extract(input, 8, header_size, 2) == 2,
+            "field packet has no frame header");
+    const auto first = static_cast<gsize>(8 + (header_size[0] << 8) + header_size[1]);
+    guint8 picture_size[4]{};
+    require(gst_buffer_extract(input, first + 1, picture_size, 4) == 4,
+            "field packet has no first picture size");
+    const auto second = first +
+        (static_cast<gsize>(picture_size[0]) << 24) +
+        (static_cast<gsize>(picture_size[1]) << 16) +
+        (static_cast<gsize>(picture_size[2]) << 8) + picture_size[3];
+    require(second + 8 <= gst_buffer_get_size(input), "field packet has no second picture");
+    const guint8 invalid_header = 0;
+    require(gst_buffer_fill(input, second, &invalid_header, 1) == 1,
+            "cannot corrupt second picture header");
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+    auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+    gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+    pipeline.state(GST_STATE_PLAYING);
+    gst_app_src_push_buffer(GST_APP_SRC(source), input);
+    gst_app_src_end_of_stream(GST_APP_SRC(source));
+    gst_object_unref(source);
+    pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT);
+}
+
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
-    require(argc >= 2 && argc <= 4,
-            "d3d11_plugin_smoke 1080p60-hq.mov [2160p60-hq.mov] [alpha.mov]");
+    require(argc >= 2 && (argc <= 4 || argc == 8),
+            "d3d11_plugin_smoke hq.mov [4k.mov] [alpha.mov] [tff.mov bff.mov alpha-tff.mov alpha-bff.mov]");
     const auto capabilities = check_device_capabilities();
     GstBuffer* retained = nullptr;
     {
@@ -845,7 +926,7 @@ int main(int argc, char** argv) try {
     delayed_entropy_error(compressed);
     gst_sample_unref(compressed);
 
-    if (argc == 4) {
+    if (argc >= 4) {
         Pipeline demux("filesrc name=source ! qtdemux ! appsink name=sink sync=false max-buffers=1");
         demux.file(argv[3]);
         demux.state(GST_STATE_PLAYING);
@@ -853,6 +934,19 @@ int main(int argc, char** argv) try {
         require(alpha != nullptr, "alpha corruption fixture missing");
         alpha_entropy_error(alpha);
         gst_sample_unref(alpha);
+    }
+    if (argc == 8) {
+        interlaced_output(argv[4], GST_VIDEO_FIELD_ORDER_TOP_FIELD_FIRST, false, 30);
+        interlaced_output(argv[5], GST_VIDEO_FIELD_ORDER_BOTTOM_FIELD_FIRST, false, 30);
+        interlaced_output(argv[6], GST_VIDEO_FIELD_ORDER_TOP_FIELD_FIRST, true, 30);
+        interlaced_output(argv[7], GST_VIDEO_FIELD_ORDER_BOTTOM_FIELD_FIRST, true, 30);
+        Pipeline demux("filesrc name=source ! qtdemux ! appsink name=sink sync=false max-buffers=1");
+        demux.file(argv[4]);
+        demux.state(GST_STATE_PLAYING);
+        auto* compressed_field = demux.pull();
+        require(compressed_field != nullptr, "interlaced corruption fixture missing");
+        reject_corrupt_second_field(compressed_field);
+        gst_sample_unref(compressed_field);
     }
 
     {
@@ -881,7 +975,8 @@ int main(int argc, char** argv) try {
                  "\"r16_format_support\":" << capabilities.r16_support << ","
                  "\"software_adapter_decoder_rejected\":true,"
                  "\"software_adapter_rgb_rejected\":true,\"error_cases\":"
-              << (argc == 4 ? 16 : 15) << ","
+              << (argc == 8 ? 17 : argc >= 4 ? 16 : 15) << ",\"interlaced_cases\":"
+              << (argc == 8 ? 4 : 0) << ","
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;

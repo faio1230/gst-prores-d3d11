@@ -29,6 +29,7 @@ struct Slice {
     std::uint16_t mb_y = 0;
     std::uint16_t mb_count = 0;
     std::uint8_t quant_index = 0;
+    std::uint8_t field_parity = 0;
     std::array<Plane, 4> planes{};
 };
 
@@ -39,6 +40,8 @@ struct Frame {
     std::uint16_t mb_height = 0;
     std::uint8_t chroma_shift = 1;
     std::uint8_t bit_depth = 10;
+    // 0: progressive, 1: top field first, 2/3: bottom field first (FFmpeg n8.1).
+    std::uint8_t frame_type = 0;
     // 0: opaque, 1: 8-bit alpha, 2: 16-bit alpha.
     std::uint8_t alpha_info = 0;
     std::uint8_t color_primaries = 0;
@@ -49,7 +52,8 @@ struct Frame {
     std::vector<Slice> slices;
 };
 
-// One complete progressive ProRes frame. Bit depth comes from the container
+// One complete ProRes frame (one progressive picture or two field pictures).
+// Bit depth comes from the container
 // FourCC; chroma sampling and alpha depth come from the frame header. The
 // Callers must opt in to alpha so legacy alpha-free checks remain explicit.
 bool parse_frame(const std::uint8_t* data, std::size_t size,
@@ -62,16 +66,18 @@ struct CoefficientJob {
     std::uint32_t data_size = 0;
     std::uint32_t block_count = 0;
     std::uint32_t output_offset = 0;
+    std::uint32_t interlaced_scan = 0;
 };
 
 struct IdctBlockJob {
     std::uint32_t coefficient_offset = 0;
     std::uint32_t destination_x = 0;
-    std::uint32_t destination_y = 0;
+    std::uint32_t destination_y = 0; // 下位16bit: フィールド内行、bit16: 出力行の偶奇
     std::uint32_t component = 0;
     std::uint32_t quant_scale = 0;
     std::uint32_t matrix_offset = 0;
 };
+static_assert(sizeof(IdctBlockJob) == 24);
 
 void make_coefficient_jobs(const Frame& frame,
                            std::vector<CoefficientJob>& jobs,

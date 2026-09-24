@@ -1,4 +1,4 @@
-// ProRes progressive 4:2:2 entropy decoder and inverse scan.
+// ProRes 4:2:2/4:4:4 entropy decoder and progressive/interlaced inverse scan.
 // Derived from FFmpeg's LGPL-2.1-or-later proresdec.c/prores_vld.comp.glsl.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
@@ -9,6 +9,7 @@ struct CoefficientJob {
     uint data_size;
     uint block_count;
     uint output_offset;
+    uint interlaced_scan;
 };
 
 StructuredBuffer<CoefficientJob> jobs : register(t1);
@@ -31,6 +32,16 @@ static const uint progressive_scan[64] = {
     49, 56, 57, 50, 43, 36, 37, 44,
     51, 58, 59, 52, 45, 38, 39, 46,
     53, 60, 61, 54, 47, 55, 62, 63,
+};
+static const uint interlaced_scan[64] = {
+     0,  8,  1,  9, 16, 24, 17, 25,
+     2, 10,  3, 11, 18, 26, 19, 27,
+    32, 40, 33, 34, 41, 48, 56, 49,
+    42, 35, 43, 50, 57, 58, 51, 59,
+     4, 12,  5,  6, 13, 20, 28, 21,
+    14,  7, 15, 22, 29, 36, 44, 37,
+    30, 23, 31, 38, 45, 52, 60, 53,
+    46, 39, 47, 54, 61, 62, 55, 63,
 };
 
 static const uint dc_codebook[7] = {
@@ -224,7 +235,9 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
         uint block = position & block_mask;
         uint scan_index = position >> log2_block_count;
         int value = negative ? -int(level) : int(level);
-        coefficients[job.output_offset + block * 64 + progressive_scan[scan_index]] = value;
+        uint natural_index = job.interlaced_scan != 0 ?
+            interlaced_scan[scan_index] : progressive_scan[scan_index];
+        coefficients[job.output_offset + block * 64 + natural_index] = value;
         if (reader.failed) break;
     }
     if (reader.failed) errors[job_index] = 2;

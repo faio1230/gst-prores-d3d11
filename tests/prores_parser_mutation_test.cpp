@@ -51,6 +51,7 @@ std::vector<std::uint8_t> read_frame(const std::string& path) {
 
 void check_frame_bounds(const prores::Frame& frame, std::size_t size) {
     std::uint64_t covered = 0;
+    std::uint64_t field_covered[2]{};
     for (const auto& slice : frame.slices) {
         require(slice.offset <= size && slice.size <= size - slice.offset,
                 "slice exceeds frame");
@@ -58,7 +59,10 @@ void check_frame_bounds(const prores::Frame& frame, std::size_t size) {
         require(slice.mb_count >= 1 && slice.mb_count <= 8, "invalid macroblock count");
         require(static_cast<unsigned>(slice.mb_x) + slice.mb_count <= frame.mb_width &&
                 slice.mb_y < frame.mb_height, "slice exceeds picture grid");
+        require(slice.field_parity <= 1 && (frame.frame_type || slice.field_parity == 0),
+                "invalid field parity");
         covered += slice.mb_count;
+        field_covered[slice.field_parity] += slice.mb_count;
         for (unsigned component = 0; component < (frame.alpha_info ? 4u : 3u); ++component) {
             const auto& plane = slice.planes[component];
             require(plane.offset >= slice.offset && plane.offset <= slice_end &&
@@ -68,7 +72,9 @@ void check_frame_bounds(const prores::Frame& frame, std::size_t size) {
                     "plane exceeds slice");
         }
     }
-    require(covered == static_cast<std::uint64_t>(frame.mb_width) * frame.mb_height,
+    const auto picture_coverage = static_cast<std::uint64_t>(frame.mb_width) * frame.mb_height;
+    require(field_covered[0] == picture_coverage &&
+            field_covered[1] == (frame.frame_type ? picture_coverage : 0),
             "slice coverage differs from picture grid");
     std::vector<prores::CoefficientJob> jobs;
     std::uint32_t coefficient_count = 0;
@@ -114,7 +120,7 @@ void mutate(std::vector<std::uint8_t>& bytes, const prores::Frame& seed,
     case 6: {
         const auto picture = 8 + be16(bytes.data() + 8);
         const auto index = picture + (bytes[picture] >> 3);
-        const auto chosen = random.index(seed.slices.size());
+        const auto chosen = random.index(seed.slices.size() / (seed.frame_type ? 2u : 1u));
         const auto offset = random.next() & 1 ? index + chosen * 2 :
                             static_cast<std::size_t>(seed.slices[chosen].offset);
         bytes[offset + random.index(2)] = static_cast<std::uint8_t>(random.next());

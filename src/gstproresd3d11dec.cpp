@@ -123,7 +123,7 @@ struct IdctParameters {
 };
 
 struct AlphaJob {
-    std::uint32_t data_offset, data_size, mb_x, mb_y, mb_count, reserved;
+    std::uint32_t data_offset, data_size, mb_x, mb_y, mb_count, field_layout;
 };
 
 struct AlphaParameters {
@@ -307,7 +307,9 @@ public:
             for (const auto& slice : parsed.slices) {
                 const auto& plane = slice.planes[3];
                 alpha_jobs.push_back({plane.offset, plane.size, slice.mb_x, slice.mb_y,
-                                      slice.mb_count, 0});
+                                      slice.mb_count,
+                                      (parsed.frame_type ? 2u : 1u) |
+                                          (static_cast<std::uint32_t>(slice.field_parity) << 8)});
             }
         }
         mark(&CpuDecodeTiming::coefficient_jobs_ms);
@@ -384,7 +386,8 @@ public:
             static_cast<std::uint32_t>(coefficient_jobs.size()), coefficient_count};
         const IdctParameters idct_parameter_values{
             static_cast<std::uint32_t>(idct_jobs.size()), parsed.width, parsed.height,
-            static_cast<std::uint32_t>(parsed.bit_depth << 8) | parsed.chroma_shift};
+            static_cast<std::uint32_t>(parsed.bit_depth << 8) | parsed.chroma_shift |
+                (parsed.frame_type ? 2u : 0u)};
         std::vector<std::uint32_t> quant_matrices;
         quant_matrices.reserve(128);
         for (auto value : parsed.luma_quant_matrix) quant_matrices.push_back(value);
@@ -675,6 +678,7 @@ private:
         std::uint16_t mb_x = 0;
         std::uint16_t mb_y = 0;
         std::uint16_t mb_count = 0;
+        std::uint8_t field_parity = 0;
         std::uint32_t quant_scale = 0;
         std::size_t job_begin = 0;
         std::size_t job_end = 0;
@@ -691,6 +695,7 @@ private:
         bool same_layout = idct_layout_width_ == parsed.width &&
                            idct_layout_height_ == parsed.height &&
                            idct_layout_chroma_shift_ == parsed.chroma_shift &&
+                           idct_layout_frame_type_ == parsed.frame_type &&
                            idct_layout_.size() == parsed.slices.size() &&
                            coefficient_jobs.size() == parsed.slices.size() * 3;
         if (same_layout && (idct_layout_.empty() ||
@@ -702,6 +707,7 @@ private:
                 const auto& layout = idct_layout_[i];
                 if (layout.mb_x != slice.mb_x || layout.mb_y != slice.mb_y ||
                     layout.mb_count != slice.mb_count ||
+                    layout.field_parity != slice.field_parity ||
                     layout.job_begin > layout.job_end ||
                     layout.job_end > idct_jobs_.size() ||
                     layout.job_end - layout.job_begin != static_cast<std::size_t>(slice.mb_count) *
@@ -722,12 +728,14 @@ private:
                 const auto job_end = job_begin + static_cast<std::size_t>(slice.mb_count) *
                     (parsed.chroma_shift ? 8 : 12);
                 idct_layout_.push_back({slice.mb_x, slice.mb_y, slice.mb_count,
+                                        slice.field_parity,
                                         quant_scale, job_begin, job_end});
                 job_begin = job_end;
             }
             idct_layout_width_ = parsed.width;
             idct_layout_height_ = parsed.height;
             idct_layout_chroma_shift_ = parsed.chroma_shift;
+            idct_layout_frame_type_ = parsed.frame_type;
             return {true, true, static_cast<std::uint32_t>(parsed.slices.size())};
         }
         IdctJobUpdate update{};
@@ -869,6 +877,7 @@ private:
     std::uint16_t idct_layout_width_ = 0;
     std::uint16_t idct_layout_height_ = 0;
     std::uint8_t idct_layout_chroma_shift_ = 1;
+    std::uint8_t idct_layout_frame_type_ = 0;
 };
 
 }  // namespace
@@ -889,6 +898,7 @@ typedef struct _GstProresD3D11Dec {
     GstVideoFormat output_format;
     guint output_bit_depth;
     guint output_chroma_shift;
+    guint output_frame_type;
     gboolean cpu_timing;
     guint64 cpu_timing_sequence;
 } GstProresD3D11Dec;
@@ -902,13 +912,13 @@ enum { PROP_0, PROP_ADAPTER, PROP_SHADER_DIRECTORY };
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
     "sink", GST_PAD_SINK, GST_PAD_ALWAYS,
     GST_STATIC_CAPS("video/x-prores, variant=(string){ proxy, lt, standard, hq, 4444, 4444xq }, width=(int)[16,8192], "
-                    "height=(int)[16,8192], interlace-mode=(string)progressive"));
+                    "height=(int)[16,8192], interlace-mode=(string){ progressive, interleaved }"));
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src", GST_PAD_SRC, GST_PAD_ALWAYS,
     GST_STATIC_CAPS("video/x-raw(memory:D3D11Memory), "
                     "format=(string){ I422_10LE, Y444_10LE, I422_12LE, Y444_12LE, AYUV64 }, "
                     "width=(int)[16,8192], height=(int)[16,8192], "
-                    "interlace-mode=(string)progressive"));
+                    "interlace-mode=(string){ progressive, interleaved }"));
 
 static void clear_format(GstProresD3D11Dec* self) {
     if (self->input) gst_video_codec_state_unref(self->input);
@@ -979,10 +989,11 @@ static gboolean set_format(GstVideoDecoder* decoder, GstVideoCodecState* state) 
         (g_strcmp0(variant, "proxy") != 0 && g_strcmp0(variant, "lt") != 0 &&
          g_strcmp0(variant, "standard") != 0 && g_strcmp0(variant, "hq") != 0 &&
          g_strcmp0(variant, "4444") != 0 && g_strcmp0(variant, "4444xq") != 0) ||
-        (interlace && g_strcmp0(interlace, "progressive") != 0) ||
+        (interlace && g_strcmp0(interlace, "progressive") != 0 &&
+         g_strcmp0(interlace, "interleaved") != 0) ||
         width < 16 || width > 8192 || height < 16 || height > 8192 || (width & 1)) {
         GST_ELEMENT_ERROR(self, STREAM, FORMAT,
-            ("Only progressive ProRes 422/444 10/12-bit is supported"),
+            ("Only progressive/interleaved ProRes 422/444 10/12-bit is supported"),
             ("caps: %" GST_PTR_FORMAT, state->caps));
         return FALSE;
     }
@@ -998,12 +1009,17 @@ static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& p
         self->color_trc == parsed.transfer_characteristic &&
         self->color_matrix == parsed.matrix_coefficients &&
         self->output_format == format && self->output_bit_depth == parsed.bit_depth &&
-        self->output_chroma_shift == parsed.chroma_shift) return TRUE;
+        self->output_chroma_shift == parsed.chroma_shift &&
+        self->output_frame_type == parsed.frame_type) return TRUE;
     auto* decoder = GST_VIDEO_DECODER(self);
     auto* state = gst_video_decoder_set_output_state(decoder, format,
                                                       parsed.width, parsed.height, self->input);
     if (!state) return FALSE;
-    state->info.interlace_mode = GST_VIDEO_INTERLACE_MODE_PROGRESSIVE;
+    state->info.interlace_mode = parsed.frame_type ?
+        GST_VIDEO_INTERLACE_MODE_INTERLEAVED : GST_VIDEO_INTERLACE_MODE_PROGRESSIVE;
+    GST_VIDEO_INFO_FIELD_ORDER(&state->info) = parsed.frame_type == 1 ?
+        GST_VIDEO_FIELD_ORDER_TOP_FIELD_FIRST : parsed.frame_type ?
+        GST_VIDEO_FIELD_ORDER_BOTTOM_FIELD_FIRST : GST_VIDEO_FIELD_ORDER_UNKNOWN;
     state->info.colorimetry.range = GST_VIDEO_COLOR_RANGE_16_235;
     state->info.colorimetry.matrix = gst_video_color_matrix_from_iso(parsed.matrix_coefficients);
     state->info.colorimetry.primaries = gst_video_color_primaries_from_iso(parsed.color_primaries);
@@ -1037,6 +1053,7 @@ static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& p
     self->output_format = format;
     self->output_bit_depth = parsed.bit_depth;
     self->output_chroma_shift = parsed.chroma_shift;
+    self->output_frame_type = parsed.frame_type;
     self->negotiated = TRUE;
     return TRUE;
 }
@@ -1128,6 +1145,11 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
         gst_buffer_unmap(frame->input_buffer, &input);
         gst_video_decoder_drop_frame(decoder, frame);
         return flow;
+    }
+    if (parsed.frame_type) {
+        GST_BUFFER_FLAG_SET(frame->output_buffer, GST_VIDEO_BUFFER_FLAG_INTERLACED);
+        if (parsed.frame_type == 1)
+            GST_BUFFER_FLAG_SET(frame->output_buffer, GST_VIDEO_BUFFER_FLAG_TFF);
     }
     const auto allocate_ms = phase_ms();
     CpuDecodeTiming decode_timing{};

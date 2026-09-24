@@ -292,8 +292,9 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
     mutation[20] &= static_cast<std::uint8_t>(~0xc0);
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "invalid-chroma");
     mutation = packet.bytes;
-    mutation[20] |= 4;
-    expect_rejection(std::move(mutation), parsed.width, parsed.height, "interlace");
+    mutation[20] = static_cast<std::uint8_t>((mutation[20] & ~0x0cu) |
+        (parsed.frame_type ? 0u : 4u));
+    expect_rejection(std::move(mutation), parsed.width, parsed.height, "field-picture-count");
     mutation = packet.bytes;
     mutation[25] = static_cast<std::uint8_t>((mutation[25] & 0xf0) | 3u);
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "alpha");
@@ -531,7 +532,8 @@ int main(int argc, char** argv) try {
     }
     const std::vector<IdctParameters> idct_parameter_values{{
         static_cast<std::uint32_t>(idct_jobs.size()), frame.width, frame.height,
-        static_cast<std::uint32_t>(frame.bit_depth << 8) | frame.chroma_shift}};
+        static_cast<std::uint32_t>(frame.bit_depth << 8) | frame.chroma_shift |
+            (frame.frame_type ? 2u : 0u)}};
     auto idct_parameter_buffer = immutable_buffer(device.Get(), idct_parameter_values,
                                                    D3D11_BIND_CONSTANT_BUFFER);
     ID3D11ShaderResourceView* idct_srvs[] = {

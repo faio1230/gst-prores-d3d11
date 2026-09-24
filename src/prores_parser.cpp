@@ -23,6 +23,16 @@ constexpr std::array<std::uint8_t, 64> kProgressiveScan = {
     51, 58, 59, 52, 45, 38, 39, 46,
     53, 60, 61, 54, 47, 55, 62, 63,
 };
+constexpr std::array<std::uint8_t, 64> kInterlacedScan = {
+     0,  8,  1,  9, 16, 24, 17, 25,
+     2, 10,  3, 11, 18, 26, 19, 27,
+    32, 40, 33, 34, 41, 48, 56, 49,
+    42, 35, 43, 50, 57, 58, 51, 59,
+     4, 12,  5,  6, 13, 20, 28, 21,
+    14,  7, 15, 22, 29, 36, 44, 37,
+    30, 23, 31, 38, 45, 52, 60, 53,
+    46, 39, 47, 54, 61, 62, 55, 63,
+};
 
 constexpr std::array<std::uint8_t, 7> kDcCodebook = {
     0x04, 0x28, 0x28, 0x4d, 0x4d, 0x70, 0x70,
@@ -128,7 +138,7 @@ std::int32_t to_signed(std::uint32_t value) {
 
 bool decode_plane(const std::uint8_t* data, std::size_t size,
                   std::uint32_t block_count, std::int32_t* output,
-                  std::string& error) {
+                  const std::array<std::uint8_t, 64>& scan, std::string& error) {
     if (!block_count || block_count > 32 || (block_count & (block_count - 1)))
         return fail(error, "invalid coefficient block count");
     if (!size) {
@@ -184,7 +194,7 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
         if (run >= max_coefficients || position > max_coefficients - run - 1)
             return fail(error, "AC run exceeds coefficient plane");
         // Equality would advance one past the last coefficient and index
-        // kProgressiveScan[64]. Keep a distinct error for the regression case.
+        // scan[64]. Keep a distinct error for the regression case.
         if (position == max_coefficients - run - 1)
             return fail(error, "AC run reaches coefficient plane end");
         position += run + 1;
@@ -199,7 +209,7 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
                                             static_cast<std::int32_t>(level);
         const auto block = position & block_mask;
         const auto scan_index = position >> log2_block_count;
-        output[block * 64 + kProgressiveScan[scan_index]] = coefficient;
+        output[block * 64 + scan[scan_index]] = coefficient;
     }
     return true;
 }
@@ -231,11 +241,11 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     if (!output.width || !output.height || (output.width & 1) ||
         (expected_width && output.width != expected_width) ||
         (expected_height && output.height != expected_height))
-        return fail(error, "frame dimensions do not match progressive caps");
+        return fail(error, "frame dimensions do not match caps");
     if ((header[12] & 0xc0) != 0x80 && (header[12] & 0xc0) != 0xc0)
         return fail(error, "unsupported ProRes chroma format");
     output.chroma_shift = (header[12] & 0xc0) == 0xc0 ? 0 : 1;
-    if (((header[12] >> 2) & 3) != 0) return fail(error, "interlaced ProRes is unsupported");
+    output.frame_type = (header[12] >> 2) & 3;
     output.alpha_info = header[17] & 0x0f;
     if (output.alpha_info > 2) return fail(error, "invalid ProRes alpha depth");
     if (output.alpha_info && !allow_alpha)
@@ -260,8 +270,14 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
         output.chroma_quant_matrix = output.luma_quant_matrix;
     }
 
-    const std::size_t picture_offset = 8 + header_size;
-    if (picture_offset + 8 > size) return fail(error, "missing picture header");
+    std::size_t picture_offset = 8 + header_size;
+    output.mb_width = static_cast<std::uint16_t>((output.width + 15) >> 4);
+    output.mb_height = static_cast<std::uint16_t>(output.frame_type ?
+        (output.height + 31) >> 5 : (output.height + 15) >> 4);
+    const unsigned picture_count = output.frame_type ? 2u : 1u;
+    for (unsigned picture_index = 0; picture_index < picture_count; ++picture_index) {
+    if (picture_offset > size || size - picture_offset < 8)
+        return fail(error, "missing field picture header");
     const auto* picture = data + picture_offset;
     const auto picture_header_size = picture[0] >> 3;
     const auto picture_size = read_be32(picture + 1);
@@ -271,22 +287,11 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
         picture_size < static_cast<std::uint32_t>(picture_header_size))
         return fail(error, "invalid picture data size");
     const auto picture_end = picture_offset + picture_size;
-    // Recorders may pad the outer frame to 512 bytes (possibly with nonzero
-    // bytes) or use a small all-zero trailer.  The indexed picture still has
-    // to end exactly at its own size; the trailer is not entropy data.
-    const auto trailer_size = size - picture_end;
-    if (trailer_size && (trailer_size >= 512 ||
-        ((size & 511) != 0 &&
-         !std::all_of(data + picture_end, data + size,
-                      [](std::uint8_t byte) { return byte == 0; }))))
-        return fail(error, "progressive frame has an invalid picture trailer");
     const unsigned log2_slice_width = picture[7] >> 4;
     const unsigned log2_slice_height = picture[7] & 15;
     if (log2_slice_width > 3 || log2_slice_height)
         return fail(error, "unsupported slice dimensions");
     const std::uint16_t nominal_slice_width = static_cast<std::uint16_t>(1u << log2_slice_width);
-    output.mb_width = static_cast<std::uint16_t>((output.width + 15) >> 4);
-    output.mb_height = static_cast<std::uint16_t>((output.height + 15) >> 4);
     const auto remainder = output.mb_width & (nominal_slice_width - 1);
     const auto slice_count = static_cast<std::size_t>(output.mb_height) *
         ((output.mb_width >> log2_slice_width) +
@@ -299,7 +304,7 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     std::uint16_t mb_x = 0;
     std::uint16_t mb_y = 0;
     std::uint16_t mb_count = nominal_slice_width;
-    output.slices.reserve(slice_count);
+    output.slices.reserve(output.slices.size() + slice_count);
     for (std::size_t i = 0; i < slice_count; ++i) {
         const auto slice_size = read_be16(index + i * 2);
         while (output.mb_width - mb_x < mb_count) mb_count >>= 1;
@@ -334,6 +339,8 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
         slice.mb_x = mb_x;
         slice.mb_y = mb_y;
         slice.mb_count = mb_count;
+        slice.field_parity = output.frame_type == 0 ? 0 :
+            static_cast<std::uint8_t>(output.frame_type == 1 ? picture_index : 1u - picture_index);
         slice.quant_index = std::clamp<std::uint8_t>(slice_data[1], 1, 224);
         auto plane_offset = slice_offset + slice_header_size;
         slice.planes[0] = {static_cast<std::uint32_t>(plane_offset), y_size};
@@ -357,6 +364,23 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     }
     if (mb_x || mb_y != output.mb_height || slice_offset != picture_offset + picture_size)
         return fail(error, "slice table does not cover the picture exactly");
+    picture_offset = picture_end;
+    }
+    // Recorders may pad the outer frame to 512 bytes (possibly with nonzero
+    // bytes) or use a small all-zero trailer, but never between two fields.
+    const auto trailer_size = size - picture_offset;
+    // A progressive packet must not silently treat another indexed picture
+    // as recorder padding when its frame_type bit is corrupt.
+    if (!output.frame_type && trailer_size >= 8 &&
+        (data[picture_offset] >> 3) >= 8 &&
+        read_be32(data + picture_offset + 1) >= 8 &&
+        read_be32(data + picture_offset + 1) <= trailer_size)
+        return fail(error, "progressive frame contains a second picture");
+    if (trailer_size && (trailer_size >= 512 ||
+        ((size & 511) != 0 &&
+         !std::all_of(data + picture_offset, data + size,
+                      [](std::uint8_t byte) { return byte == 0; }))))
+        return fail(error, "frame has an invalid picture trailer");
     return true;
 }
 
@@ -371,7 +395,8 @@ void make_coefficient_jobs(const Frame& frame,
             const auto& plane = slice.planes[component];
             const auto block_count = static_cast<std::uint32_t>(slice.mb_count) *
                                      (component == 0 || frame.chroma_shift == 0 ? 4u : 2u);
-            jobs.push_back({plane.offset, plane.size, block_count, coefficient_count});
+            jobs.push_back({plane.offset, plane.size, block_count, coefficient_count,
+                            frame.frame_type ? 1u : 0u});
             coefficient_count += block_count * 64;
         }
     }
@@ -397,7 +422,8 @@ bool make_coefficient_reference(const std::uint8_t* data, std::size_t size,
             context << "slice " << slice_index << " component " << component << ": ";
             std::string detail;
             if (!decode_plane(data + job.data_offset, job.data_size, job.block_count,
-                              coefficients.data() + job.output_offset, detail))
+                              coefficients.data() + job.output_offset,
+                              job.interlaced_scan ? kInterlacedScan : kProgressiveScan, detail))
                 return fail(error, context.str() + detail);
         }
     }
@@ -437,7 +463,8 @@ void make_idct_jobs(const Frame& frame,
                 idct_jobs.push_back({
                     coefficient_job.output_offset + block * 64,
                     base_x + block_x * 8,
-                    base_y + block_y * 8,
+                    (base_y + block_y * 8) |
+                        (static_cast<std::uint32_t>(slice.field_parity) << 16),
                     component,
                     quant_scale,
                     component ? 64u : 0u,

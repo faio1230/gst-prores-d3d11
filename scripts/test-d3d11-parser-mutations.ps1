@@ -44,7 +44,10 @@ $sources = @(
 $packets = @()
 $hashes = @()
 foreach ($name in $sources) {
-    $source = Join-Path $root "media/$name"
+    $candidate = Join-Path $root $name
+    $source = if (Test-Path -LiteralPath $candidate) { $candidate } else {
+        Join-Path $root "media/$name"
+    }
     if (!(Test-Path -LiteralPath $source)) { throw "検査素材がありません: $source" }
     $seedName = [IO.Path]::GetFileName($name)
     $packet = Join-Path $seedDir "$seedName.packet"

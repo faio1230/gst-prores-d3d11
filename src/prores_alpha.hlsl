@@ -11,7 +11,7 @@ struct AlphaJob {
     uint mb_x;
     uint mb_y;
     uint mb_count;
-    uint reserved;
+    uint field_layout; // low byte: row stride; next byte: field parity
 };
 StructuredBuffer<AlphaJob> jobs : register(t1);
 RWTexture2D<uint> alpha_plane : register(u0);
@@ -61,7 +61,8 @@ uint scaled_alpha(uint value, uint alpha_info, uint depth) {
 void write_alpha(uint position, uint sample, AlphaJob job) {
     uint row_width = job.mb_count * 16u;
     uint x = job.mb_x * 16u + position % row_width;
-    uint y = job.mb_y * 16u + position / row_width;
+    uint y = (job.mb_y * 16u + position / row_width) * (job.field_layout & 255u) +
+        ((job.field_layout >> 8) & 255u);
     if (x < width && y < height)
         alpha_plane[uint2(x, y)] = sample;
 }
