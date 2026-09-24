@@ -102,8 +102,11 @@ try {
                 rendered = $metrics.rendered
                 decoder_qos_missing = $metrics.stages.missing_after_decoder_count
                 sink_dropped = $metrics.dropped
-                wait_p99_ms = $wait.p99; wait_max_ms = $wait.max
+                wait_p99_ms = $wait.p99; wait_p99_9_ms = $wait.p99_9
+                wait_max_ms = $wait.max
                 decode_p99_ms = $cpu.field_ms.backend_ms.p99
+                retire_internal_over_20ms_count = $cpu.retire_internal_over_20ms_count
+                top_retire_wait_rows = $cpu.top_retire_wait_rows
                 plugin_sha256 = $hashes[$variant]
             }
             $records | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath `

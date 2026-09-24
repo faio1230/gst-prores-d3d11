@@ -15,11 +15,12 @@ FIELDS = ("coefficient_jobs_ms", "idct_jobs_ms", "cache_ms", "upload_ms",
 def distribution(rows, field):
     values = sorted(row[field] for row in rows)
     if not values:
-        return {"p50": None, "p95": None, "p99": None, "max": None}
+        return {"p50": None, "p95": None, "p99": None, "p99_9": None, "max": None}
     return {
         "p50": values[math.floor((len(values) - 1) * 0.50)],
         "p95": values[math.floor((len(values) - 1) * 0.95)],
         "p99": values[math.floor((len(values) - 1) * 0.99)],
+        "p99_9": values[math.floor((len(values) - 1) * 0.999)],
         "max": values[-1],
     }
 
@@ -69,6 +70,9 @@ def main():
             row["copy_ready_wait_ms"] = float(fields["copy_ready_wait_ms"])
         if "retire_wait_ms" in fields:
             row["retire_wait_ms"] = float(fields["retire_wait_ms"])
+        for optional in ("retire_device_lock_ms", "retire_flush_ms", "retire_map_ms"):
+            if optional in fields:
+                row[optional] = float(fields[optional])
         if "retire_map_attempts" in fields:
             row["retire_map_attempts"] = int(fields["retire_map_attempts"])
         if "map_attempts" in fields:
@@ -140,6 +144,55 @@ def main():
         summary["field_ms"]["retire_wait_ms"] = distribution(rows, "retire_wait_ms")
         summary["retire_map_attempts"] = sum(row.get("retire_map_attempts", 0)
                                               for row in rows)
+        component_fields = ("retire_device_lock_ms", "retire_flush_ms", "retire_map_ms")
+        for field in component_fields:
+            count = sum(field in row for row in rows)
+            if count not in (0, expected):
+                raise ValueError(f"リング回収の{field}が一部フレームで欠けています")
+            if count:
+                summary["field_ms"][field] = distribution(rows, field)
+        if all(field in rows[0] for field in component_fields):
+            summary["retire_internal_over_20ms_count"] = sum(
+                sum(row[field] for field in component_fields) > 20.0 for row in rows)
+        stage_csv = args.trial_json.with_suffix(".stages.csv")
+        sink_times = {}
+        if stage_csv.exists():
+            last_pts = {}
+            loop_by_stage = {}
+            with stage_csv.open(newline="", encoding="utf-8-sig") as stream:
+                for item in csv.DictReader(stream):
+                    stage = item["stage"]
+                    if stage not in ("sink_push", "sink_return"):
+                        continue
+                    pts_ns = int(item["pts_ns"])
+                    loop = loop_by_stage.get(stage, 0) + int(
+                        stage in last_pts and pts_ns < last_pts[stage])
+                    last_pts[stage] = pts_ns
+                    loop_by_stage[stage] = loop
+                    sink_times.setdefault((loop, pts_ns), {})[stage + "_wall_ms"] = float(
+                        item["wall_ms"])
+        def top_wait_row(row):
+            previous = rows[row["seq"] - 1] if row["seq"] else None
+            key = (row["seq"] // source_frames, row["pts_ns"])
+            previous_key = ((previous["seq"] // source_frames, previous["pts_ns"])
+                            if previous else None)
+            result = {
+                "seq": row["seq"], "loop": key[0], "pts_ns": key[1],
+                "retire_wait_ms": row["retire_wait_ms"],
+                "retire_map_attempts": row.get("retire_map_attempts"),
+                "previous_finish_ms": previous["finish_ms"] if previous else None,
+                "previous_pts_ns": previous["pts_ns"] if previous else None,
+                "sink_current": sink_times.get(key),
+                "sink_previous": sink_times.get(previous_key),
+            }
+            for field in component_fields:
+                result[field] = row.get(field)
+            if all(field in row for field in component_fields):
+                result["retire_other_ms"] = max(0.0, row["retire_wait_ms"] - sum(
+                    row[field] for field in component_fields))
+            return result
+        summary["top_retire_wait_rows"] = [top_wait_row(row) for row in sorted(
+            rows, key=lambda row: row["retire_wait_ms"], reverse=True)[:5]]
     if all("idct_gpu_upload" in row for row in rows):
         summary["idct_cache"] = {
             "layout_rebuild_frames": sum(row["idct_layout_rebuilt"] for row in rows),
