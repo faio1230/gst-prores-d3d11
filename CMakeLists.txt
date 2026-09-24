@@ -40,8 +40,10 @@ if(BUILD_GSTREAMER_PLUGIN)
 
   add_library(gstproresd3d11 MODULE src/gstproresd3d11dec.cpp src/gstproresd3d11rgb.cpp
     src/prores_parser.cpp src/d3d11_bounded_map.hpp
-    src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl)
+    src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl
+    src/prores_alpha.hlsl src/prores_pack_alpha.hlsl src/prores_rgb_alpha.hlsl)
   set_source_files_properties(src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl
+    src/prores_alpha.hlsl src/prores_pack_alpha.hlsl src/prores_rgb_alpha.hlsl
     PROPERTIES HEADER_FILE_ONLY TRUE)
   target_include_directories(gstproresd3d11 PRIVATE "${CMAKE_SOURCE_DIR}/src"
     "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
@@ -71,6 +73,15 @@ if(BUILD_GSTREAMER_PLUGIN)
     COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
       /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_rgb.cso"
       "${CMAKE_SOURCE_DIR}/src/prores_rgb.hlsl"
+    COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
+      /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_alpha.cso"
+      "${CMAKE_SOURCE_DIR}/src/prores_alpha.hlsl"
+    COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
+      /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_pack_alpha.cso"
+      "${CMAKE_SOURCE_DIR}/src/prores_pack_alpha.hlsl"
+    COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
+      /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_rgb_alpha.cso"
+      "${CMAKE_SOURCE_DIR}/src/prores_rgb_alpha.hlsl"
     COMMENT "DX11 ProRes shaderをcs_5_0 bytecodeへコンパイル")
   add_custom_command(TARGET gstproresd3d11 POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -79,6 +90,12 @@ if(BUILD_GSTREAMER_PLUGIN)
       "${CMAKE_SOURCE_DIR}/src/prores_idct.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_idct.hlsl"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
       "${CMAKE_SOURCE_DIR}/src/prores_rgb.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_rgb.hlsl"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/src/prores_alpha.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_alpha.hlsl"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/src/prores_pack_alpha.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_pack_alpha.hlsl"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/src/prores_rgb_alpha.hlsl" "$<TARGET_FILE_DIR:gstproresd3d11>/prores_rgb_alpha.hlsl"
     COMMENT "DX11 ProRes shaderをプラグイン出力先へ配置")
   if(MSVC)
     target_compile_options(gstproresd3d11 PRIVATE /W4 /utf-8)
@@ -198,6 +215,32 @@ target_link_libraries(prores_dx11_coeff PRIVATE avformat avcodec avutil d3d11 dx
 target_compile_definitions(prores_dx11_coeff PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
   target_compile_options(prores_dx11_coeff PRIVATE /W4 /utf-8)
+endif()
+
+add_executable(prores_dx11_alpha tests/prores_dx11_alpha.cpp src/prores_parser.cpp
+  src/prores_alpha.hlsl)
+set_source_files_properties(src/prores_alpha.hlsl PROPERTIES HEADER_FILE_ONLY TRUE)
+target_include_directories(prores_dx11_alpha PRIVATE "${CMAKE_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
+target_link_directories(prores_dx11_alpha PRIVATE "${FFMPEG_ROOT}/lib")
+target_link_libraries(prores_dx11_alpha PRIVATE avformat avcodec avutil d3d11 dxgi)
+target_compile_definitions(prores_dx11_alpha PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+  target_compile_options(prores_dx11_alpha PRIVATE /W4 /utf-8)
+endif()
+
+add_executable(make_prores_422_alpha tests/make_prores_422_alpha.cpp src/prores_parser.cpp)
+target_include_directories(make_prores_422_alpha PRIVATE "${CMAKE_SOURCE_DIR}/src" "${FFMPEG_ROOT}/include")
+target_link_directories(make_prores_422_alpha PRIVATE "${FFMPEG_ROOT}/lib")
+target_link_libraries(make_prores_422_alpha PRIVATE avformat avcodec avutil)
+if(MSVC)
+  target_compile_options(make_prores_422_alpha PRIVATE /W4 /utf-8)
+endif()
+if(FXC_EXECUTABLE)
+  add_custom_command(TARGET prores_dx11_alpha PRE_BUILD
+    COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
+      /Fo "$<TARGET_FILE_DIR:prores_dx11_alpha>/prores_alpha.cso"
+      "${CMAKE_SOURCE_DIR}/src/prores_alpha.hlsl"
+    COMMENT "DX11 alpha検証シェーダをcs_5_0へコンパイル")
 endif()
 
 if(BUILD_GSTREAMER_PLUGIN)

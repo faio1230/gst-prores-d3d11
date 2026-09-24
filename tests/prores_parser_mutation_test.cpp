@@ -59,12 +59,14 @@ void check_frame_bounds(const prores::Frame& frame, std::size_t size) {
         require(static_cast<unsigned>(slice.mb_x) + slice.mb_count <= frame.mb_width &&
                 slice.mb_y < frame.mb_height, "slice exceeds picture grid");
         covered += slice.mb_count;
-        for (const auto& plane : slice.planes)
+        for (unsigned component = 0; component < (frame.alpha_info ? 4u : 3u); ++component) {
+            const auto& plane = slice.planes[component];
             require(plane.offset >= slice.offset && plane.offset <= slice_end &&
                     plane.offset <= size &&
                     plane.size <= size - plane.offset &&
                     plane.size <= slice_end - plane.offset,
                     "plane exceeds slice");
+        }
     }
     require(covered == static_cast<std::uint64_t>(frame.mb_width) * frame.mb_height,
             "slice coverage differs from picture grid");
@@ -152,7 +154,8 @@ int main(int argc, char** argv) try {
         const auto original = read_frame(argv[source]);
         prores::Frame seed;
         std::string error;
-        require(prores::parse_frame(original.data(), original.size(), 0, 0, seed, error),
+        require(prores::parse_frame(original.data(), original.size(), 0, 0, seed, error,
+                                    10, true),
                 std::string("invalid seed: ") + argv[source] + ": " + error);
         check_frame_bounds(seed, original.size());
         for (unsigned long i = 0; i < iterations; ++i) {
@@ -161,7 +164,7 @@ int main(int argc, char** argv) try {
             mutate(bytes, seed, random, mode);
             prores::Frame frame;
             const bool accepted = prores::parse_frame(bytes.data(), bytes.size(),
-                seed.width, seed.height, frame, error);
+                seed.width, seed.height, frame, error, 10, true);
             if (!accepted) { ++structural_rejected; continue; }
             ++structural_accepted;
             try {

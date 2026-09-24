@@ -123,13 +123,16 @@ CpuFrame decode_cpu(const Packet& packet) {
         throw std::runtime_error("CPU ProRes decode failed");
     const auto format = static_cast<AVPixelFormat>(objects.frame->format);
     if (format != AV_PIX_FMT_YUV422P10LE && format != AV_PIX_FMT_YUV444P10LE &&
-        format != AV_PIX_FMT_YUV422P12LE && format != AV_PIX_FMT_YUV444P12LE)
+        format != AV_PIX_FMT_YUV422P12LE && format != AV_PIX_FMT_YUV444P12LE &&
+        format != AV_PIX_FMT_YUVA422P10LE && format != AV_PIX_FMT_YUVA444P10LE &&
+        format != AV_PIX_FMT_YUVA422P12LE && format != AV_PIX_FMT_YUVA444P12LE)
         throw std::runtime_error("unexpected CPU reference format");
     CpuFrame output;
     output.width = objects.frame->width;
     output.height = objects.frame->height;
     output.chroma_shift = format == AV_PIX_FMT_YUV422P10LE ||
-        format == AV_PIX_FMT_YUV422P12LE ? 1 : 0;
+        format == AV_PIX_FMT_YUV422P12LE || format == AV_PIX_FMT_YUVA422P10LE ||
+        format == AV_PIX_FMT_YUVA422P12LE ? 1 : 0;
     for (int component = 0; component < 3; ++component) {
         const int width = component ? output.width >> output.chroma_shift : output.width;
         output.planes[component].resize(static_cast<std::size_t>(width) * output.height);
@@ -275,7 +278,7 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
         prores::Frame ignored;
         std::string error;
         if (prores::parse_frame(bytes.data(), bytes.size(), width, height, ignored, error,
-                                 parsed.bit_depth))
+                                 parsed.bit_depth, parsed.alpha_info != 0))
             throw std::runtime_error(std::string("parser accepted malformed case: ") + name);
         ++rejected;
     };
@@ -292,7 +295,7 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
     mutation[20] |= 4;
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "interlace");
     mutation = packet.bytes;
-    mutation[25] |= 1;
+    mutation[25] = static_cast<std::uint8_t>((mutation[25] & 0xf0) | 3u);
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "alpha");
     mutation = packet.bytes;
     const std::size_t picture_offset = 8 + read_be16(mutation.data() + 8);
@@ -317,7 +320,8 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
     prores::Frame zero_padded;
     std::string padding_error;
     if (!prores::parse_frame(mutation.data(), mutation.size(), parsed.width,
-                             parsed.height, zero_padded, padding_error, parsed.bit_depth))
+                             parsed.height, zero_padded, padding_error, parsed.bit_depth,
+                             parsed.alpha_info != 0))
         throw std::runtime_error("zero-padded frame rejected: " + padding_error);
     mutation = packet.bytes;
     mutation.push_back(0x7f);
@@ -351,7 +355,8 @@ std::size_t verify_entropy_rejections(const Packet& packet, const prores::Frame&
     prores::Frame reparsed;
     std::string error;
     if (!prores::parse_frame(mutation.data(), mutation.size(), parsed.width,
-                             parsed.height, reparsed, error, parsed.bit_depth))
+                             parsed.height, reparsed, error, parsed.bit_depth,
+                             parsed.alpha_info != 0))
         throw std::runtime_error("entropy mutation failed structural parse: " + error);
     std::vector<prores::CoefficientJob> jobs;
     std::vector<std::int32_t> coefficients;
@@ -385,7 +390,7 @@ int main(int argc, char** argv) try {
     if (!prores::parse_frame(packet.bytes.data(), packet.bytes.size(),
                              static_cast<std::uint16_t>(packet.width),
                              static_cast<std::uint16_t>(packet.height), frame, parse_error,
-                             bit_depth))
+                             bit_depth, true))
         throw std::runtime_error("parse: " + parse_error);
     std::vector<prores::CoefficientJob> jobs;
     std::vector<std::int32_t> reference;

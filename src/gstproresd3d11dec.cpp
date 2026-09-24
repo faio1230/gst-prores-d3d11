@@ -122,6 +122,39 @@ struct IdctParameters {
     std::uint32_t mode = 0;
 };
 
+struct AlphaJob {
+    std::uint32_t data_offset, data_size, mb_x, mb_y, mb_count, reserved;
+};
+
+struct AlphaParameters {
+    std::uint32_t job_count, width, height, alpha_info_and_depth;
+    std::uint32_t error_base, reserved[3]{};
+};
+
+struct AlphaPackParameters {
+    std::uint32_t width, height, chroma_shift, reserved = 0;
+};
+
+void make_alpha_texture(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT format,
+                        ComPtr<ID3D11Texture2D>& texture,
+                        ComPtr<ID3D11ShaderResourceView>& srv,
+                        ComPtr<ID3D11UnorderedAccessView>& uav) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    check_hr(device->CreateTexture2D(&desc, nullptr, &texture), "Create alpha scratch texture");
+    check_hr(device->CreateShaderResourceView(texture.Get(), nullptr, &srv),
+             "Create alpha scratch SRV");
+    check_hr(device->CreateUnorderedAccessView(texture.Get(), nullptr, &uav),
+             "Create alpha scratch UAV");
+}
+
 struct MemoryUav {
     ComPtr<ID3D11UnorderedAccessView> view;
 };
@@ -233,6 +266,12 @@ public:
         check_hr(device_->CreateComputeShader(idct_bytecode.data(), idct_bytecode.size(),
                                               nullptr, &idct_),
                  "Create IDCT shader");
+        const auto alpha_bytecode = read_shader(shader_directory / L"prores_alpha.cso");
+        check_hr(device_->CreateComputeShader(alpha_bytecode.data(), alpha_bytecode.size(),
+                                              nullptr, &alpha_), "Create alpha shader");
+        const auto pack_bytecode = read_shader(shader_directory / L"prores_pack_alpha.cso");
+        check_hr(device_->CreateComputeShader(pack_bytecode.data(), pack_bytecode.size(),
+                                              nullptr, &alpha_pack_), "Create alpha pack shader");
         if (g_strcmp0(g_getenv("PRORES_DX11_GPU_TIMING"), "1") == 0)
             timing_ = std::make_unique<GpuTimingQueries>(device_);
     }
@@ -261,6 +300,16 @@ public:
         auto& coefficient_jobs = coefficient_jobs_;
         std::uint32_t coefficient_count = 0;
         prores::make_coefficient_jobs(parsed, coefficient_jobs, coefficient_count);
+        auto& alpha_jobs = alpha_jobs_;
+        alpha_jobs.clear();
+        if (parsed.alpha_info) {
+            alpha_jobs.reserve(parsed.slices.size());
+            for (const auto& slice : parsed.slices) {
+                const auto& plane = slice.planes[3];
+                alpha_jobs.push_back({plane.offset, plane.size, slice.mb_x, slice.mb_y,
+                                      slice.mb_count, 0});
+            }
+        }
         mark(&CpuDecodeTiming::coefficient_jobs_ms);
         const auto idct_update = refresh_idct_jobs(parsed, coefficient_jobs);
         if (cpu_timing) {
@@ -282,10 +331,11 @@ public:
         if (cpu_timing) cpu_timing->idct_gpu_upload = upload_idct_jobs;
         mark(&CpuDecodeTiming::cache_ms);
 
-        if (gst_buffer_n_memory(output) != 3)
-            throw std::runtime_error("planar ProRes D3D11 output must have three memories");
+        if (gst_buffer_n_memory(output) != (parsed.alpha_info ? 1u : 3u))
+            throw std::runtime_error("ProRes D3D11 output has an unexpected memory count");
         ComPtr<ID3D11UnorderedAccessView> output_uavs[3];
-        for (guint component = 0; component < 3; ++component) {
+        ComPtr<ID3D11UnorderedAccessView> packed_uav;
+        for (guint component = 0; component < (parsed.alpha_info ? 1u : 3u); ++component) {
             GstMemory* memory = gst_buffer_peek_memory(output, component);
             if (!gst_is_d3d11_memory(memory))
                 throw std::runtime_error("output pool returned non-D3D11 memory");
@@ -293,11 +343,14 @@ public:
             if (d3d_memory->device != gst_device_)
                 throw std::runtime_error("output texture belongs to a different D3D11 device");
             D3D11_TEXTURE2D_DESC desc{};
+            const auto expected_format = parsed.alpha_info ? DXGI_FORMAT_R16G16B16A16_UNORM :
+                DXGI_FORMAT_R16_UNORM;
+            const auto expected_width = parsed.alpha_info || !component ? parsed.width :
+                static_cast<UINT>(parsed.width >> parsed.chroma_shift);
             if (!gst_d3d11_memory_get_texture_desc(d3d_memory, &desc) ||
-                desc.Format != DXGI_FORMAT_R16_UNORM || !(desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) ||
-                desc.Width != static_cast<UINT>(component ? parsed.width >> parsed.chroma_shift : parsed.width) ||
-                desc.Height != parsed.height)
-                throw std::runtime_error("unexpected planar ProRes D3D11 texture layout");
+                desc.Format != expected_format || !(desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) ||
+                desc.Width != expected_width || desc.Height != parsed.height)
+                throw std::runtime_error("unexpected ProRes D3D11 texture layout");
             auto* stored = static_cast<MemoryUav*>(
                 gst_d3d11_memory_get_token_data(d3d_memory, token_));
             if (!stored) {
@@ -309,8 +362,12 @@ public:
                 gst_d3d11_memory_set_token_data(d3d_memory, token_, created.release(),
                                                 destroy_memory_uav);
             }
-            output_uavs[component] = stored->view;
+            if (parsed.alpha_info) packed_uav = stored->view;
+            else output_uavs[component] = stored->view;
         }
+        if (parsed.alpha_info)
+            for (guint component = 0; component < 3; ++component)
+                output_uavs[component] = cache_.alpha_uavs[component];
         mark(&CpuDecodeTiming::output_uav_ms);
 
         std::optional<DeviceLock> lock(std::in_place, gst_device_);
@@ -343,6 +400,20 @@ public:
                                     quant_matrices.data(), 0, 0);
         context_->UpdateSubresource(cache_.idct_parameters.Get(), 0, nullptr,
                                     &idct_parameter_values, 0, 0);
+        if (parsed.alpha_info) {
+            const AlphaParameters alpha_values{
+                static_cast<std::uint32_t>(alpha_jobs.size()), parsed.width, parsed.height,
+                static_cast<std::uint32_t>((parsed.bit_depth << 8) | parsed.alpha_info),
+                static_cast<std::uint32_t>(coefficient_jobs.size())};
+            const AlphaPackParameters pack_values{
+                parsed.width, parsed.height, parsed.chroma_shift};
+            context_->UpdateSubresource(cache_.alpha_jobs.Get(), 0, nullptr,
+                                        alpha_jobs.data(), 0, 0);
+            context_->UpdateSubresource(cache_.alpha_parameters.Get(), 0, nullptr,
+                                        &alpha_values, 0, 0);
+            context_->UpdateSubresource(cache_.alpha_pack_parameters.Get(), 0, nullptr,
+                                        &pack_values, 0, 0);
+        }
         const UINT zeros[4]{};
         context_->ClearUnorderedAccessViewUint(cache_.coefficient_uav.Get(), zeros);
         context_->ClearUnorderedAccessViewUint(cache_.error_uav.Get(), zeros);
@@ -382,6 +453,37 @@ public:
         ID3D11ShaderResourceView* null_idct_srvs[] = {nullptr, nullptr, nullptr};
         context_->CSSetUnorderedAccessViews(0, 3, null_idct_uavs, nullptr);
         context_->CSSetShaderResources(0, 3, null_idct_srvs);
+        if (parsed.alpha_info) {
+            ID3D11ShaderResourceView* alpha_srvs[] = {
+                cache_.packet_srv.Get(), cache_.alpha_job_srv.Get()};
+            ID3D11UnorderedAccessView* alpha_uavs[] = {
+                cache_.alpha_uavs[3].Get(), cache_.error_uav.Get()};
+            ID3D11Buffer* alpha_constants[] = {cache_.alpha_parameters.Get()};
+            context_->CSSetShader(alpha_.Get(), nullptr, 0);
+            context_->CSSetShaderResources(0, 2, alpha_srvs);
+            context_->CSSetUnorderedAccessViews(0, 2, alpha_uavs, nullptr);
+            context_->CSSetConstantBuffers(0, 1, alpha_constants);
+            context_->Dispatch(static_cast<UINT>((alpha_jobs.size() + 63) / 64), 1, 1);
+            ID3D11ShaderResourceView* null_alpha_srvs[] = {nullptr, nullptr};
+            ID3D11UnorderedAccessView* null_alpha_uavs[] = {nullptr, nullptr};
+            context_->CSSetShaderResources(0, 2, null_alpha_srvs);
+            context_->CSSetUnorderedAccessViews(0, 2, null_alpha_uavs, nullptr);
+
+            ID3D11ShaderResourceView* pack_srvs[] = {
+                cache_.alpha_srvs[0].Get(), cache_.alpha_srvs[1].Get(),
+                cache_.alpha_srvs[2].Get(), cache_.alpha_srvs[3].Get()};
+            ID3D11UnorderedAccessView* pack_uavs[] = {packed_uav.Get()};
+            ID3D11Buffer* pack_constants[] = {cache_.alpha_pack_parameters.Get()};
+            context_->CSSetShader(alpha_pack_.Get(), nullptr, 0);
+            context_->CSSetShaderResources(0, 4, pack_srvs);
+            context_->CSSetUnorderedAccessViews(0, 1, pack_uavs, nullptr);
+            context_->CSSetConstantBuffers(0, 1, pack_constants);
+            context_->Dispatch((parsed.width + 7) / 8, (parsed.height + 7) / 8, 1);
+            ID3D11ShaderResourceView* null_pack_srvs[] = {nullptr, nullptr, nullptr, nullptr};
+            ID3D11UnorderedAccessView* null_pack_uavs[] = {nullptr};
+            context_->CSSetShaderResources(0, 4, null_pack_srvs);
+            context_->CSSetUnorderedAccessViews(0, 1, null_pack_uavs, nullptr);
+        }
         context_->CSSetShader(nullptr, nullptr, 0);
         const auto staging = cache_.error_staging[next_staging_index_];
         if (timing_) context_->End(timing_->copy_begin.Get());
@@ -393,12 +495,12 @@ public:
         // The pool can recycle these memory objects.  A direct UAV write does
         // not pass through GstD3D11Memory's map path, so invalidate its cached
         // staging copy explicitly before any downstream CPU mapping.
-        for (guint component = 0; component < 3; ++component) {
+        for (guint component = 0; component < (parsed.alpha_info ? 1u : 3u); ++component) {
             auto* memory = gst_buffer_peek_memory(output, component);
             GST_MEMORY_FLAG_UNSET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
             GST_MINI_OBJECT_FLAG_SET(memory, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
         }
-        pending_errors_.push_back({staging, static_cast<UINT>(coefficient_jobs.size()),
+        pending_errors_.push_back({staging, cache_.error_count,
                                    frame_sequence_++, pts});
         next_staging_index_ = (next_staging_index_ + 1) % kErrorRingSize;
         mark(&CpuDecodeTiming::idct_submit_ms);
@@ -537,10 +639,13 @@ private:
     struct Cache {
         UINT width = 0;
         UINT height = 0;
+        UINT chroma_shift = 0;
+        bool alpha_enabled = false;
         UINT packet_capacity = 0;
         UINT coefficient_job_count = 0;
         UINT coefficient_count = 0;
         UINT idct_job_count = 0;
+        UINT error_count = 0;
         ComPtr<ID3D11Buffer> packet;
         ComPtr<ID3D11Buffer> coefficient_jobs;
         ComPtr<ID3D11Buffer> coefficients;
@@ -557,6 +662,13 @@ private:
         ComPtr<ID3D11ShaderResourceView> quant_srv;
         ComPtr<ID3D11UnorderedAccessView> coefficient_uav;
         ComPtr<ID3D11UnorderedAccessView> error_uav;
+        ComPtr<ID3D11Buffer> alpha_jobs;
+        ComPtr<ID3D11Buffer> alpha_parameters;
+        ComPtr<ID3D11Buffer> alpha_pack_parameters;
+        ComPtr<ID3D11ShaderResourceView> alpha_job_srv;
+        std::array<ComPtr<ID3D11Texture2D>, 4> alpha_textures;
+        std::array<ComPtr<ID3D11ShaderResourceView>, 4> alpha_srvs;
+        std::array<ComPtr<ID3D11UnorderedAccessView>, 4> alpha_uavs;
     };
 
     struct IdctLayoutSlice {
@@ -638,11 +750,16 @@ private:
                       UINT coefficient_job_count, UINT coefficient_count,
                       UINT idct_job_count) {
         const UINT padded_packet_size = (packet_size + 3u) & ~3u;
+        const bool alpha_enabled = parsed.alpha_info != 0;
+        const UINT error_count = coefficient_job_count +
+            (alpha_enabled ? static_cast<UINT>(parsed.slices.size()) : 0u);
         if (cache_.width == parsed.width && cache_.height == parsed.height &&
+            cache_.chroma_shift == parsed.chroma_shift &&
+            cache_.alpha_enabled == alpha_enabled &&
             cache_.packet_capacity >= padded_packet_size &&
             cache_.coefficient_job_count == coefficient_job_count &&
             cache_.coefficient_count == coefficient_count &&
-            cache_.idct_job_count == idct_job_count)
+            cache_.idct_job_count == idct_job_count && cache_.error_count == error_count)
             return false;
 
         const std::uint64_t rounded =
@@ -652,10 +769,13 @@ private:
         Cache replacement;
         replacement.width = parsed.width;
         replacement.height = parsed.height;
+        replacement.chroma_shift = parsed.chroma_shift;
+        replacement.alpha_enabled = alpha_enabled;
         replacement.packet_capacity = packet_capacity;
         replacement.coefficient_job_count = coefficient_job_count;
         replacement.coefficient_count = coefficient_count;
         replacement.idct_job_count = idct_job_count;
+        replacement.error_count = error_count;
 
         replacement.packet = make_buffer(device_, packet_capacity,
             D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0,
@@ -664,10 +784,10 @@ private:
             sizeof(prores::CoefficientJob), D3D11_BIND_SHADER_RESOURCE);
         replacement.coefficients = structured_buffer(device_, coefficient_count,
             sizeof(std::int32_t), D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-        replacement.errors = structured_buffer(device_, coefficient_job_count,
+        replacement.errors = structured_buffer(device_, error_count,
             sizeof(std::uint32_t), D3D11_BIND_UNORDERED_ACCESS);
         for (auto& staging : replacement.error_staging)
-            staging = structured_buffer(device_, coefficient_job_count,
+            staging = structured_buffer(device_, error_count,
                 sizeof(std::uint32_t), 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ);
         replacement.vld_parameters = make_buffer(device_, sizeof(VldParameters),
                                                    D3D11_BIND_CONSTANT_BUFFER);
@@ -704,6 +824,26 @@ private:
         check_hr(device_->CreateUnorderedAccessView(replacement.errors.Get(), nullptr,
                                                     &replacement.error_uav),
                  "Create VLD error UAV");
+        if (alpha_enabled) {
+            replacement.alpha_jobs = structured_buffer(device_,
+                static_cast<UINT>(parsed.slices.size()), sizeof(AlphaJob),
+                D3D11_BIND_SHADER_RESOURCE);
+            replacement.alpha_parameters = make_buffer(device_, sizeof(AlphaParameters),
+                D3D11_BIND_CONSTANT_BUFFER);
+            replacement.alpha_pack_parameters = make_buffer(device_, sizeof(AlphaPackParameters),
+                D3D11_BIND_CONSTANT_BUFFER);
+            check_hr(device_->CreateShaderResourceView(replacement.alpha_jobs.Get(), nullptr,
+                &replacement.alpha_job_srv), "Create alpha job SRV");
+            for (UINT component = 0; component < 4; ++component)
+                make_alpha_texture(device_,
+                    component == 0 || component == 3 ? parsed.width :
+                        parsed.width >> parsed.chroma_shift,
+                    parsed.height, component == 3 ? DXGI_FORMAT_R16_UINT :
+                        DXGI_FORMAT_R16_UNORM,
+                    replacement.alpha_textures[component],
+                    replacement.alpha_srvs[component],
+                    replacement.alpha_uavs[component]);
+        }
         cache_ = std::move(replacement);
         next_staging_index_ = 0;
         return true;
@@ -715,12 +855,15 @@ private:
     gint64 token_;
     ComPtr<ID3D11ComputeShader> vld_;
     ComPtr<ID3D11ComputeShader> idct_;
+    ComPtr<ID3D11ComputeShader> alpha_;
+    ComPtr<ID3D11ComputeShader> alpha_pack_;
     std::unique_ptr<GpuTimingQueries> timing_;
     Cache cache_;
     std::deque<PendingError> pending_errors_;
     std::size_t next_staging_index_ = 0;
     std::uint64_t frame_sequence_ = 0;
     std::vector<prores::CoefficientJob> coefficient_jobs_;
+    std::vector<AlphaJob> alpha_jobs_;
     std::vector<prores::IdctBlockJob> idct_jobs_;
     std::vector<IdctLayoutSlice> idct_layout_;
     std::uint16_t idct_layout_width_ = 0;
@@ -744,6 +887,8 @@ typedef struct _GstProresD3D11Dec {
     gint color_trc;
     gint color_matrix;
     GstVideoFormat output_format;
+    guint output_bit_depth;
+    guint output_chroma_shift;
     gboolean cpu_timing;
     guint64 cpu_timing_sequence;
 } GstProresD3D11Dec;
@@ -761,7 +906,7 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src", GST_PAD_SRC, GST_PAD_ALWAYS,
     GST_STATIC_CAPS("video/x-raw(memory:D3D11Memory), "
-                    "format=(string){ I422_10LE, Y444_10LE, I422_12LE, Y444_12LE }, "
+                    "format=(string){ I422_10LE, Y444_10LE, I422_12LE, Y444_12LE, AYUV64 }, "
                     "width=(int)[16,8192], height=(int)[16,8192], "
                     "interlace-mode=(string)progressive"));
 
@@ -837,7 +982,7 @@ static gboolean set_format(GstVideoDecoder* decoder, GstVideoCodecState* state) 
         (interlace && g_strcmp0(interlace, "progressive") != 0) ||
         width < 16 || width > 8192 || height < 16 || height > 8192 || (width & 1)) {
         GST_ELEMENT_ERROR(self, STREAM, FORMAT,
-            ("Only progressive, alpha-free ProRes 422/444 10/12-bit is supported"),
+            ("Only progressive ProRes 422/444 10/12-bit is supported"),
             ("caps: %" GST_PTR_FORMAT, state->caps));
         return FALSE;
     }
@@ -846,13 +991,14 @@ static gboolean set_format(GstVideoDecoder* decoder, GstVideoCodecState* state) 
 }
 
 static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& parsed) {
-    const auto format = parsed.bit_depth == 12
+    const auto format = parsed.alpha_info ? GST_VIDEO_FORMAT_AYUV64 : parsed.bit_depth == 12
         ? (parsed.chroma_shift ? GST_VIDEO_FORMAT_I422_12LE : GST_VIDEO_FORMAT_Y444_12LE)
         : (parsed.chroma_shift ? GST_VIDEO_FORMAT_I422_10LE : GST_VIDEO_FORMAT_Y444_10LE);
     if (self->negotiated && self->color_primaries == parsed.color_primaries &&
         self->color_trc == parsed.transfer_characteristic &&
         self->color_matrix == parsed.matrix_coefficients &&
-        self->output_format == format) return TRUE;
+        self->output_format == format && self->output_bit_depth == parsed.bit_depth &&
+        self->output_chroma_shift == parsed.chroma_shift) return TRUE;
     auto* decoder = GST_VIDEO_DECODER(self);
     auto* state = gst_video_decoder_set_output_state(decoder, format,
                                                       parsed.width, parsed.height, self->input);
@@ -875,6 +1021,12 @@ static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& p
     }
     if (state->caps) gst_caps_unref(state->caps);
     state->caps = gst_video_info_to_caps(&state->info);
+    if (parsed.alpha_info) {
+        gst_structure_set(gst_caps_get_structure(state->caps, 0), "prores-depth",
+                          G_TYPE_INT, static_cast<int>(parsed.bit_depth), nullptr);
+        gst_structure_set(gst_caps_get_structure(state->caps, 0), "prores-chroma-shift",
+                          G_TYPE_INT, static_cast<int>(parsed.chroma_shift), nullptr);
+    }
     gst_caps_set_features(state->caps, 0,
         gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY, nullptr));
     gst_video_codec_state_unref(state);
@@ -883,6 +1035,8 @@ static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& p
     self->color_trc = parsed.transfer_characteristic;
     self->color_matrix = parsed.matrix_coefficients;
     self->output_format = format;
+    self->output_bit_depth = parsed.bit_depth;
+    self->output_chroma_shift = parsed.chroma_shift;
     self->negotiated = TRUE;
     return TRUE;
 }
@@ -954,7 +1108,7 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
     const std::uint8_t bit_depth = g_strcmp0(variant, "4444") == 0 ||
         g_strcmp0(variant, "4444xq") == 0 ? 12 : 10;
     if (!prores::parse_frame(input.data, input.size, expected_width, expected_height,
-                             parsed, error, bit_depth)) {
+                             parsed, error, bit_depth, true)) {
         gst_buffer_unmap(frame->input_buffer, &input);
         self->failed = TRUE;
         GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("Malformed or unsupported ProRes frame"),

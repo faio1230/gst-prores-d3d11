@@ -208,7 +208,8 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
 
 bool parse_frame(const std::uint8_t* data, std::size_t size,
                  std::uint16_t expected_width, std::uint16_t expected_height,
-                 Frame& output, std::string& error, std::uint8_t bit_depth) {
+                 Frame& output, std::string& error, std::uint8_t bit_depth,
+                 bool allow_alpha) {
     output = {};
     error.clear();
     if (bit_depth != 10 && bit_depth != 12)
@@ -235,7 +236,10 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
         return fail(error, "unsupported ProRes chroma format");
     output.chroma_shift = (header[12] & 0xc0) == 0xc0 ? 0 : 1;
     if (((header[12] >> 2) & 3) != 0) return fail(error, "interlaced ProRes is unsupported");
-    if ((header[17] & 0x0f) != 0) return fail(error, "alpha ProRes is unsupported");
+    output.alpha_info = header[17] & 0x0f;
+    if (output.alpha_info > 2) return fail(error, "invalid ProRes alpha depth");
+    if (output.alpha_info && !allow_alpha)
+        return fail(error, "alpha ProRes GPU output is not enabled");
     output.color_primaries = header[14];
     output.transfer_characteristic = header[15];
     output.matrix_coefficients = header[16];
@@ -312,14 +316,17 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
         if (slice_header_size > 7) {
             v_size = read_be16(slice_data + 6);
         } else {
+            if (output.alpha_info)
+                return fail(error, "alpha slice has no explicit V plane size");
             if (slice_header_size + y_size + u_size > slice_size)
                 return fail(error, "slice plane sizes exceed slice");
             v_size = slice_size - slice_header_size - y_size - u_size;
         }
         const std::uint64_t plane_total = static_cast<std::uint64_t>(slice_header_size) +
             y_size + u_size + v_size;
-        if (!y_size || plane_total != slice_size)
-            return fail(error, "slice has invalid plane sizes or unexpected alpha payload");
+        if (!y_size || plane_total > slice_size ||
+            (output.alpha_info ? plane_total == slice_size : plane_total != slice_size))
+            return fail(error, "slice has invalid YUV/alpha plane sizes");
 
         Slice slice{};
         slice.offset = static_cast<std::uint32_t>(slice_offset);
@@ -334,6 +341,10 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
         slice.planes[1] = {static_cast<std::uint32_t>(plane_offset), u_size};
         plane_offset += u_size;
         slice.planes[2] = {static_cast<std::uint32_t>(plane_offset), v_size};
+        plane_offset += v_size;
+        if (output.alpha_info)
+            slice.planes[3] = {static_cast<std::uint32_t>(plane_offset),
+                               static_cast<std::uint32_t>(slice_size - plane_total)};
         output.slices.push_back(slice);
         slice_offset += slice_size;
 

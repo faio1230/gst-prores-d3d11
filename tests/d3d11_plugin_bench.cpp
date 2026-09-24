@@ -154,7 +154,7 @@ static StreamContract verify_sample(GstSample* sample, const std::string& mode,
     const auto format = GST_VIDEO_INFO_FORMAT(&info);
     const bool direct_format = format == GST_VIDEO_FORMAT_I422_10LE ||
         format == GST_VIDEO_FORMAT_Y444_10LE || format == GST_VIDEO_FORMAT_I422_12LE ||
-        format == GST_VIDEO_FORMAT_Y444_12LE;
+        format == GST_VIDEO_FORMAT_Y444_12LE || format == GST_VIDEO_FORMAT_AYUV64;
     require(mode == "dx11-direct" ? direct_format : format == GST_VIDEO_FORMAT_I422_10LE,
             "unexpected output format");
     const bool d3d = gst_caps_features_contains(gst_caps_get_features(caps, 0),
@@ -162,10 +162,18 @@ static StreamContract verify_sample(GstSample* sample, const std::string& mode,
     require(d3d == (mode == "dx11-direct"), "unexpected output memory feature");
     auto* buffer = gst_sample_get_buffer(sample);
     if (d3d) {
-        require(gst_buffer_n_memory(buffer) == 3, "D3D11 output plane count mismatch");
-        for (guint plane = 0; plane < 3; ++plane)
+        const guint expected_memories = format == GST_VIDEO_FORMAT_AYUV64 ? 1u : 3u;
+        require(gst_buffer_n_memory(buffer) == expected_memories,
+                "D3D11 output plane count mismatch");
+        for (guint plane = 0; plane < expected_memories; ++plane)
             require(gst_is_d3d11_memory(gst_buffer_peek_memory(buffer, plane)),
                     "non-D3D11 memory in direct mode");
+        if (format == GST_VIDEO_FORMAT_AYUV64) {
+            int depth = 0;
+            require(gst_structure_get_int(gst_caps_get_structure(caps, 0),
+                                          "prores-depth", &depth) && (depth == 10 || depth == 12),
+                    "packed alpha output has no ProRes depth tag");
+        }
     }
     if (info.fps_n > 0) {
         const auto expected = gst_util_uint64_scale(frame_index * info.fps_d,
@@ -264,7 +272,8 @@ int main(int argc, char** argv) try {
     }
 
     for (int iteration = 0; iteration < seek_count; ++iteration) {
-        const auto frame = static_cast<std::uint64_t>((iteration * 73) % (frames_per_loop - 2));
+        const auto frame = static_cast<std::uint64_t>((iteration * 73) %
+            std::max(1, frames_per_loop - 2));
         const auto target = gst_util_uint64_scale(frame * contract.fps_d,
                                                   GST_SECOND, contract.fps_n);
         const auto begin = Clock::now();

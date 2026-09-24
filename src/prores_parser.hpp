@@ -29,7 +29,7 @@ struct Slice {
     std::uint16_t mb_y = 0;
     std::uint16_t mb_count = 0;
     std::uint8_t quant_index = 0;
-    std::array<Plane, 3> planes{};
+    std::array<Plane, 4> planes{};
 };
 
 struct Frame {
@@ -39,6 +39,8 @@ struct Frame {
     std::uint16_t mb_height = 0;
     std::uint8_t chroma_shift = 1;
     std::uint8_t bit_depth = 10;
+    // 0: opaque, 1: 8-bit alpha, 2: 16-bit alpha.
+    std::uint8_t alpha_info = 0;
     std::uint8_t color_primaries = 0;
     std::uint8_t transfer_characteristic = 0;
     std::uint8_t matrix_coefficients = 0;
@@ -47,11 +49,13 @@ struct Frame {
     std::vector<Slice> slices;
 };
 
-// One complete progressive, alpha-free ProRes frame. Bit depth comes from
-// the container FourCC; chroma sampling comes from the frame header.
+// One complete progressive ProRes frame. Bit depth comes from the container
+// FourCC; chroma sampling and alpha depth come from the frame header. The
+// Callers must opt in to alpha so legacy alpha-free checks remain explicit.
 bool parse_frame(const std::uint8_t* data, std::size_t size,
                  std::uint16_t expected_width, std::uint16_t expected_height,
-                 Frame& output, std::string& error, std::uint8_t bit_depth = 10);
+                 Frame& output, std::string& error, std::uint8_t bit_depth = 10,
+                 bool allow_alpha = false);
 
 struct CoefficientJob {
     std::uint32_t data_offset = 0;

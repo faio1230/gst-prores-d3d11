@@ -272,6 +272,10 @@ static void injected_error(GstSample* compressed, const char* test) {
         byte = 2;
         gst_buffer_fill(input, 25, &byte, 1);
     }
+    if (std::string(test) == "invalid-alpha-mode") {
+        byte = 3;
+        gst_buffer_fill(input, 25, &byte, 1);
+    }
     if (std::string(test) == "interlaced-hidden-in-caps") {
         gst_buffer_extract(input, 20, &byte, 1);
         byte |= 4;
@@ -329,7 +333,9 @@ static void injected_error(GstSample* compressed, const char* test) {
     gst_app_src_push_buffer(GST_APP_SRC(source), input);
     gst_app_src_end_of_stream(GST_APP_SRC(source));
     gst_object_unref(source);
-    if (std::string(test) == "oversized-first-dc" ||
+    if (std::string(test) == "invalid-alpha-mode")
+        pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT);
+    else if (std::string(test) == "oversized-first-dc" ||
         std::string(test) == "ac-run-boundary")
         pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE,
                               expected_gpu_error.c_str());
@@ -365,6 +371,51 @@ static void delayed_entropy_error(GstSample* compressed) {
     gst_object_unref(source);
     pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE,
                           "GPU entropy decoder rejected job 0 frame=0");
+}
+
+static void alpha_entropy_error(GstSample* compressed) {
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+    auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+    gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+    auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+    GstMapInfo mapped{};
+    require(gst_buffer_map(input, &mapped, GST_MAP_READ), "cannot map alpha mutation input");
+    prores::Frame parsed;
+    std::string error;
+    const bool valid = prores::parse_frame(mapped.data, mapped.size, 0, 0,
+                                           parsed, error, 12, true);
+    gst_buffer_unmap(input, &mapped);
+    require(valid && parsed.alpha_info && !parsed.slices.empty() &&
+            parsed.slices[0].planes[3].size > 0,
+            "alpha mutation fixture has no alpha payload");
+    const auto& alpha = parsed.slices[0].planes[3];
+    require(gst_buffer_memset(input, alpha.offset, 0, alpha.size) == alpha.size,
+            "cannot zero alpha payload");
+    pipeline.state(GST_STATE_PLAYING);
+    gst_app_src_push_buffer(GST_APP_SRC(source), input);
+    gst_app_src_end_of_stream(GST_APP_SRC(source));
+    gst_object_unref(source);
+    pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE,
+                          "GPU entropy decoder rejected job");
+    pipeline.state(GST_STATE_NULL);
+
+    // EOSなしで3スロットを使い切り、4枚目の投入時に初回alpha異常を伝播する。
+    Pipeline delayed("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+    auto* delayed_source = gst_bin_get_by_name(GST_BIN(delayed.pipe), "source");
+    gst_app_src_set_caps(GST_APP_SRC(delayed_source), gst_sample_get_caps(compressed));
+    delayed.state(GST_STATE_PLAYING);
+    for (guint i = 0; i < 4; ++i) {
+        auto* packet = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+        GST_BUFFER_PTS(packet) = i * GST_SECOND / 30;
+        if (i == 0)
+            require(gst_buffer_memset(packet, alpha.offset, 0, alpha.size) == alpha.size,
+                    "cannot zero delayed alpha payload");
+        gst_app_src_push_buffer(GST_APP_SRC(delayed_source), packet);
+    }
+    gst_object_unref(delayed_source);
+    const auto expected = "GPU entropy decoder rejected job " +
+        std::to_string(parsed.slices.size() * 3) + " frame=0";
+    delayed.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE, expected.c_str());
 }
 
 static void reject_software_device(GstSample* compressed) {
@@ -695,8 +746,8 @@ static void shared_device_instances(const char* path) {
 
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
-    require(argc == 2 || argc == 3,
-            "d3d11_plugin_smoke 1080p60-hq.mov [2160p60-hq.mov]");
+    require(argc >= 2 && argc <= 4,
+            "d3d11_plugin_smoke 1080p60-hq.mov [2160p60-hq.mov] [alpha.mov]");
     const auto capabilities = check_device_capabilities();
     GstBuffer* retained = nullptr;
     {
@@ -777,7 +828,7 @@ int main(int argc, char** argv) try {
     dynamic_rejected_input(compressed, false);
     dynamic_rejected_input(compressed, true);
     reject_unsupported_rgb_color(compressed);
-    if (argc == 3) {
+    if (argc >= 3) {
         Pipeline demux("filesrc name=source ! qtdemux ! appsink name=sink sync=false max-buffers=1");
         demux.file(argv[2]);
         demux.state(GST_STATE_PLAYING);
@@ -787,11 +838,22 @@ int main(int argc, char** argv) try {
         gst_sample_unref(uhd);
     }
     for (const char* test : {"bad-signature", "alpha-hidden-in-caps",
+                             "invalid-alpha-mode",
                              "interlaced-hidden-in-caps", "invalid-chroma-flags",
                              "oversized-first-dc", "ac-run-boundary"})
         injected_error(compressed, test);
     delayed_entropy_error(compressed);
     gst_sample_unref(compressed);
+
+    if (argc == 4) {
+        Pipeline demux("filesrc name=source ! qtdemux ! appsink name=sink sync=false max-buffers=1");
+        demux.file(argv[3]);
+        demux.state(GST_STATE_PLAYING);
+        auto* alpha = demux.pull();
+        require(alpha != nullptr, "alpha corruption fixture missing");
+        alpha_entropy_error(alpha);
+        gst_sample_unref(alpha);
+    }
 
     {
         Pipeline pipeline(direct_pipeline);
@@ -813,12 +875,13 @@ int main(int argc, char** argv) try {
                  "\"flushing_seeks\":4,\"known_color_cases\":2,"
                  "\"dynamic_color_caps_changes\":2,"
                  "\"dynamic_rejected_input_cases\":2,"
-                 "\"dynamic_caps_changes\":" << (argc == 3 ? 2 : 0) << ","
+                 "\"dynamic_caps_changes\":" << (argc >= 3 ? 2 : 0) << ","
                  "\"retained_buffer_after_destroy\":true,\"shared_device_instances\":2,"
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
                  "\"software_adapter_decoder_rejected\":true,"
-                 "\"software_adapter_rgb_rejected\":true,\"error_cases\":14,"
+                 "\"software_adapter_rgb_rejected\":true,\"error_cases\":"
+              << (argc == 4 ? 16 : 15) << ","
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";
     gst_deinit();
     return 0;

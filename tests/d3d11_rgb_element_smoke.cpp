@@ -17,8 +17,10 @@ static void require(bool value, const char* reason) {
 static void check_sample(GstSample* sample, GstVideoInfo* info) {
     require(sample != nullptr, "RGB sample timeout");
     auto* caps = gst_sample_get_caps(sample);
-    require(gst_video_info_from_caps(info, caps) &&
-            GST_VIDEO_INFO_FORMAT(info) == GST_VIDEO_FORMAT_RGB10A2_LE &&
+    const auto format = gst_video_info_from_caps(info, caps) ?
+        GST_VIDEO_INFO_FORMAT(info) : GST_VIDEO_FORMAT_UNKNOWN;
+    require((format == GST_VIDEO_FORMAT_RGB10A2_LE ||
+             format == GST_VIDEO_FORMAT_RGBA64_LE) &&
             info->colorimetry.range == GST_VIDEO_COLOR_RANGE_0_255 &&
             info->colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_RGB &&
             info->colorimetry.transfer == GST_VIDEO_TRANSFER_BT709 &&
@@ -32,11 +34,12 @@ static void check_sample(GstSample* sample, GstVideoInfo* info) {
     require(gst_is_d3d11_memory(memory), "RGB output is not D3D11Memory");
     D3D11_TEXTURE2D_DESC desc{};
     require(gst_d3d11_memory_get_texture_desc(GST_D3D11_MEMORY_CAST(memory), &desc) &&
-            desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
+            desc.Format == (format == GST_VIDEO_FORMAT_RGBA64_LE ?
+                            DXGI_FORMAT_R16G16B16A16_UNORM : DXGI_FORMAT_R10G10B10A2_UNORM) &&
             desc.Width == static_cast<UINT>(info->width) &&
             desc.Height == static_cast<UINT>(info->height) &&
             (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS),
-            "RGB output texture is not RGB10A2 typed UAV");
+            "RGB output texture has unexpected typed UAV format");
 }
 
 int main(int argc, char** argv) try {
