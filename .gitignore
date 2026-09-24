@@ -22,3 +22,7 @@ __pycache__/
 /results/present-control-topmost-direct.csv
 /results/present-control-dji-pilot.csv
 /results/present-control-pilot.csv
+# M0の長いFFmpeg診断ログ・一時MD5/MOVはローカルに残し、要約JSONを追跡する。
+/results/feature-matrix-2026-09-24/*.log
+/results/feature-matrix-2026-09-24/*.framemd5
+/results/feature-matrix-2026-09-24/*.mov

@@ -1,4 +1,4 @@
-// Verify the actual GStreamer D3D11Memory topology selected for I422_10LE.
+// Verify GStreamer D3D11Memory topology and writable UAVs for a video format.
 #include <gst/gst.h>
 #include <gst/video/video.h>
 #include <gst/video/gstvideopool.h>
@@ -18,14 +18,17 @@ static void require(bool value, const char* message) {
 
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
+    const char* format_name = argc > 1 ? argv[1] : "I422_10LE";
+    const GstVideoFormat video_format = gst_video_format_from_string(format_name);
+    require(video_format != GST_VIDEO_FORMAT_UNKNOWN, "unknown GstVideoFormat");
     GstD3D11Device* device = gst_d3d11_device_new(0, 0);
     require(device != nullptr, "cannot create GstD3D11Device");
     GstD3D11Format format{};
-    require(gst_d3d11_device_get_format(device, GST_VIDEO_FORMAT_I422_10LE, &format),
-            "I422_10LE is unsupported by GstD3D11Device");
+    require(gst_d3d11_device_get_format(device, video_format, &format),
+            "format is unsupported by GstD3D11Device");
 
     GstCaps* caps = gst_caps_new_simple("video/x-raw",
-        "format", G_TYPE_STRING, "I422_10LE",
+        "format", G_TYPE_STRING, format_name,
         "width", G_TYPE_INT, 1920,
         "height", G_TYPE_INT, 1080,
         "framerate", GST_TYPE_FRACTION, 60, 1,
@@ -45,7 +48,7 @@ int main(int argc, char** argv) try {
     require(params != nullptr, "cannot create allocation parameters");
     gst_buffer_pool_config_set_d3d11_allocation_params(config, params);
     gst_d3d11_allocation_params_free(params);
-    require(gst_buffer_pool_set_config(pool, config), "D3D11 pool rejected I422_10LE UAV config");
+    require(gst_buffer_pool_set_config(pool, config), "D3D11 pool rejected UAV config");
     require(gst_buffer_pool_set_active(pool, TRUE), "cannot activate D3D11 pool");
     GstBuffer* buffer = nullptr;
     require(gst_buffer_pool_acquire_buffer(pool, &buffer, nullptr) == GST_FLOW_OK,
@@ -57,9 +60,9 @@ int main(int argc, char** argv) try {
             "RGB10A2 DXGI format query failed");
     const bool rgb_typed_uav = (rgb_support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) != 0;
     const auto memories = gst_buffer_n_memory(buffer);
-    require(memories == 3, "I422_10LE must allocate exactly three D3D11 memories");
+    require(memories == GST_VIDEO_INFO_N_PLANES(&info), "unexpected D3D11 memory count");
     bool all_uav = true;
-    std::cout << "{\"passed\":true,\"gst_format\":\"I422_10LE\",\"memories\":"
+    std::cout << "{\"passed\":true,\"gst_format\":\"" << format_name << "\",\"memories\":"
               << memories << ",\"device_dxgi_format\":" << static_cast<unsigned>(format.dxgi_format)
               << ",\"planes\":[";
     for (guint i = 0; i < memories; ++i) {
