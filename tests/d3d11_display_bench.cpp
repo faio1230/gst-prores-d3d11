@@ -394,10 +394,12 @@ int main(int argc, char** argv) try {
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
     if (argc < 4)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb] [queue-before-decoder] [queue-after-rgb] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [sink-processing-deadline-ms=N] [present-sync1] [settle-ms=N]]");
+        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb|direct-ayuv|deinterlace] [queue-before-decoder] [queue-after-rgb] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [sink-processing-deadline-ms=N] [present-sync1] [settle-ms=N] [preplay-delay-ms=N] [interval-warmup=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
+    bool direct_ayuv = false;
+    bool deinterlace = false;
     bool predecode_queue = false;
     bool postrgb_queue = false;
     bool decoder_no_qos = false;
@@ -408,6 +410,8 @@ int main(int argc, char** argv) try {
     bool sink_clock_sync = true;
     guint sink_stall_ms = 0;
     guint settle_ms = 0;
+    guint preplay_delay_ms = 0;
+    guint interval_warmup = 30;
     int sink_ts_offset_ms = 0;
     int sink_processing_deadline_ms = 15;
     for (int i = 5; i < argc; ++i) {
@@ -415,6 +419,8 @@ int main(int argc, char** argv) try {
         if (option == "preroll") preroll = true;
         else if (option == "lossless") lossless = true;
         else if (option == "native-rgb") native_rgb = true;
+        else if (option == "direct-ayuv") direct_ayuv = true;
+        else if (option == "deinterlace") deinterlace = true;
         else if (option == "queue-before-decoder") predecode_queue = true;
         else if (option == "queue-after-rgb") postrgb_queue = true;
         else if (option == "decoder-no-qos") decoder_no_qos = true;
@@ -431,10 +437,18 @@ int main(int argc, char** argv) try {
             sink_stall_ms = static_cast<guint>(std::stoi(option.substr(14)));
         else if (option.rfind("settle-ms=", 0) == 0)
             settle_ms = static_cast<guint>(std::stoi(option.substr(10)));
+        else if (option.rfind("preplay-delay-ms=", 0) == 0)
+            preplay_delay_ms = static_cast<guint>(std::stoi(option.substr(17)));
+        else if (option.rfind("interval-warmup=", 0) == 0)
+            interval_warmup = static_cast<guint>(std::stoi(option.substr(16)));
         else throw std::runtime_error("unknown display option: " + option);
     }
     if (sink_stall_ms > 1000) throw std::runtime_error("sink stall must be at most 1000ms");
     if (settle_ms > 5000) throw std::runtime_error("settle time must be at most 5000ms");
+    if (preplay_delay_ms > 30000) throw std::runtime_error("preplay delay must be at most 30000ms");
+    if (interval_warmup > 1000) throw std::runtime_error("interval warmup must be at most 1000 frames");
+    if (static_cast<int>(native_rgb) + static_cast<int>(direct_ayuv) + static_cast<int>(deinterlace) > 1)
+        throw std::runtime_error("display output modes are mutually exclusive");
     if (sink_ts_offset_ms < -100 || sink_ts_offset_ms > 100)
         throw std::runtime_error("sink ts offset must be between -100 and 100ms");
     if (sink_processing_deadline_ms < 0 || sink_processing_deadline_ms > 100)
@@ -450,7 +464,7 @@ int main(int argc, char** argv) try {
     const bool reference = reference_rgb || reference_heavy || reference_stress;
     if (reference && loops != 1)
         throw std::runtime_error("D3D11 test source reference requires one 1440-frame loop");
-    if (reference && (native_rgb || predecode_queue || postrgb_queue || decoder_no_qos))
+    if (reference && (native_rgb || direct_ayuv || deinterlace || predecode_queue || postrgb_queue || decoder_no_qos))
         throw std::runtime_error("ProRes-only decoder options cannot be used with D3D11 test source reference");
     GError* error = nullptr;
     const std::string rgb_caps =
@@ -470,9 +484,15 @@ int main(int argc, char** argv) try {
     } else {
         description = std::string("filesrc name=source ! qtdemux ! ") +
             (predecode_queue ? "queue name=predecode max-size-buffers=32 max-size-bytes=0 max-size-time=0 ! " : "") +
-            "proresd3d11dec name=decoder ! " +
-            (native_rgb ? "proresd3d11rgb" : "d3d11convert") +
-            " name=converter ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! ";
+            "proresd3d11dec name=decoder ! ";
+        if (direct_ayuv) {
+            description += "video/x-raw(memory:D3D11Memory),format=AYUV64 ! ";
+        } else if (deinterlace) {
+            description += "d3d11deinterlace name=converter ! ";
+        } else {
+            description += (native_rgb ? "proresd3d11rgb" : "d3d11convert") +
+                std::string(" name=converter ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! ");
+        }
     }
     if (postrgb_queue)
         description += "queue name=postrgb max-size-buffers=4 max-size-bytes=0 max-size-time=0 ! ";
@@ -488,13 +508,13 @@ int main(int argc, char** argv) try {
     auto* predecode = predecode_queue ? gst_bin_get_by_name(GST_BIN(pipeline), "predecode") : nullptr;
     auto* postrgb = postrgb_queue ? gst_bin_get_by_name(GST_BIN(pipeline), "postrgb") : nullptr;
     auto* decoder = reference ? nullptr : gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
-    auto* converter = reference_rgb ? nullptr : gst_bin_get_by_name(GST_BIN(pipeline), "converter");
+    auto* converter = (reference_rgb || direct_ayuv) ? nullptr : gst_bin_get_by_name(GST_BIN(pipeline), "converter");
     auto* pushmeter = trace_sink_return ? gst_bin_get_by_name(GST_BIN(pipeline), "pushmeter") : nullptr;
     auto* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     auto* bus = gst_element_get_bus(pipeline);
     if (!source || (predecode_queue && !predecode) || (postrgb_queue && !postrgb) ||
         (!reference && !decoder) ||
-        (!reference_rgb && !converter) ||
+        (!reference_rgb && !direct_ayuv && !converter) ||
         (trace_sink_return && !pushmeter) || !sink || !bus)
         throw std::runtime_error("pipeline endpoint missing");
     if (!reference) g_object_set(source, "location", argv[1], nullptr);
@@ -555,7 +575,7 @@ int main(int argc, char** argv) try {
             if (predecode) add_stage_probe(predecode, "sink", &demuxed);
             add_stage_probe(decoder, "sink", &compressed);
             add_stage_probe(decoder, "src", &decoded);
-            add_stage_probe(converter, "src", &rgb);
+            add_stage_probe(converter ? converter : decoder, "src", &rgb);
             if (postrgb) add_stage_probe(postrgb, "src", &rgb_dequeued);
         }
     }
@@ -569,6 +589,7 @@ int main(int argc, char** argv) try {
             throw std::runtime_error("PAUSED preroll failed");
         preroll_ms = ms(preroll_start, Clock::now());
     }
+    if (preplay_delay_ms) Sleep(preplay_delay_ms);
     if (present_sync1) present_hook.install(sink);
     const auto start = Clock::now();
     const auto cpu_start = cpu_seconds();
@@ -644,7 +665,7 @@ int main(int argc, char** argv) try {
                 << ',' << window.foreground << ',' << window.foreground_overlap_percent
                 << ',' << window.topmost << ',' << window.width << ',' << window.height;
             csv << '\n';
-            if (i > endpoints[loop] + 30) intervals.push_back(interval);
+            if (i > endpoints[loop] + interval_warmup) intervals.push_back(interval);
         }
     }
     if (argc >= 5) {
@@ -670,8 +691,11 @@ int main(int argc, char** argv) try {
               << std::setprecision(3)
               << ",\"loops\":" << loops << ",\"preroll_ms\":" << preroll_ms
               << ",\"source_mode\":\"" << (reference ? input : "prores") << "\""
-              << ",\"rgb_converter\":\"" << (reference_rgb ? "none" :
+              << ",\"rgb_converter\":\"" << (direct_ayuv ? "none" :
+                  deinterlace ? "d3d11deinterlace" : reference_rgb ? "none" :
                   (reference_heavy || reference_stress || native_rgb) ? "proresd3d11rgb" : "d3d11convert") << "\""
+              << ",\"display_path\":\"" << (direct_ayuv ? "ayuv64-direct" :
+                  deinterlace ? "deinterlace" : native_rgb ? "native-rgb" : "standard-rgb") << "\""
               << ",\"predecode_queue\":" << (predecode_queue ? "true" : "false")
               << ",\"postrgb_queue\":" << (postrgb_queue ? "true" : "false")
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
@@ -689,6 +713,8 @@ int main(int argc, char** argv) try {
               << ",\"present_sync_hook_queries\":" << sync_hook_queries.load()
               << ",\"present_sync_hook_last_hr\":" << sync_hook_last_hr.load()
               << ",\"settle_ms\":" << settle_ms
+              << ",\"preplay_delay_ms\":" << preplay_delay_ms
+              << ",\"interval_warmup\":" << interval_warmup
               << ",\"injected_sink_stall_ms\":" << sink_stall_ms
               << ",\"injected_stall_start_ms\":" << stall.start_ms
               << ",\"injected_stall_end_ms\":" << stall.end_ms
@@ -700,6 +726,7 @@ int main(int argc, char** argv) try {
               << ",\"interval_p50_ms\":" << percentile(intervals, .5)
               << ",\"interval_p95_ms\":" << percentile(intervals, .95)
               << ",\"interval_p99_ms\":" << percentile(intervals, .99)
+              << ",\"interval_max_ms\":" << (intervals.empty() ? 0.0 : *std::max_element(intervals.begin(), intervals.end()))
               << ",\"seek_first_p95_ms\":" << percentile(seek_first_ms, .95)
               << ",\"cpu_core_equivalent_percent\":" << cpu_used / (wall / 1000) * 100
               << ",\"cpu_machine_percent\":" << cpu_used / (wall / 1000) * 100 / system.dwNumberOfProcessors
