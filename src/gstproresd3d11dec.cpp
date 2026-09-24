@@ -991,7 +991,7 @@ static gboolean set_format(GstVideoDecoder* decoder, GstVideoCodecState* state) 
          g_strcmp0(variant, "4444") != 0 && g_strcmp0(variant, "4444xq") != 0) ||
         (interlace && g_strcmp0(interlace, "progressive") != 0 &&
          g_strcmp0(interlace, "interleaved") != 0) ||
-        width < 16 || width > 8192 || height < 16 || height > 8192 || (width & 1)) {
+        width < 16 || width > 8192 || height < 16 || height > 8192) {
         GST_ELEMENT_ERROR(self, STREAM, FORMAT,
             ("Only progressive/interleaved ProRes 422/444 10/12-bit is supported"),
             ("caps: %" GST_PTR_FORMAT, state->caps));

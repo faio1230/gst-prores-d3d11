@@ -238,13 +238,15 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     if (read_be16(header + 2) > 1) return fail(error, "unsupported frame header version");
     output.width = read_be16(header + 8);
     output.height = read_be16(header + 10);
-    if (!output.width || !output.height || (output.width & 1) ||
+    if (!output.width || !output.height ||
         (expected_width && output.width != expected_width) ||
         (expected_height && output.height != expected_height))
         return fail(error, "frame dimensions do not match caps");
     if ((header[12] & 0xc0) != 0x80 && (header[12] & 0xc0) != 0xc0)
         return fail(error, "unsupported ProRes chroma format");
     output.chroma_shift = (header[12] & 0xc0) == 0xc0 ? 0 : 1;
+    if (output.chroma_shift && (output.width & 1))
+        return fail(error, "odd 4:2:2 frame width is unsupported");
     output.frame_type = (header[12] >> 2) & 3;
     output.alpha_info = header[17] & 0x0f;
     if (output.alpha_info > 2) return fail(error, "invalid ProRes alpha depth");

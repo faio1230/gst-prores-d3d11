@@ -343,6 +343,20 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "oversized-frame-trailer");
     expect_rejection(packet.bytes, static_cast<std::uint16_t>(parsed.width + 2),
                      parsed.height, "caps-dimensions");
+    if (parsed.chroma_shift && !(parsed.width & 1)) {
+        mutation = packet.bytes;
+        const auto odd_width = static_cast<std::uint16_t>(parsed.width - 1);
+        mutation[16] = static_cast<std::uint8_t>(odd_width >> 8);
+        mutation[17] = static_cast<std::uint8_t>(odd_width);
+        prores::Frame ignored;
+        std::string error;
+        if (prores::parse_frame(mutation.data(), mutation.size(), odd_width,
+                                parsed.height, ignored, error, parsed.bit_depth,
+                                parsed.alpha_info != 0) ||
+            error != "odd 4:2:2 frame width is unsupported")
+            throw std::runtime_error("odd 4:2:2 frame width was not explicitly rejected");
+        ++rejected;
+    }
     return rejected;
 }
 
@@ -665,8 +679,11 @@ int main(int argc, char** argv) try {
     // is therefore the explicit validation tolerance at the final rounding
     // boundary; coefficients themselves remain bit exact.
     constexpr std::uint32_t pixel_tolerance = 1;
+    const std::size_t expected_malformed_rejections =
+        12 + (frame.chroma_shift && !(frame.width & 1) ? 1 : 0);
     const bool passed = coefficients_passed && maximum_pixel_difference <= pixel_tolerance &&
-                        malformed_rejections == 12 && entropy_rejections == 1 &&
+                        malformed_rejections == expected_malformed_rejections &&
+                        entropy_rejections == 1 &&
                         (!external_compared || external_difference.maximum <= pixel_tolerance);
     std::cout << "{\"passed\":" << (passed ? "true" : "false")
               << ",\"frame_index\":" << frame_index

@@ -301,7 +301,9 @@ static gboolean set_caps(GstBaseTransform* transform, GstCaps* input, GstCaps* o
          format != GST_VIDEO_FORMAT_Y444_12LE && !alpha) ||
         GST_VIDEO_INFO_FORMAT(&out) != (alpha ? GST_VIDEO_FORMAT_RGBA64_LE :
                                         GST_VIDEO_FORMAT_RGB10A2_LE) ||
-        in.width != out.width || in.height != out.height || (in.width & 1) ||
+        in.width != out.width || in.height != out.height ||
+        ((in.width & 1) && (format == GST_VIDEO_FORMAT_I422_10LE ||
+                            format == GST_VIDEO_FORMAT_I422_12LE)) ||
         in.interlace_mode != GST_VIDEO_INTERLACE_MODE_PROGRESSIVE ||
         out.interlace_mode != GST_VIDEO_INTERLACE_MODE_PROGRESSIVE ||
         (chroma_site && std::strcmp(chroma_site, "jpeg") != 0) ||

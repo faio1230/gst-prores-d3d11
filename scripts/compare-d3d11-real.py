@@ -129,9 +129,15 @@ def compare_yuv_streams(cpu_command, dx_command, width, height, frames,
                         pixel_format, cpu_log, dx_log, env, timeout=900):
     """一時RAWを作らず2つの独立した復号器を全フレーム・全画素比較する。"""
     pixels = width * height
-    chroma_samples = pixels if '444' in pixel_format else pixels // 2
+    chroma_width = width if '444' in pixel_format else width // 2
+    chroma_samples = chroma_width * height
     sections = [('Y', pixels), ('U', chroma_samples), ('V', chroma_samples)]
     frame_bytes = (pixels + 2 * chroma_samples) * 2
+    plane_widths = (width, chroma_width, chroma_width)
+    # GstVideoInfo's planar 16-bit rows are aligned to four bytes.  The
+    # fixed-SDK rawvideo stream has no row padding, so strip it only on DX11.
+    plane_strides = tuple((plane_width + 1) & ~1 for plane_width in plane_widths)
+    dx_frame_bytes = sum(stride * height * 2 for stride in plane_strides)
     stats = [make_stat(name) for name, _ in sections]
     maxima = []
     with cpu_log.open('wb') as cpu_error, dx_log.open('wb') as dx_error:
@@ -142,18 +148,24 @@ def compare_yuv_streams(cpu_command, dx_command, width, height, frames,
         try:
             for index in range(frames):
                 left = cpu.stdout.read(frame_bytes)
-                right = dx.stdout.read(frame_bytes)
-                if len(left) != frame_bytes or len(right) != frame_bytes:
+                right = dx.stdout.read(dx_frame_bytes)
+                if len(left) != frame_bytes or len(right) != dx_frame_bytes:
                     raise RuntimeError(f'frame {index}: CPU={len(left)}, DX11={len(right)}, '
-                                       f'expected={frame_bytes}')
+                                       f'expected={frame_bytes}/{dx_frame_bytes}')
                 aa = np.frombuffer(left, dtype='<u2')
-                bb = np.frombuffer(right, dtype='<u2')
+                padded = np.frombuffer(right, dtype='<u2')
                 offset = 0
+                dx_offset = 0
                 frame_maxima = []
-                for stat, (_, count) in zip(stats, sections):
+                for stat, (_, count), plane_width, stride in zip(
+                        stats, sections, plane_widths, plane_strides):
+                    plane_size = stride * height
+                    bb = padded[dx_offset:dx_offset + plane_size].reshape(
+                        height, stride)[:, :plane_width].reshape(-1)
                     frame_maxima.append(update(stat, aa[offset:offset + count],
-                                               bb[offset:offset + count]))
+                                               bb))
                     offset += count
+                    dx_offset += plane_size
                 maxima.append(frame_maxima)
             if cpu.stdout.read(1) or dx.stdout.read(1):
                 raise RuntimeError('expected frame count exceeded')
@@ -179,8 +191,11 @@ def compare_rgb_formula_streams(yuv_command, rgb_command, width, height, frames,
                                 pixel_format, yuv_log, rgb_log, env, timeout=900):
     """同一DX11復号のYUVとGPU RGBを、独立BT.709式で全フレーム比較する。"""
     pixels = width * height
-    chroma_samples = pixels if '444' in pixel_format else pixels // 2
-    yuv_bytes = (pixels + 2 * chroma_samples) * 2
+    chroma_width = width if '444' in pixel_format else width // 2
+    chroma_samples = chroma_width * height
+    plane_widths = (width, chroma_width, chroma_width)
+    plane_strides = tuple((plane_width + 1) & ~1 for plane_width in plane_widths)
+    yuv_bytes = sum(stride * height * 2 for stride in plane_strides)
     rgb_bytes = pixels * 4
     stats = [make_stat(name) for name in 'RGBA']
     maxima = []
@@ -206,10 +221,13 @@ def compare_rgb_formula_streams(yuv_command, rgb_command, width, height, frames,
                                        f'expected={yuv_bytes}/{rgb_bytes}')
                 raw = np.frombuffer(yuv_raw, dtype='<u2')
                 packed = np.frombuffer(rgb_raw, dtype='<u4').reshape(height, width)
-                y_plane = raw[:pixels].reshape(height, width)
-                chroma_width = width if '444' in pixel_format else width // 2
-                u_plane = raw[pixels:pixels + chroma_samples].reshape(height, chroma_width)
-                v_plane = raw[pixels + chroma_samples:].reshape(height, chroma_width)
+                planes = []
+                offset = 0
+                for plane_width, stride in zip(plane_widths, plane_strides):
+                    planes.append(raw[offset:offset + stride * height]
+                                  .reshape(height, stride)[:, :plane_width])
+                    offset += stride * height
+                y_plane, u_plane, v_plane = planes
                 frame_maxima = [0, 0, 0, 0]
                 for row in range(0, height, 64):
                     rows = slice(row, min(row + 64, height))
@@ -343,7 +361,9 @@ def main():
         raise ValueError('RGB比較は現在I422_10LEのみ対応')
     expected_frames = min(args.frames or int(probe['nb_frames']), int(probe['nb_frames']))
     width, height = probe['width'], probe['height']
-    if width % 2:
+    if width % 2 and (not args.streaming or
+                      args.mode not in ('yuv', 'rgb_element_formula') or
+                      '422' in pixel_format):
         raise ValueError('odd width is not supported by this raw comparator')
     args.out.parent.mkdir(parents=True, exist_ok=True)
     (ROOT / 'build').mkdir(exist_ok=True)

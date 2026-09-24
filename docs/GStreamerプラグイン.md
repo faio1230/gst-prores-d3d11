@@ -85,6 +85,8 @@ D3D11下流検査ではdecoderの3面I422_10LEからd3d11convertのRGB10A2_LE、
 
 `proresd3d11rgb`はalphaなしの3面D3D11Memoryを`prores_rgb.hlsl`で`RGB10A2_LE`へ、alpha付きの標準`AYUV64`を`prores_rgb_alpha.hlsl`で`RGBA64_LE`へCompute Shaderで直接書く。CPU読み戻しは検査経路だけで、通常経路にはない。入力はprogressive・limited BT.709に限定する。alphaなしの422では元のクロマ位置を中央補間し、444では各画素のクロマを使う。alpha付きAYUV64は既に4:4:4へ隣接複製した値を16bit UNORMとして扱い、元の422/444情報には依存しない。公開HQ実写1080p全50枚／4K全129枚／4K60全480枚とM2の18素材780枚で、alphaなしの独立BT.709式とのR/G/B最大差は各1 code。M3のalpha付き24条件48枚では、DX11が復号したAYUV値から独立に計算したRGB式との差最大1、alpha差0。EOS、seek、停止・破棄後のbuffer寿命も検査した。capsだけではSRV bind flagが保証されず、外部ソースの別構成は拒否し得る。表示機器の色管理、他GPUのtyped UAV対応、BT.709以外のRGBAは未達。詳細は[実素材と表示検証](実素材と表示検証.md)、[444・12bit拡張](444・12bit拡張.md)、[アルファ拡張](アルファ拡張.md)。
 
+M5では標準colorimetryをBT.601/709/2020、PQ、HLGの5条件で確認し、318×178の422と319×179の444、同一pipelineでの色・解像度・形式変更をCPU全画素と照合した。奇数幅422は拒否する。専用RGB要素はBT.709限定を維持し、319×179の444も独立式で最大差1 code。詳細は[M5検証](M5色タグ・端数寸法・形式変更.md)。
+
 ## 比較用Vulkan版：proresvkdec
 
 ## Vulkan版の構成
