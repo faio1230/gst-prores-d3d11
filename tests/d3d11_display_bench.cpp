@@ -168,6 +168,8 @@ struct PresentLog {
         int foreground = -1;
         int foreground_overlap_percent = -1;
         int topmost = -1;
+        int left = -1;
+        int top = -1;
         int width = -1;
         int height = -1;
     };
@@ -303,6 +305,8 @@ static void sample_d3d11_window(HWND hwnd, PresentLog::WindowState* state) {
     state->topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) ? 1 : 0;
     RECT rect{};
     if (GetWindowRect(hwnd, &rect)) {
+        state->left = rect.left;
+        state->top = rect.top;
         state->width = rect.right - rect.left;
         state->height = rect.bottom - rect.top;
         if (foreground == hwnd) {
@@ -331,6 +335,20 @@ static BOOL CALLBACK find_d3d11_window(HWND hwnd, LPARAM param) {
         std::string(class_name) != "GSTD3D11") return TRUE;
     sample_d3d11_window(hwnd, reinterpret_cast<PresentLog::WindowState*>(param));
     return FALSE;
+}
+
+static double wait_for_visible_foreground_window(guint timeout_ms) {
+    const auto start = Clock::now();
+    while (ms(start, Clock::now()) <= timeout_ms) {
+        PresentLog::WindowState window;
+        window.found = 0;
+        EnumWindows(find_d3d11_window, reinterpret_cast<LPARAM>(&window));
+        if (window.found == 1 && window.visible == 1 && window.minimized == 0 &&
+            window.foreground == 1 && window.width > 0 && window.height > 0)
+            return ms(start, Clock::now());
+        Sleep(25);
+    }
+    throw std::runtime_error("invalid trial: visible foreground D3D11 sink window was not confirmed within 10 seconds");
 }
 
 static void on_present(GstElement*, GstObject*, gpointer, gpointer data) {
@@ -394,7 +412,7 @@ int main(int argc, char** argv) try {
     if (!gst_element_register(nullptr, "d3d11pushmeter", GST_RANK_NONE, gst_timed_push_get_type()))
         throw std::runtime_error("cannot register display push meter");
     if (argc < 4)
-        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb|direct-ayuv|deinterlace] [queue-before-decoder] [queue-after-rgb] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [topmost-window] [sink-ts-offset-ms=N] [sink-processing-deadline-ms=N] [present-sync1] [settle-ms=N] [preplay-delay-ms=N] [interval-warmup=N]]");
+        throw std::runtime_error("usage: d3d11_display_bench input.mov|testsrc-rgb|testsrc-heavy|testsrc-stress loops present.csv [stages.csv [preroll] [lossless] [native-rgb|direct-ayuv|deinterlace] [queue-before-decoder] [queue-after-rgb] [decoder-no-qos] [sink-no-clock-sync] [sink-stall-ms=N] [trace-sink-return] [trace-window-state] [require-visible-foreground] [topmost-window] [sink-ts-offset-ms=N] [sink-processing-deadline-ms=N] [present-sync1] [settle-ms=N] [preplay-delay-ms=N] [interval-warmup=N]]");
     bool preroll = false;
     bool lossless = false;
     bool native_rgb = false;
@@ -405,6 +423,7 @@ int main(int argc, char** argv) try {
     bool decoder_no_qos = false;
     bool trace_sink_return = false;
     bool trace_window_state = false;
+    bool require_visible_foreground = false;
     bool topmost_window = false;
     bool present_sync1 = false;
     bool sink_clock_sync = true;
@@ -426,6 +445,7 @@ int main(int argc, char** argv) try {
         else if (option == "decoder-no-qos") decoder_no_qos = true;
         else if (option == "trace-sink-return") trace_sink_return = true;
         else if (option == "trace-window-state") trace_window_state = true;
+        else if (option == "require-visible-foreground") { require_visible_foreground = true; trace_window_state = true; }
         else if (option == "topmost-window") { topmost_window = true; trace_window_state = true; }
         else if (option == "present-sync1") present_sync1 = true;
         else if (option == "sink-no-clock-sync") sink_clock_sync = false;
@@ -455,6 +475,8 @@ int main(int argc, char** argv) try {
         throw std::runtime_error("sink processing deadline must be between 0 and 100ms");
     if (present_sync1 && !preroll)
         throw std::runtime_error("present-sync1 requires preroll before installing the diagnostic hook");
+    if (require_visible_foreground && !preroll)
+        throw std::runtime_error("require-visible-foreground requires preroll");
     const int loops = std::stoi(argv[2]);
     if (loops < 1) throw std::runtime_error("loops must be positive");
     const std::string input(argv[1]);
@@ -590,6 +612,8 @@ int main(int argc, char** argv) try {
         preroll_ms = ms(preroll_start, Clock::now());
     }
     if (preplay_delay_ms) Sleep(preplay_delay_ms);
+    const double foreground_ready_wait_ms = require_visible_foreground
+        ? wait_for_visible_foreground_window(10000) : -1.0;
     if (present_sync1) present_hook.install(sink);
     const auto start = Clock::now();
     const auto cpu_start = cpu_seconds();
@@ -653,7 +677,7 @@ int main(int argc, char** argv) try {
                               sizeof(memory))) throw std::runtime_error("GetProcessMemoryInfo failed");
     std::ofstream csv(argv[3]);
     if (!csv) throw std::runtime_error("cannot open present CSV");
-    csv << "loop,present_index,wall_ms,interval_ms,pts_ns,window_found,window_visible,window_minimized,window_foreground,window_foreground_overlap_percent,window_topmost,window_width,window_height\n";
+    csv << "loop,present_index,wall_ms,interval_ms,pts_ns,window_found,window_visible,window_minimized,window_foreground,window_foreground_overlap_percent,window_topmost,window_left,window_top,window_width,window_height\n";
     std::vector<double> intervals;
     for (int loop = 0; loop < loops; ++loop) {
         for (std::size_t i = endpoints[loop]; i < endpoints[loop + 1]; ++i) {
@@ -663,7 +687,8 @@ int main(int argc, char** argv) try {
             const auto& window = presents.windows[i];
             csv << ',' << window.found << ',' << window.visible << ',' << window.minimized
                 << ',' << window.foreground << ',' << window.foreground_overlap_percent
-                << ',' << window.topmost << ',' << window.width << ',' << window.height;
+                << ',' << window.topmost << ',' << window.left << ',' << window.top
+                << ',' << window.width << ',' << window.height;
             csv << '\n';
             if (i > endpoints[loop] + interval_warmup) intervals.push_back(interval);
         }
@@ -701,6 +726,8 @@ int main(int argc, char** argv) try {
               << ",\"decoder_no_qos\":" << (decoder_no_qos ? "true" : "false")
               << ",\"trace_sink_return\":" << (trace_sink_return ? "true" : "false")
               << ",\"trace_window_state\":" << (trace_window_state ? "true" : "false")
+              << ",\"require_visible_foreground\":" << (require_visible_foreground ? "true" : "false")
+              << ",\"foreground_ready_wait_ms\":" << foreground_ready_wait_ms
               << ",\"topmost_window\":" << (topmost_window ? "true" : "false")
               << ",\"topmost_request_ok\":" << (presents.topmost_request_ok ? "true" : "false")
               << ",\"sink_ts_offset_ms\":" << sink_ts_offset_ms

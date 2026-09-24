@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import math
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -41,17 +42,82 @@ def cpu_stages(path, source_frames):
     return result
 
 
-def window_stats(path):
+def percentile(values, fraction):
+    values = sorted(values)
+    return values[math.ceil((len(values) - 1) * fraction)] if values else None
+
+
+def window_stats(path, loops, position, pts, cpu, source_frames, sink_loops):
     with path.open(newline="", encoding="utf-8-sig") as stream:
         rows = list(csv.DictReader(stream))
     observed = [row for row in rows if row["window_found"] == "1"]
-    return {
+    all_stats = {
         "present_rows": len(rows),
         "window_observed": len(observed),
         "window_visible": sum(row["window_visible"] == "1" for row in observed),
         "window_foreground": sum(row["window_foreground"] == "1" for row in observed),
         "window_background": sum(row["window_foreground"] == "0" for row in observed),
     }
+    by_loop = defaultdict(list)
+    for row in rows:
+        by_loop[int(row["loop"])].append(row)
+    loop_stats = []
+    last_state = None
+    for loop in range(loops):
+        current = by_loop[loop]
+        states = [
+            (row["window_foreground"], row.get("window_left"), row.get("window_top"),
+             row["window_width"], row["window_height"])
+            for row in current
+        ]
+        transition = len(set(states)) > 1 or bool(states and last_state and states[0] != last_state)
+        if states:
+            last_state = states[-1]
+        visible = bool(current) and all(row["window_found"] == "1" and
+                                       row["window_visible"] == "1" and
+                                       row["window_minimized"] == "0" for row in current)
+        wanted = "1" if position == "foreground" else "0"
+        position_met = bool(current) and all(row["window_foreground"] == wanted for row in current)
+        rect_present = bool(current) and all(row.get("window_left") is not None and
+                                             row.get("window_top") is not None and
+                                             int(row["window_width"]) > 0 and
+                                             int(row["window_height"]) > 0 for row in current)
+        count_ok = (sum(key[0] == loop for key in pts["compressed"]) == source_frames and
+                    len([key for key in pts["decoded"] if key[0] == loop]) <= source_frames and
+                    len([key for key in cpu if key[0] == loop]) == source_frames)
+        if loop == 0:
+            category = "warmup"
+        elif transition:
+            category = "state_transition"
+        elif not (visible and position_met and rect_present and count_ok):
+            category = "invalid_window_or_stream"
+        else:
+            category = "valid"
+        missing = sorted(frame_pts for stage_loop, frame_pts in
+                         pts["compressed"] - pts["decoded"] if stage_loop == loop)
+        interval = [float(row["interval_ms"]) for row in current
+                    if int(row["present_index"]) > (30 if source_frames >= 480 else 2)]
+        loop_stats.append({
+            "loop": loop,
+            "category": category,
+            "state_transition": transition,
+            "visible": visible,
+            "position_met": position_met,
+            "rect_present": rect_present,
+            "decoder_input": sum(key[0] == loop for key in pts["compressed"]),
+            "decoder_output": sum(key[0] == loop for key in pts["decoded"]),
+            "decoder_qos_missing": len(missing),
+            "missing_frames": [
+                {"pts_ns": frame_pts, "cpu": cpu.get((loop, frame_pts))}
+                for frame_pts in missing
+            ],
+            "sink_drop": sink_loops[loop]["dropped"],
+            "sink_rendered": sink_loops[loop]["rendered"],
+            "present_rows": len(current),
+            "present_interval_p99_ms": percentile(interval, .99),
+            "present_interval_max_ms": max(interval) if interval else None,
+        })
+    return all_stats, loop_stats
 
 
 def main():
@@ -70,11 +136,11 @@ def main():
     missing = sorted(pts["compressed"] - pts["decoded"])
     extra = sorted(pts["decoded"] - pts["compressed"])
     cpu = cpu_stages(args.stderr_log, args.source_frames)
-    windows = window_stats(args.present_csv)
-    position_met = (windows["window_observed"] == windows["present_rows"] and
-                    (windows["window_foreground"] == windows["present_rows"]
-                     if args.position == "foreground" else
-                     windows["window_background"] == windows["present_rows"]))
+    windows, loop_stats = window_stats(args.present_csv, trial["loops"], args.position,
+                                       pts, cpu, args.source_frames, trial["per_loop"])
+    valid_loops = [row for row in loop_stats if row["category"] == "valid"]
+    excluded_loops = [row for row in loop_stats if row["category"] != "valid"]
+    invalid_loops = [row for row in loop_stats if row["category"] == "invalid_window_or_stream"]
     result = {
         "trial": args.trial_json.stem,
         "display_path": trial["display_path"],
@@ -97,18 +163,29 @@ def main():
         "decoder_qos_enabled": not trial["decoder_no_qos"],
         "normal_sink_policy": not trial["lossless_sink_policy"],
         "window": windows,
-        "position_met": position_met,
+        "preplay_window_confirmed": trial.get("require_visible_foreground", False),
+        "preplay_wait_ms": trial.get("foreground_ready_wait_ms"),
+        "loop_stats": loop_stats,
+        "valid_loops": len(valid_loops),
+        "valid_decoder_qos_missing": sum(row["decoder_qos_missing"] for row in valid_loops),
+        "excluded_decoder_qos_missing": sum(row["decoder_qos_missing"] for row in excluded_loops),
+        "state_transition_loops": [row["loop"] for row in loop_stats
+                                   if row["category"] == "state_transition"],
+        "invalid_loops": [row["loop"] for row in invalid_loops],
         "missing_frames": [
             {"loop": loop, "pts_ns": frame_pts, "cpu": cpu.get((loop, frame_pts))}
             for loop, frame_pts in missing
         ],
     }
     result["valid"] = (len(pts["compressed"]) == expected and
-                       len(cpu) == expected and not extra and
+                       len(cpu) == expected and not extra and bool(valid_loops) and
+                       not invalid_loops and
+                       trial.get("require_visible_foreground", False) and
                        trial["present_sync_interval"] == 0 and
                        trial["sink_clock_sync"] and not trial["decoder_no_qos"] and
-                       not trial["lossless_sink_policy"] and
-                       position_met)
+                       not trial["lossless_sink_policy"])
+    result["gate_passed"] = (result["valid"] and
+                             result["valid_decoder_qos_missing"] == 0)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False))
