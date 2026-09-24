@@ -2,11 +2,11 @@
 
 このディレクトリは独立DLLの動作検証用ステージです。公開配布物としては未完成です。リポジトリの公開ライセンス、派生ソースの提供方法、実表示と他GPUの採用判定が未完了です。
 
-`gstproresd3d11.dll` は `proresd3d11dec`（ProRes復号）と `proresd3d11rgb`（BT.709専用RGB変換）を登録します。復号器の対応範囲は progressive ProRes 422 HQ、10bit、alphaなし。Proxy/LT/Standard、4444/XQ、interlace、12bit、alphaは対象外です。CPU/Vulkanへの暗黙fallbackはありません。
+`gstproresd3d11.dll` は `proresd3d11dec`（ProRes復号）と `proresd3d11rgb`（BT.709専用RGB変換）を登録します。復号器の採用範囲はprogressive ProResの6 FourCC、422/444、10/12bit、alphaなし/8/16bitです。interlaceと途中形式変更は未採用です。CPU/Vulkanへの暗黙fallbackはありません。
 
-復号出力は `video/x-raw(memory:D3D11Memory),format=I422_10LE` で、3枚のR16_UNORM textureです。通常経路で復号画像をCPUへ読み戻しません。RGB要素はBT.709 limited、中央または未指定のクロマ位置に限り、`RGB10A2_LE(memory:D3D11Memory)` を出力します。
+alphaなしの復号出力は`I422_10LE`/`Y444_10LE`/`I422_12LE`/`Y444_12LE`の3面R16_UNORM、alpha付きは`AYUV64`の単一R16G16B16A16_UNORMです。いずれも`video/x-raw(memory:D3D11Memory)`で、通常経路で画像をCPUへ読み戻しません。RGB要素はBT.709 limited入力だけを受け、alphaなしは`RGB10A2_LE`、alpha付きは`RGBA64_LE`のD3D11Memoryを出力します。
 
-検証済み環境はWindows x64、GStreamer 1.28.2 MSVC x64、Direct3D feature level 11_0以上・R16_UNORM typed UAV対応のRTX 3070です。DXGIでソフトウェアと報告されるWARP等のdeviceは、SM5対応でもGPU復号器として受け付けません。他の物理GPUの動作は未検証です。GStreamer本体とMSVC runtimeは同梱していません。プラグインDLLと3つの`.cso`を同じディレクトリに置いてください。
+検証済み環境はWindows x64、GStreamer 1.28.2 MSVC x64、Direct3D feature level 11_0以上・R16_UNORM/R16G16B16A16_UNORM typed UAV対応のRTX 3070です。DXGIでソフトウェアと報告されるWARP等のdeviceは、SM5対応でもGPU復号器として受け付けません。他の物理GPUの動作は未検証です。GStreamer本体とMSVC runtimeは同梱していません。プラグインDLLと6つの`.cso`を同じディレクトリに置いてください。
 
 PowerShellでGStreamerの`bin`をPATH先頭に置き、`GST_PLUGIN_PATH`をこのディレクトリへ設定してから、`gst-inspect-1.0 proresd3d11dec` と `gst-inspect-1.0 proresd3d11rgb` で登録を確認できます。独立したパイプライン例：
 
@@ -19,6 +19,8 @@ filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! video/x-raw(memory:D3D1
 ```text
 filesrc location=bt709-hq.mov ! qtdemux ! proresd3d11dec ! proresd3d11rgb ! video/x-raw(memory:D3D11Memory),format=RGB10A2_LE ! fakesink sync=false
 ```
+
+alpha付きBT.709素材では復号出力`AYUV64`、RGB出力`RGBA64_LE`を使用します。alphaの有無とbit深度はProRes frame headerから判定し、範囲外の値は`STREAM/FORMAT`で停止します。
 
 `source/`にはDX11版DLLのC++/HLSLソースと、FFmpeg/Vulkan SDKを必要としない単独ビルド定義を含めます。Visual StudioのMSVC x64・Windows SDK・GStreamer MSVC x64 SDKを用意し、ステージのディレクトリから次のように再ビルドできます（generator名はインストール済みのVisual Studioに合わせてください）。
 

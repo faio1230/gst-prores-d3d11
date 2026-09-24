@@ -22,19 +22,25 @@ $launch = Join-Path $gstBin 'gst-launch-1.0.exe'
 $ffmpeg = Join-Path $root 'tools/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1/bin/ffmpeg.exe'
 $fixture1080 = Join-Path $root 'media/synthetic-1080p60-hq.mov'
 $fixture4k = Join-Path $root 'media/synthetic-2160p60-hq.mov'
+$fixtureAlpha = Join-Path $root 'media/feature-matrix-2026-09-24/ap4h-alpha8.mov'
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $files = @(
     'gstproresd3d11.dll', 'prores_vld.cso', 'prores_idct_unorm.cso', 'prores_rgb.cso',
-    'prores_vld.hlsl', 'prores_idct.hlsl', 'prores_rgb.hlsl'
+    'prores_alpha.cso', 'prores_pack_alpha.cso', 'prores_rgb_alpha.cso',
+    'prores_vld.hlsl', 'prores_idct.hlsl', 'prores_rgb.hlsl',
+    'prores_alpha.hlsl', 'prores_pack_alpha.hlsl', 'prores_rgb_alpha.hlsl'
 )
 $sourceFiles = @(
     'gstproresd3d11dec.cpp', 'gstproresd3d11rgb.cpp', 'd3d11_hardware_device.hpp',
     'prores_parser.cpp', 'prores_parser.hpp', 'd3d11_bounded_map.hpp',
-    'prores_vld.hlsl', 'prores_idct.hlsl', 'prores_rgb.hlsl'
+    'prores_vld.hlsl', 'prores_idct.hlsl', 'prores_rgb.hlsl',
+    'prores_alpha.hlsl', 'prores_pack_alpha.hlsl', 'prores_rgb_alpha.hlsl'
 )
 $sourceCmake = Join-Path $root 'packaging/CMakeLists.txt'
-$docs = @('GStreamerプラグイン.md', '採用判断サマリー.md', 'DX11実装検証.md')
-foreach ($required in @($inspect, $launch, $ffmpeg, $fixture1080, $fixture4k, $vswhere,
+$docs = @('GStreamerプラグイン.md', '採用判断サマリー.md', 'DX11実装検証.md',
+    '機能対応表.md', 'アルファ拡張.md')
+foreach ($required in @($inspect, $launch, $ffmpeg, $fixture1080, $fixture4k,
+    $fixtureAlpha, $vswhere,
     (Join-Path $root 'packaging/README-ja.md'), $sourceCmake) +
     @($files | ForEach-Object { Join-Path $artifactDir $_ }) +
     @($sourceFiles | ForEach-Object { Join-Path (Join-Path $root 'src') $_ }) +
@@ -96,7 +102,8 @@ if ($LASTEXITCODE -ne 0) { throw "独立ソースのCMake構成に失敗: $sourc
 if ($LASTEXITCODE -ne 0) { throw "独立ソースの再ビルドに失敗: $sourceBuildLog" }
 $rebuiltDir = Join-Path $sourceBuild 'plugins/Release'
 $rebuiltDll = Join-Path $rebuiltDir 'gstproresd3d11.dll'
-foreach ($file in @('gstproresd3d11.dll', 'prores_vld.cso', 'prores_idct_unorm.cso', 'prores_rgb.cso')) {
+foreach ($file in @('gstproresd3d11.dll', 'prores_vld.cso', 'prores_idct_unorm.cso',
+    'prores_rgb.cso', 'prores_alpha.cso', 'prores_pack_alpha.cso', 'prores_rgb_alpha.cso')) {
     if (!(Test-Path -LiteralPath (Join-Path $rebuiltDir $file))) {
         throw "独立ソースの再ビルド成果物が不足: $file"
     }
@@ -145,6 +152,21 @@ try {
         fakesink sync=false *> $log
     if ($LASTEXITCODE -ne 0) { throw "ステージのDX11 RGB変換に失敗: $log" }
     $pipelineResults += [ordered]@{ input = 'stage-d3d11-bt709-fixture.mov'; output = 'RGB10A2_LE D3D11Memory'; passed = $true }
+    $alphaInput = $fixtureAlpha -replace '\\', '/'
+    & $launch -q -e filesrc "location=$alphaInput" ! qtdemux ! proresd3d11dec ! `
+        'video/x-raw(memory:D3D11Memory),format=AYUV64' ! fakesink sync=false *> $log
+    if ($LASTEXITCODE -ne 0) { throw "ステージのDX11 alpha復号に失敗: $log" }
+    $pipelineResults += [ordered]@{ input = (Split-Path $fixtureAlpha -Leaf); output = 'AYUV64 D3D11Memory'; passed = $true }
+    $taggedAlpha = Join-Path $build 'stage-d3d11-alpha-bt709-fixture.mov'
+    & $ffmpeg -hide_banner -loglevel error -i $fixtureAlpha -map 0:v:0 -c:v copy `
+        -color_primaries bt709 -color_trc bt709 -colorspace bt709 -movflags +write_colr -y $taggedAlpha
+    if ($LASTEXITCODE -ne 0) { throw '固定FFmpeg SDKによるalpha色付き検査素材の作成に失敗' }
+    $alphaRgbInput = $taggedAlpha -replace '\\', '/'
+    & $launch -q -e filesrc "location=$alphaRgbInput" ! qtdemux ! proresd3d11dec ! `
+        proresd3d11rgb ! 'video/x-raw(memory:D3D11Memory),format=RGBA64_LE' ! `
+        fakesink sync=false *> $log
+    if ($LASTEXITCODE -ne 0) { throw "ステージのDX11 RGBA変換に失敗: $log" }
+    $pipelineResults += [ordered]@{ input = 'stage-d3d11-alpha-bt709-fixture.mov'; output = 'RGBA64_LE D3D11Memory'; passed = $true }
     $env:GST_PLUGIN_PATH = $rebuiltDir
     $env:GST_REGISTRY = Join-Path $build ("stage-source-registry-" + [guid]::NewGuid().ToString('N') + '.bin')
     foreach ($element in @('proresd3d11dec', 'proresd3d11rgb')) {
@@ -158,6 +180,13 @@ try {
         'video/x-raw(memory:D3D11Memory),format=RGB10A2_LE' ! fakesink sync=false `
         *> $log
     if ($LASTEXITCODE -ne 0) { throw "独立ソース再ビルドのRGB経路が失敗: $log" }
+    & $launch -q -e filesrc "location=$alphaInput" ! qtdemux ! proresd3d11dec ! `
+        'video/x-raw(memory:D3D11Memory),format=AYUV64' ! fakesink sync=false *> $log
+    if ($LASTEXITCODE -ne 0) { throw "独立ソース再ビルドのalpha復号が失敗: $log" }
+    & $launch -q -e filesrc "location=$alphaRgbInput" ! qtdemux ! proresd3d11dec ! `
+        proresd3d11rgb ! 'video/x-raw(memory:D3D11Memory),format=RGBA64_LE' ! `
+        fakesink sync=false *> $log
+    if ($LASTEXITCODE -ne 0) { throw "独立ソース再ビルドのRGBA経路が失敗: $log" }
     $version = (& $inspect --version | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'GStreamer版を取得できません' }
     $commit = (& git -C $root rev-parse HEAD).Trim()
@@ -187,7 +216,7 @@ try {
         source_rebuild = [ordered]@{
             passed = $true
             independent_source_directory = $sourceOut
-            output = 'proresd3d11dec ! proresd3d11rgb -> RGB10A2_LE D3D11Memory'
+            output = 'I422_10LE/AYUV64およびRGB10A2_LE/RGBA64_LE D3D11Memory'
             direct_dll_dependencies = $rebuiltImports
         }
         outstanding_gates = @('公開ライセンスと対応ソースの提供条件', '実表示の安定性', '他GPUと実際のdevice lost')

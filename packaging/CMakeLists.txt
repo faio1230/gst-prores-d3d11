@@ -9,8 +9,10 @@ endif()
 add_library(gstproresd3d11 MODULE
   src/gstproresd3d11dec.cpp src/gstproresd3d11rgb.cpp src/prores_parser.cpp
   src/d3d11_bounded_map.hpp
-  src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl)
+  src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl
+  src/prores_alpha.hlsl src/prores_pack_alpha.hlsl src/prores_rgb_alpha.hlsl)
 set_source_files_properties(src/prores_vld.hlsl src/prores_idct.hlsl src/prores_rgb.hlsl
+  src/prores_alpha.hlsl src/prores_pack_alpha.hlsl src/prores_rgb_alpha.hlsl
   PROPERTIES HEADER_FILE_ONLY TRUE)
 target_include_directories(gstproresd3d11 PRIVATE "${CMAKE_SOURCE_DIR}/src"
   "${GSTREAMER_ROOT}/include/gstreamer-1.0" "${GSTREAMER_ROOT}/include/glib-2.0"
@@ -44,4 +46,13 @@ add_custom_command(TARGET gstproresd3d11 PRE_BUILD
     "${CMAKE_SOURCE_DIR}/src/prores_idct.hlsl"
   COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
     /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_rgb.cso"
-    "${CMAKE_SOURCE_DIR}/src/prores_rgb.hlsl")
+    "${CMAKE_SOURCE_DIR}/src/prores_rgb.hlsl"
+  COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
+    /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_alpha.cso"
+    "${CMAKE_SOURCE_DIR}/src/prores_alpha.hlsl"
+  COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
+    /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_pack_alpha.cso"
+    "${CMAKE_SOURCE_DIR}/src/prores_pack_alpha.hlsl"
+  COMMAND "${FXC_EXECUTABLE}" /nologo /Ges /O3 /T cs_5_0 /E main
+    /Fo "$<TARGET_FILE_DIR:gstproresd3d11>/prores_rgb_alpha.cso"
+    "${CMAKE_SOURCE_DIR}/src/prores_rgb_alpha.hlsl")

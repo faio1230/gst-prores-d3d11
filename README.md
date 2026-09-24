@@ -4,7 +4,7 @@
 
 完成形は `video/x-prores → DX11 Compute Shaderによる復号 → video/x-raw(memory:D3D11Memory)`。復号画像をCPUへ読み戻さず、Vulkanに依存しない経路を目指します。現在の `proresvkdec` はFFmpeg Vulkanを使う比較・検証用の中間成果で、最終成果物ではありません。以後の主実装はDX11ネイティブ復号とD3D11Memory出力に置きます。
 
-**純粋DX11のProRes GPU復号は、alphaなし・progressiveの422/444・10/12bitまで段階的に採用済みです。goal全体は未完了です。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTを行い、GStreamerの3面D3D11Memoryへ直接出力します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodec、画像のGPU内コピーはありません。M2の18素材780枚で係数完全一致・CPU画素との差最大1を確認し、同じ形式をRGB10A2 D3D11Memoryへ変換できました。alpha、インターレース、途中形式変更、他GPU、最後の実表示QoSは未達です。対応範囲と数値は[機能対応表](docs/機能対応表.md)と[444・12bit拡張](docs/444・12bit拡張.md)を参照してください。
+**純粋DX11のProRes GPU復号は、progressiveの422/444・10/12bit・alphaなし/8/16bitまで採用済みです。goal全体は未完了です。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTとalphaのエントロピー復号を行います。alphaなしは3面、alpha付きは`AYUV64`の単一`GstD3D11Memory`へ出力し、`proresd3d11rgb`はそれぞれRGB10A2/RGBA64へGPUで変換します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodecへのfallbackはありません。M3の24交差条件でalpha差0・YUV差最大1、全条件の4K directは最低84.55 fps。インターレース、途中形式変更、他GPU、最後の実表示QoSは未達です。対応範囲と数値は[機能対応表](docs/機能対応表.md)と[アルファ拡張](docs/アルファ拡張.md)を参照してください。
 
 ```powershell
 ./scripts/bootstrap.ps1
