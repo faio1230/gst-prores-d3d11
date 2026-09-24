@@ -37,6 +37,8 @@ struct Frame {
     std::uint16_t height = 0;
     std::uint16_t mb_width = 0;
     std::uint16_t mb_height = 0;
+    std::uint8_t chroma_shift = 1;
+    std::uint8_t bit_depth = 10;
     std::uint8_t color_primaries = 0;
     std::uint8_t transfer_characteristic = 0;
     std::uint8_t matrix_coefficients = 0;
@@ -45,11 +47,11 @@ struct Frame {
     std::vector<Slice> slices;
 };
 
-// The first implementation intentionally accepts only the target contract:
-// one complete progressive, alpha-free, 10-bit ProRes 422 frame.
+// One complete progressive, alpha-free ProRes frame. Bit depth comes from
+// the container FourCC; chroma sampling comes from the frame header.
 bool parse_frame(const std::uint8_t* data, std::size_t size,
                  std::uint16_t expected_width, std::uint16_t expected_height,
-                 Frame& output, std::string& error);
+                 Frame& output, std::string& error, std::uint8_t bit_depth = 10);
 
 struct CoefficientJob {
     std::uint32_t data_offset = 0;

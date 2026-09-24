@@ -1,4 +1,4 @@
-// ProRes inverse quantization, inverse DCT, rounding and 10-bit clipping.
+// ProRes inverse quantization, inverse DCT, rounding and 10/12-bit clipping.
 // The separable transform is written directly here so the validation path has
 // an independent, readable CPU formula to compare against.
 
@@ -29,7 +29,7 @@ cbuffer Parameters : register(b0) {
     uint block_count;
     uint output_width;
     uint output_height;
-    uint reserved;
+    uint mode; // low bit: chroma horizontal shift; bits 8..15: output depth
 };
 
 static const float basis[64] = {
@@ -68,18 +68,19 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID) {
     sum = 0.0;
     [unroll] for (uint u = 0; u < 8; ++u)
         sum += column_idct[y * 8 + u] * basis[u * 8 + x];
-    // ProRes coefficients are defined for a 12-bit transform domain.  The
-    // orthogonal 8x8 inverse transform contributes 1/4 and conversion from the
-    // 12-bit domain to the requested 10-bit samples contributes another 1/4.
-    // FFmpeg's 10-bit ProRes reference limits decoded codes to 4..1019.
-    // Lower-bitrate 422 profiles reach this range at high-contrast edges.
-    int value = clamp(int(round(512.0 + sum * (1.0 / 16.0))), 4, 1019);
+    // The orthogonal 8x8 inverse transform contributes 1/4. The 10-bit
+    // output additionally divides the 12-bit coefficient domain by four.
+    uint bit_depth = (mode >> 8) & 255u;
+    float scale = bit_depth == 12u ? 0.25 : 0.0625;
+    float bias = bit_depth == 12u ? 2048.0 : 512.0;
+    int maximum = bit_depth == 12u ? 4091 : 1019;
+    int value = clamp(int(round(bias + sum * scale)), 4, maximum);
     uint2 destination = uint2(job.destination_x + x, job.destination_y + y);
-    uint plane_width = job.component == 0 ? output_width : output_width >> 1;
+    uint plane_width = job.component == 0 ? output_width : output_width >> (mode & 1u);
     if (destination.x >= plane_width || destination.y >= output_height) return;
 #ifdef PRORES_OUTPUT_UNORM
-    // GStreamer I422_10LE stores the 10-bit code in the low bits of its
-    // 16-bit container even though the D3D resource view is R16_UNORM.
+    // GStreamer planar 10/12-bit formats store the code in the low bits of
+    // the 16-bit container even though the D3D resource view is R16_UNORM.
     float normalized = float(value) / 65535.0;
     if (job.component == 0) output_y[destination] = normalized;
     else if (job.component == 1) output_u[destination] = normalized;

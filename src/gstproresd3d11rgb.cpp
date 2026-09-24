@@ -1,4 +1,4 @@
-/* Native D3D11 I422_10LE -> RGB10A2_LE color converter.
+/* Native D3D11 planar 422/444 10/12-bit -> RGB10A2_LE color converter.
  * The compute shader writes directly into a GstD3D11BufferPool texture.
  */
 #include "d3d11_hardware_device.hpp"
@@ -62,15 +62,17 @@ private:
 struct Parameters {
     std::uint32_t width;
     std::uint32_t height;
-    std::uint32_t reserved[2]{};
+    std::uint32_t mode;
+    std::uint32_t reserved = 0;
 };
 
 class RgbBackend {
 public:
-    RgbBackend(GstD3D11Device* gst_device, unsigned width, unsigned height)
+    RgbBackend(GstD3D11Device* gst_device, unsigned width, unsigned height,
+               unsigned chroma_shift, unsigned bit_depth)
         : gst_device_(gst_device), device_(gst_d3d11_device_get_device_handle(gst_device)),
           context_(gst_d3d11_device_get_device_context_handle(gst_device)),
-          width_(width), height_(height) {
+          width_(width), height_(height), chroma_shift_(chroma_shift) {
         require(device_ && context_, "missing native D3D11 handles");
         require_d3d11_non_software_adapter(device_);
         require(device_->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0,
@@ -100,7 +102,7 @@ public:
         require(static_cast<bool>(file), "cannot read prores_rgb.cso");
         check_hr(device_->CreateComputeShader(bytes.data(), bytes.size(), nullptr, &shader_),
                  "CreateComputeShader RGB");
-        Parameters parameters{width, height};
+        Parameters parameters{width, height, (bit_depth << 8) | chroma_shift};
         D3D11_BUFFER_DESC desc{};
         desc.ByteWidth = sizeof(Parameters);
         desc.Usage = D3D11_USAGE_DEFAULT;
@@ -122,7 +124,7 @@ public:
             D3D11_TEXTURE2D_DESC desc{};
             const bool has_desc = gst_d3d11_memory_get_texture_desc(d3d_memory, &desc);
             if (!has_desc || desc.Format != DXGI_FORMAT_R16_UNORM || desc.ArraySize != 1 ||
-                desc.Width != (index ? width_ / 2 : width_) || desc.Height != height_ ||
+                desc.Width != (index ? width_ >> chroma_shift_ : width_) || desc.Height != height_ ||
                 !(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE))
                 throw std::runtime_error("RGB input plane topology is unexpected: plane=" +
                     std::to_string(index) + " format=" + std::to_string(desc.Format) +
@@ -177,6 +179,7 @@ private:
     ID3D11DeviceContext* context_;
     unsigned width_;
     unsigned height_;
+    unsigned chroma_shift_;
     ComPtr<ID3D11ComputeShader> shader_;
     ComPtr<ID3D11Buffer> constants_;
 };
@@ -199,7 +202,8 @@ G_DEFINE_TYPE(GstProresD3D11Rgb, gst_prores_d3d11_rgb, GST_TYPE_BASE_TRANSFORM)
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
     "sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("video/x-raw(memory:D3D11Memory), format=(string)I422_10LE, "
+    GST_STATIC_CAPS("video/x-raw(memory:D3D11Memory), "
+                    "format=(string){ I422_10LE, Y444_10LE, I422_12LE, Y444_12LE }, "
                     "width=(int)[16,8192], height=(int)[16,8192]"));
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src", GST_PAD_SRC, GST_PAD_ALWAYS,
@@ -221,11 +225,23 @@ static GstCaps* transform_caps(GstBaseTransform*, GstPadDirection direction,
     auto* result = gst_caps_copy(caps);
     for (guint index = 0; index < gst_caps_get_size(result); ++index) {
         auto* structure = gst_caps_get_structure(result, index);
-        gst_structure_set(structure,
-                          "format", G_TYPE_STRING,
-                          direction == GST_PAD_SINK ? "RGB10A2_LE" : "I422_10LE",
-                          "colorimetry", G_TYPE_STRING,
+        gst_structure_set(structure, "colorimetry", G_TYPE_STRING,
                           direction == GST_PAD_SINK ? "1:1:5:1" : "bt709", nullptr);
+        if (direction == GST_PAD_SINK) {
+            gst_structure_set(structure, "format", G_TYPE_STRING, "RGB10A2_LE", nullptr);
+        } else {
+            GValue formats = G_VALUE_INIT;
+            g_value_init(&formats, GST_TYPE_LIST);
+            for (const char* name : {"I422_10LE", "Y444_10LE", "I422_12LE", "Y444_12LE"}) {
+                GValue value = G_VALUE_INIT;
+                g_value_init(&value, G_TYPE_STRING);
+                g_value_set_string(&value, name);
+                gst_value_list_append_value(&formats, &value);
+                g_value_unset(&value);
+            }
+            gst_structure_set_value(structure, "format", &formats);
+            g_value_unset(&formats);
+        }
         gst_structure_remove_field(structure, "chroma-site");
     }
     if (filter) {
@@ -243,7 +259,10 @@ static gboolean set_caps(GstBaseTransform* transform, GstCaps* input, GstCaps* o
     const char* chroma_site = gst_structure_get_string(gst_caps_get_structure(input, 0),
                                                         "chroma-site");
     if (!gst_video_info_from_caps(&in, input) || !gst_video_info_from_caps(&out, output) ||
-        GST_VIDEO_INFO_FORMAT(&in) != GST_VIDEO_FORMAT_I422_10LE ||
+        (GST_VIDEO_INFO_FORMAT(&in) != GST_VIDEO_FORMAT_I422_10LE &&
+         GST_VIDEO_INFO_FORMAT(&in) != GST_VIDEO_FORMAT_Y444_10LE &&
+         GST_VIDEO_INFO_FORMAT(&in) != GST_VIDEO_FORMAT_I422_12LE &&
+         GST_VIDEO_INFO_FORMAT(&in) != GST_VIDEO_FORMAT_Y444_12LE) ||
         GST_VIDEO_INFO_FORMAT(&out) != GST_VIDEO_FORMAT_RGB10A2_LE ||
         in.width != out.width || in.height != out.height || (in.width & 1) ||
         in.interlace_mode != GST_VIDEO_INTERLACE_MODE_PROGRESSIVE ||
@@ -261,7 +280,7 @@ static gboolean set_caps(GstBaseTransform* transform, GstCaps* input, GstCaps* o
                                     GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY) ||
         !gst_caps_features_contains(gst_caps_get_features(output, 0),
                                     GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY)) {
-        GST_ERROR_OBJECT(self, "expected progressive limited BT.709 I422 with centered or unspecified chroma site -> full RGB10A2 D3D11Memory");
+        GST_ERROR_OBJECT(self, "expected progressive limited BT.709 planar 422/444 10/12-bit -> full RGB10A2 D3D11Memory");
         return FALSE;
     }
     reset_gpu(self);
@@ -281,7 +300,13 @@ static void ensure_output_pool(GstProresD3D11Rgb* self, GstBuffer* input) {
     if (self->pool && self->device == device) return;
     reset_gpu(self);
     self->device = GST_D3D11_DEVICE(gst_object_ref(device));
-    self->backend = new RgbBackend(device, self->input_info.width, self->input_info.height);
+    const auto format = GST_VIDEO_INFO_FORMAT(&self->input_info);
+    const unsigned chroma_shift = format == GST_VIDEO_FORMAT_I422_10LE ||
+        format == GST_VIDEO_FORMAT_I422_12LE ? 1u : 0u;
+    const unsigned bit_depth = format == GST_VIDEO_FORMAT_I422_12LE ||
+        format == GST_VIDEO_FORMAT_Y444_12LE ? 12u : 10u;
+    self->backend = new RgbBackend(device, self->input_info.width, self->input_info.height,
+                                   chroma_shift, bit_depth);
     self->pool = gst_d3d11_buffer_pool_new(device);
     require(self->pool != nullptr, "cannot create RGB D3D11 buffer pool");
     auto* config = gst_buffer_pool_get_config(self->pool);
@@ -357,7 +382,7 @@ static void gst_prores_d3d11_rgb_class_init(GstProresD3D11RgbClass* klass) {
     object->finalize = finalize;
     auto* element = GST_ELEMENT_CLASS(klass);
     gst_element_class_set_static_metadata(element, "Native D3D11 BT.709 RGB converter",
-        "Filter/Converter/Video/Hardware", "I422_10LE to RGB10A2_LE D3D11Memory without image readback",
+        "Filter/Converter/Video/Hardware", "planar ProRes 422/444 10/12-bit to RGB10A2_LE D3D11Memory without image readback",
         "ProRes GPU project");
     gst_element_class_add_static_pad_template(element, &sink_template);
     gst_element_class_add_static_pad_template(element, &src_template);

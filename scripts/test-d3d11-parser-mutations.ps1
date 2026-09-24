@@ -46,8 +46,9 @@ $hashes = @()
 foreach ($name in $sources) {
     $source = Join-Path $root "media/$name"
     if (!(Test-Path -LiteralPath $source)) { throw "検査素材がありません: $source" }
-    $packet = Join-Path $seedDir "$name.packet"
-    & $ffmpeg -hide_banner -loglevel error -y -i $source -map '0:v:0' -frames:v 1 -c copy -f data $packet *> (Join-Path $build "$name.extract.log")
+    $seedName = [IO.Path]::GetFileName($name)
+    $packet = Join-Path $seedDir "$seedName.packet"
+    & $ffmpeg -hide_banner -loglevel error -y -i $source -map '0:v:0' -frames:v 1 -c copy -f data $packet *> (Join-Path $build "$seedName.extract.log")
     if ($LASTEXITCODE) { throw "固定FFmpegによるpacket抽出に失敗: $name" }
     $packets += $packet
     $hashes += [pscustomobject]@{

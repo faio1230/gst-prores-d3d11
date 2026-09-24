@@ -208,9 +208,12 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
 
 bool parse_frame(const std::uint8_t* data, std::size_t size,
                  std::uint16_t expected_width, std::uint16_t expected_height,
-                 Frame& output, std::string& error) {
+                 Frame& output, std::string& error, std::uint8_t bit_depth) {
     output = {};
     error.clear();
+    if (bit_depth != 10 && bit_depth != 12)
+        return fail(error, "unsupported ProRes bit depth");
+    output.bit_depth = bit_depth;
     if (!data || size < 28 || size > 128u * 1024u * 1024u)
         return fail(error, "frame size is outside the supported range");
     if (read_be32(data) != size || data[4] != 'i' || data[5] != 'c' ||
@@ -227,8 +230,10 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     if (!output.width || !output.height || (output.width & 1) ||
         (expected_width && output.width != expected_width) ||
         (expected_height && output.height != expected_height))
-        return fail(error, "frame dimensions do not match progressive 4:2:2 caps");
-    if ((header[12] & 0xc0) != 0x80) return fail(error, "only ProRes 4:2:2 is supported");
+        return fail(error, "frame dimensions do not match progressive caps");
+    if ((header[12] & 0xc0) != 0x80 && (header[12] & 0xc0) != 0xc0)
+        return fail(error, "unsupported ProRes chroma format");
+    output.chroma_shift = (header[12] & 0xc0) == 0xc0 ? 0 : 1;
     if (((header[12] >> 2) & 3) != 0) return fail(error, "interlaced ProRes is unsupported");
     if ((header[17] & 0x0f) != 0) return fail(error, "alpha ProRes is unsupported");
     output.color_primaries = header[14];
@@ -354,7 +359,7 @@ void make_coefficient_jobs(const Frame& frame,
         for (unsigned component = 0; component < 3; ++component) {
             const auto& plane = slice.planes[component];
             const auto block_count = static_cast<std::uint32_t>(slice.mb_count) *
-                                     (component == 0 ? 4u : 2u);
+                                     (component == 0 || frame.chroma_shift == 0 ? 4u : 2u);
             jobs.push_back({plane.offset, plane.size, block_count, coefficient_count});
             coefficient_count += block_count * 64;
         }
@@ -402,7 +407,7 @@ void make_idct_jobs(const Frame& frame,
             static_cast<std::uint32_t>(slice.quant_index - 96) * 4 : slice.quant_index;
         for (std::uint32_t component = 0; component < 3; ++component, ++job_index) {
             const auto& coefficient_job = coefficient_jobs[job_index];
-            const auto chroma_shift = component ? 1u : 0u;
+            const auto chroma_shift = component ? frame.chroma_shift : 0u;
             const auto base_x = static_cast<std::uint32_t>(slice.mb_x) << (4 - chroma_shift);
             const auto base_y = static_cast<std::uint32_t>(slice.mb_y) << 4;
             for (std::uint32_t block = 0; block < coefficient_job.block_count; ++block) {
@@ -411,9 +416,12 @@ void make_idct_jobs(const Frame& frame,
                 if (!component) {
                     block_x = ((block & ~2u) + 1u) >> 1;
                     block_y = (block >> 1) & 1;
+                } else if (frame.chroma_shift == 0) {
+                    block_x = ((block & ~3u) >> 1) + ((block >> 1) & 1u);
+                    block_y = block & 1u;
                 } else {
                     block_x = (block & ~1u) >> 1;
-                    block_y = block & 1;
+                    block_y = block & 1u;
                 }
                 idct_jobs.push_back({
                     coefficient_job.output_offset + block * 64,

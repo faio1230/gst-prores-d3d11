@@ -14,11 +14,11 @@ filesrc → qtdemux → proresd3d11dec → video/x-raw(memory:D3D11Memory)
                          └ GPU: Y/U/Vの3面R16_UNORM UAVへ直接書込み
 ```
 
-入力は `video/x-prores,variant=hq` の完全な1フレーム/バッファで、progressive、4:2:2、10bit、alphaなしに限定する。Proxy/LT/Standard、4444/XQ、12bit、alpha、interlaced、RAWは明示的に対象外。CPU/Vulkanへのfallbackはない。
+入力は`video/x-prores`の完全な1フレーム/バッファ。M2採用時点ではapco/apcs/apcn/apchの10bitとap4h/ap4xの12bitを、フレームヘッダーに応じた4:2:2または4:4:4で復号する。alphaなし・progressive・偶数幅に限定し、alpha、interlaced、RAWは明示的に拒否する。CPU/Vulkanへのfallbackはない。対応表と検査結果は[444・12bit拡張](444・12bit拡張.md)。
 
 受け取ったD3D11 deviceはDXGI adapterまでたどり、`DXGI_ADAPTER_FLAG_SOFTWARE`が立つWARP等をSM5対応でも拒否する。adapter情報を取得できない場合もGPU実行と推定せず拒否する。ソフトウェアflagがないことだけで物理GPUの動作保証とはしない。専用RGB要素にも同じ判定を適用する。WARPをGStreamer contextに注入したdecoderと、WARP製D3D11Memoryを専用RGB要素へ直接渡した実パイプラインは、どちらも`RESOURCE/FAILED`で停止した。他の物理GPUと実際のdevice lostは未検証。
 
-出力は `video/x-raw(memory:D3D11Memory),format=I422_10LE`。Yは幅×高さ、U/Vは幅/2×高さの3枚 `DXGI_FORMAT_R16_UNORM` textureで、全てSRV|UAV。IDCT shaderがpoolのtextureへ直接書くため通常経路の画像GPU copyは0回、画像のCPU読み戻しも0回。圧縮packetのCPU→GPU uploadと、小さいVLDエラーフラグのGPU→CPU検査は行うため、処理全体を無条件に「ゼロコピー」とは呼ばない。
+出力は`video/x-raw(memory:D3D11Memory)`の`I422_10LE`、`Y444_10LE`、`I422_12LE`、`Y444_12LE`。Y/U/Vの3枚の`DXGI_FORMAT_R16_UNORM` texture（全てSRV|UAV）へ、IDCT shaderがpoolから受け取ったtextureに直接書く。通常経路の画像GPU copyは0回、画像のCPU読み戻しも0回。圧縮packetのCPU→GPU uploadと、小さいVLDエラーフラグのGPU→CPU検査は行うため、処理全体を無条件に「ゼロコピー」とは呼ばない。
 
 VLDエラーフラグのstaging readは、[Microsoftの`Map`仕様](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-map)に従い`D3D11_MAP_FLAG_DO_NOT_WAIT`で処理中を判定し、10秒のポーリング期限を設けた。各処理中応答で`GetDeviceRemovedReason()`も確認する。期限超過やHRESULT失敗は画像を出さずGStreamerエラーへ進む。期限・device lost・通常完了の分岐はGPUを失わせない単体試験で確認し、実GPUの復号/EOS/seekと公開素材779枚を回帰した。ただし実際のdevice lost、driver内部でAPI呼出し自体が停止する事態、全GPUでの期限保証は未検証。画像のCPU読み戻しは増やしていない。
 
@@ -80,7 +80,7 @@ VLDを1-bit反復loadから32-bit windowへ変更する前の検査用download�
 
 D3D11下流検査ではdecoderの3面I422_10LEからd3d11convertのRGB10A2_LE、d3d11compositor出力まで `memory:D3D11Memory` を維持した。RGB10A2の全画素比較は実写1080p/4Kで行ったが、表示機器の色管理と素材のクロマ位置は未確定。compositor内部のrender/copy回数も未計測なので、この下流全体をゼロコピーとは呼ばない。保存ログは `results/proresd3d11-compositor-caps.log`。
 
-`src/prores_rgb.hlsl` を `proresd3d11rgb` 要素へ統合し、I422_10LE D3D11Memoryの3面から1面RGB10A2_LE D3D11MemoryへCompute Shaderで直接書く。CPU読み戻しは検査経路だけで、通常経路にはない。入力はprogressive・limited BT.709、中央または未指定のクロマ位置に限定し、未指定は中央として扱う。公開実写1080p全50枚／4K全129枚／4K60全480枚の全画素で独立BT.709式とのR/G/B最大差は各1 code。EOS、seek、停止・破棄後のbuffer寿命も検査した。現行の入力テクスチャはデコーダー出力と同じ3面R16_UNORM・SRV対応構成を要求する。I422_10LE D3D11MemoryというcapsだけではSRV bind flagが保証されず、外部ソースの別構成は拒否し得る。クロマ位置の物理的正しさ、表示機器の色管理、他GPUのtyped UAV対応も未確定。詳細は `docs/実素材と表示検証.md`。
+`src/prores_rgb.hlsl` を `proresd3d11rgb` 要素へ統合し、上記4種の3面D3D11Memoryから1面RGB10A2_LE D3D11MemoryへCompute Shaderで直接書く。CPU読み戻しは検査経路だけで、通常経路にはない。入力はprogressive・limited BT.709に限定し、422では中央または未指定のクロマ位置を中央として扱い、444では各画素のクロマを使う。公開HQ実写1080p全50枚／4K全129枚／4K60全480枚とM2の18素材780枚で、独立BT.709式とのR/G/B最大差は各1 code。EOS、seek、停止・破棄後のbuffer寿命も検査した。入力テクスチャはデコーダー出力と同じ3面R16_UNORM・SRV対応構成を要求する。capsだけではSRV bind flagが保証されず、外部ソースの別構成は拒否し得る。表示機器の色管理、他GPUのtyped UAV対応、alpha付きRGBAは未達。詳細は[実素材と表示検証](実素材と表示検証.md)と[444・12bit拡張](444・12bit拡張.md)。
 
 ## 比較用Vulkan版：proresvkdec
 

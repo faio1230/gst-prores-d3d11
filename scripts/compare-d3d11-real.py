@@ -29,13 +29,17 @@ def execute(command, log, env=None):
         raise RuntimeError(f'exit {result.returncode}: {command[0]} (log: {log})')
 
 
-def gst_command(source, destination, mode, frames):
+def gst_command(source, destination, mode, frames, pixel_format='yuv422p10le'):
     cmd = [GST / 'gst-launch-1.0.exe', '-q', '-e', 'filesrc',
            f'location={source.as_posix()}', '!', 'qtdemux', '!', 'proresd3d11dec', '!']
     if mode in ('rgb_gpu', 'rgb_element'):
         cmd += ['d3d11convert' if mode == 'rgb_gpu' else 'proresd3d11rgb', '!',
                 f'video/x-raw(memory:D3D11Memory),format=RGB10A2_LE,colorimetry={RGB_COLORIMETRY}', '!']
     cmd += ['d3d11download', '!']
+    if mode == 'yuv':
+        gst_format = {'yuv422p10le': 'I422_10LE', 'yuv444p10le': 'Y444_10LE',
+                      'yuv422p12le': 'I422_12LE', 'yuv444p12le': 'Y444_12LE'}[pixel_format]
+        cmd += [f'video/x-raw,format={gst_format}', '!']
     if mode == 'rgb_cpu':
         # d3d11convert samples 4:2:2 chroma at centered positions.  Without
         # chroma-site the CPU path defaults to left-cosited interpolation.
@@ -47,6 +51,8 @@ def gst_command(source, destination, mode, frames):
         cmd += [f'video/x-raw,format=RGB10A2_LE,colorimetry={RGB_COLORIMETRY}', '!']
     if frames:
         cmd += ['identity', f'eos-after={frames + 1}', '!']
+    if destination is None:
+        return cmd + ['fdsink', 'fd=1']
     return cmd + ['filesink', f'location={destination.as_posix()}']
 
 
@@ -70,12 +76,12 @@ def update(stat, left, right, count_frame=True):
     return frame_max
 
 
-def compare(left_path, right_path, width, height, mode, expected_frames):
+def compare(left_path, right_path, width, height, mode, expected_frames, pixel_format='yuv422p10le'):
     pixel_count = width * height
     if mode == 'yuv':
-        frame_bytes = pixel_count * 4
-        sections = [('Y', pixel_count), ('U', pixel_count // 2),
-                    ('V', pixel_count // 2)]
+        chroma_samples = pixel_count if '444' in pixel_format else pixel_count // 2
+        frame_bytes = (pixel_count + 2 * chroma_samples) * 2
+        sections = [('Y', pixel_count), ('U', chroma_samples), ('V', chroma_samples)]
     else:
         frame_bytes = pixel_count * 4
         sections = [('R', 0), ('G', 10), ('B', 20), ('A', 30)]
@@ -113,9 +119,143 @@ def compare(left_path, right_path, width, height, mode, expected_frames):
         stat['mae'] = stat['absolute_sum'] / stat['samples']
         stat['bias'] = stat['signed_sum'] / stat['samples']
         mse = stat['squared_sum'] / stat['samples']
-        stat['psnr_db'] = (10 * math.log10((3 if stat['channel'] == 'A' else 1023) ** 2 / mse)
+        peak = 3 if stat['channel'] == 'A' else 4095 if mode == 'yuv' and 'p12le' in pixel_format else 1023
+        stat['psnr_db'] = (10 * math.log10(peak ** 2 / mse)
                            if mse else None)
     return dict(frames=frames, channels=stats, per_frame_maxima=frame_maxima)
+
+
+def compare_yuv_streams(cpu_command, dx_command, width, height, frames,
+                        pixel_format, cpu_log, dx_log, env, timeout=900):
+    """一時RAWを作らず2つの独立した復号器を全フレーム・全画素比較する。"""
+    pixels = width * height
+    chroma_samples = pixels if '444' in pixel_format else pixels // 2
+    sections = [('Y', pixels), ('U', chroma_samples), ('V', chroma_samples)]
+    frame_bytes = (pixels + 2 * chroma_samples) * 2
+    stats = [make_stat(name) for name, _ in sections]
+    maxima = []
+    with cpu_log.open('wb') as cpu_error, dx_log.open('wb') as dx_error:
+        cpu = subprocess.Popen([str(item) for item in cpu_command], stdout=subprocess.PIPE,
+                               stderr=cpu_error, stdin=subprocess.DEVNULL, env=env)
+        dx = subprocess.Popen([str(item) for item in dx_command], stdout=subprocess.PIPE,
+                              stderr=dx_error, stdin=subprocess.DEVNULL, env=env)
+        try:
+            for index in range(frames):
+                left = cpu.stdout.read(frame_bytes)
+                right = dx.stdout.read(frame_bytes)
+                if len(left) != frame_bytes or len(right) != frame_bytes:
+                    raise RuntimeError(f'frame {index}: CPU={len(left)}, DX11={len(right)}, '
+                                       f'expected={frame_bytes}')
+                aa = np.frombuffer(left, dtype='<u2')
+                bb = np.frombuffer(right, dtype='<u2')
+                offset = 0
+                frame_maxima = []
+                for stat, (_, count) in zip(stats, sections):
+                    frame_maxima.append(update(stat, aa[offset:offset + count],
+                                               bb[offset:offset + count]))
+                    offset += count
+                maxima.append(frame_maxima)
+            if cpu.stdout.read(1) or dx.stdout.read(1):
+                raise RuntimeError('expected frame count exceeded')
+            if cpu.wait(timeout=timeout) or dx.wait(timeout=timeout):
+                raise RuntimeError(f'CPU exit={cpu.returncode}, DX11 exit={dx.returncode}; '
+                                   f'logs: {cpu_log}, {dx_log}')
+        finally:
+            for process in (cpu, dx):
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                process.stdout.close()
+    peak = 4095 if 'p12le' in pixel_format else 1023
+    for stat in stats:
+        stat['mae'] = stat['absolute_sum'] / stat['samples']
+        stat['bias'] = stat['signed_sum'] / stat['samples']
+        mse = stat['squared_sum'] / stat['samples']
+        stat['psnr_db'] = 10 * math.log10(peak ** 2 / mse) if mse else None
+    return dict(frames=frames, channels=stats, per_frame_maxima=maxima)
+
+
+def compare_rgb_formula_streams(yuv_command, rgb_command, width, height, frames,
+                                pixel_format, yuv_log, rgb_log, env, timeout=900):
+    """同一DX11復号のYUVとGPU RGBを、独立BT.709式で全フレーム比較する。"""
+    pixels = width * height
+    chroma_samples = pixels if '444' in pixel_format else pixels // 2
+    yuv_bytes = (pixels + 2 * chroma_samples) * 2
+    rgb_bytes = pixels * 4
+    stats = [make_stat(name) for name in 'RGBA']
+    maxima = []
+    scale = 4.0 if 'p12le' in pixel_format else 1.0
+    if '422' in pixel_format:
+        x = np.arange(width, dtype=np.float32)
+        location = (x - .5) * .5
+        base = np.floor(location).astype(np.int32)
+        low = np.clip(base, 0, width // 2 - 1)
+        high = np.clip(base + 1, 0, width // 2 - 1)
+        fraction = (location - np.floor(location)).astype(np.float32)
+    with yuv_log.open('wb') as yuv_error, rgb_log.open('wb') as rgb_error:
+        yuv = subprocess.Popen([str(item) for item in yuv_command], stdout=subprocess.PIPE,
+                               stderr=yuv_error, stdin=subprocess.DEVNULL, env=env)
+        rgb = subprocess.Popen([str(item) for item in rgb_command], stdout=subprocess.PIPE,
+                               stderr=rgb_error, stdin=subprocess.DEVNULL, env=env)
+        try:
+            for index in range(frames):
+                yuv_raw = yuv.stdout.read(yuv_bytes)
+                rgb_raw = rgb.stdout.read(rgb_bytes)
+                if len(yuv_raw) != yuv_bytes or len(rgb_raw) != rgb_bytes:
+                    raise RuntimeError(f'frame {index}: YUV={len(yuv_raw)}, RGB={len(rgb_raw)}, '
+                                       f'expected={yuv_bytes}/{rgb_bytes}')
+                raw = np.frombuffer(yuv_raw, dtype='<u2')
+                packed = np.frombuffer(rgb_raw, dtype='<u4').reshape(height, width)
+                y_plane = raw[:pixels].reshape(height, width)
+                chroma_width = width if '444' in pixel_format else width // 2
+                u_plane = raw[pixels:pixels + chroma_samples].reshape(height, chroma_width)
+                v_plane = raw[pixels + chroma_samples:].reshape(height, chroma_width)
+                frame_maxima = [0, 0, 0, 0]
+                for row in range(0, height, 64):
+                    rows = slice(row, min(row + 64, height))
+                    yy = (y_plane[rows].astype(np.float32) / scale - 64.0) / 876.0
+                    if '444' in pixel_format:
+                        cb_codes = u_plane[rows].astype(np.float32)
+                        cr_codes = v_plane[rows].astype(np.float32)
+                    else:
+                        cb_codes = (u_plane[rows][:, low].astype(np.float32) * (1.0 - fraction) +
+                                    u_plane[rows][:, high].astype(np.float32) * fraction)
+                        cr_codes = (v_plane[rows][:, low].astype(np.float32) * (1.0 - fraction) +
+                                    v_plane[rows][:, high].astype(np.float32) * fraction)
+                    cb = (cb_codes / scale - 512.0) / 896.0
+                    cr = (cr_codes / scale - 512.0) / 896.0
+                    expected = (yy + 1.5748 * cr,
+                                yy - 0.187324 * cb - 0.468124 * cr,
+                                yy + 1.8556 * cb)
+                    for channel, (stat, predicted) in enumerate(zip(stats, expected)):
+                        reference = np.rint(np.clip(predicted * 1023.0, 0, 1023)).astype(np.int32)
+                        actual = (packed[rows] >> (channel * 10)) & 1023
+                        frame_maxima[channel] = max(frame_maxima[channel],
+                                                    update(stat, reference, actual, False))
+                    frame_maxima[3] = max(frame_maxima[3], update(stats[3],
+                        np.full(packed[rows].shape, 3, dtype=np.int32),
+                        (packed[rows] >> 30) & 3, False))
+                for stat, maximum in zip(stats, frame_maxima):
+                    stat['frames_with_difference'] += int(maximum != 0)
+                maxima.append(frame_maxima)
+            if yuv.stdout.read(1) or rgb.stdout.read(1):
+                raise RuntimeError('expected RGB frame count exceeded')
+            if yuv.wait(timeout=timeout) or rgb.wait(timeout=timeout):
+                raise RuntimeError(f'YUV exit={yuv.returncode}, RGB exit={rgb.returncode}; '
+                                   f'logs: {yuv_log}, {rgb_log}')
+        finally:
+            for process in (yuv, rgb):
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                process.stdout.close()
+    for stat in stats:
+        stat['mae'] = stat['absolute_sum'] / stat['samples']
+        stat['bias'] = stat['signed_sum'] / stat['samples']
+        mse = stat['squared_sum'] / stat['samples']
+        peak = 3 if stat['channel'] == 'A' else 1023
+        stat['psnr_db'] = 10 * math.log10(peak ** 2 / mse) if mse else None
+    return dict(frames=frames, channels=stats, per_frame_maxima=maxima)
 
 
 def compare_formula(yuv_path, rgb_path, width, height, expected_frames):
@@ -181,18 +321,26 @@ def main():
                         help='RGB先頭1フレームのI422・CPU RGB・GPU RGB rawを保存')
     parser.add_argument('--scratch-dir', type=Path,
                         help='大きな中間raw用の一時領域。省略時はbuild/')
+    parser.add_argument('--streaming', action='store_true',
+                        help='一時RAWなしでCPU/DX11出力をフレーム単位で比較（YUVのみ）')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     if args.diagnostic_dir and (args.mode not in ('rgb', 'rgb_native', 'rgb_element')
                                 or args.frames != 1):
         parser.error('--diagnostic-dir は --mode rgb/rgb_native/rgb_element --frames 1 と併用する')
+    if args.streaming and args.mode not in ('yuv', 'rgb_element_formula'):
+        parser.error('--streaming は --mode yuv/rgb_element_formula のみ対応')
     source = args.input.resolve()
     probe = json.loads(subprocess.check_output([
         str(SDK / 'ffprobe.exe'), '-v', 'error', '-select_streams', 'v:0',
         '-show_streams', '-of', 'json', str(source)]))['streams'][0]
-    if (probe['codec_name'] != 'prores' or probe['pix_fmt'] != 'yuv422p10le'
-            or probe.get('profile', '').lower() not in ('proxy', 'lt', 'standard', 'hq')):
-        raise ValueError(f'not supported ProRes 422 profile: {probe}')
+    pixel_format = probe['pix_fmt']
+    if (probe['codec_name'] != 'prores' or
+            pixel_format not in ('yuv422p10le', 'yuv444p10le', 'yuv422p12le', 'yuv444p12le') or
+            probe.get('codec_tag_string') not in ('apco', 'apcs', 'apcn', 'apch', 'ap4h', 'ap4x')):
+        raise ValueError(f'not supported alpha-free ProRes format: {probe}')
+    if args.mode not in ('yuv', 'rgb_element_formula') and pixel_format != 'yuv422p10le':
+        raise ValueError('RGB比較は現在I422_10LEのみ対応')
     expected_frames = min(args.frames or int(probe['nb_frames']), int(probe['nb_frames']))
     width, height = probe['width'], probe['height']
     if width % 2:
@@ -202,9 +350,10 @@ def main():
     scratch = (args.scratch_dir or ROOT / 'build').resolve()
     if not scratch.is_dir():
         parser.error(f'一時領域が存在しない: {scratch}')
-    raw_bytes = width * height * 4 * expected_frames * 2
+    raw_frame_bytes = width * height * (6 if '444' in pixel_format else 4)
+    raw_bytes = raw_frame_bytes * expected_frames * 2
     free_bytes = shutil.disk_usage(scratch).free
-    if free_bytes < raw_bytes + 1024 ** 3:
+    if not args.streaming and free_bytes < raw_bytes + 1024 ** 3:
         parser.error(f'一時領域が不足: 必要約{(raw_bytes + 1024 ** 3) / 1024 ** 3:.1f} GiB、'
                      f'空き{free_bytes / 1024 ** 3:.1f} GiB ({scratch})')
     env = dict(os.environ)
@@ -213,7 +362,30 @@ def main():
     env['GST_REGISTRY'] = str(ROOT / 'build/vs18/plugin-real-quality-registry.bin')
     env.pop('PRORES_DX11_SHADER_DIR', None)
     runs = []
-    with tempfile.TemporaryDirectory(prefix='real-quality-', dir=scratch) as directory:
+    if args.streaming:
+        if args.mode == 'yuv':
+            cpu_command = [SDK / 'ffmpeg.exe', '-v', 'error', '-xerror', '-threads', '1',
+                           '-apply_cropping', '0', '-i', source, '-map', '0:v:0',
+                           '-frames:v', str(expected_frames), '-fps_mode', 'passthrough',
+                           '-c:v', 'rawvideo', '-pix_fmt', pixel_format, '-f', 'rawvideo', '-']
+            dx_command = gst_command(source, None, 'yuv', args.frames, pixel_format)
+            result = compare_yuv_streams(cpu_command, dx_command, width, height,
+                                         expected_frames, pixel_format,
+                                         args.out.with_suffix('.cpu.log'),
+                                         args.out.with_suffix('.dx11.log'), env)
+            runs.extend(([str(item) for item in cpu_command],
+                         [str(item) for item in dx_command]))
+        else:
+            yuv_command = gst_command(source, None, 'yuv', args.frames, pixel_format)
+            rgb_command = gst_command(source, None, 'rgb_element', args.frames, pixel_format)
+            result = compare_rgb_formula_streams(yuv_command, rgb_command, width, height,
+                                                 expected_frames, pixel_format,
+                                                 args.out.with_suffix('.yuv.log'),
+                                                 args.out.with_suffix('.rgb.log'), env)
+            runs.extend(([str(item) for item in yuv_command],
+                         [str(item) for item in rgb_command]))
+    else:
+      with tempfile.TemporaryDirectory(prefix='real-quality-', dir=scratch) as directory:
         temp = Path(directory)
         left, right = temp / 'reference.raw', temp / 'dx11.raw'
         if args.mode == 'yuv':
@@ -223,10 +395,10 @@ def main():
                        '-apply_cropping', '0',
                        '-i', source, '-map', '0:v:0', '-frames:v', str(expected_frames),
                        '-fps_mode', 'passthrough', '-c:v', 'rawvideo',
-                       '-pix_fmt', 'yuv422p10le', '-f', 'rawvideo', left]
+                       '-pix_fmt', pixel_format, '-f', 'rawvideo', left]
             execute(command, args.out.with_suffix('.cpu.log'))
             runs.append([str(item) for item in command])
-            command = gst_command(source, right, 'yuv', args.frames)
+            command = gst_command(source, right, 'yuv', args.frames, pixel_format)
             execute(command, args.out.with_suffix('.dx11.log'), env)
             runs.append([str(item) for item in command])
         else:
@@ -256,11 +428,12 @@ def main():
         result = (compare_formula(left, right, width, height, expected_frames)
                   if args.mode in ('rgb_formula', 'rgb_element_formula')
                   else compare(left, right, width, height,
-                               'yuv' if args.mode == 'yuv' else 'rgb', expected_frames))
+                               'yuv' if args.mode == 'yuv' else 'rgb', expected_frames,
+                               pixel_format))
     with source.open('rb') as stream:
         source_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
     result.update(input=str(source), source_sha256=source_sha256,
-                  mode=args.mode, reference=('fixed FFmpeg 8.1 CPU yuv422p10le' if args.mode == 'yuv'
+                  mode=args.mode, reference=(f'fixed FFmpeg 8.1 CPU {pixel_format}' if args.mode == 'yuv'
                                             else 'same DX11 I422 + independent BT.709 limited-to-full centered chroma formula'
                                             if args.mode in ('rgb_formula', 'rgb_element_formula')
                                             else 'D3D11 decoded I422 + CPU videoconvert BT.709, centered 4:2:2 chroma'),

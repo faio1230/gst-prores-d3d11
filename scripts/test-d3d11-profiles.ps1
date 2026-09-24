@@ -3,7 +3,8 @@
 param(
     [string]$OutDir = 'results/profile-422-expansion-2026-09-24',
     [string]$FixturesFile = 'fixtures.json',
-    [string]$SummaryFile = 'verification-summary.json'
+    [string]$SummaryFile = 'verification-summary.json',
+    [switch]$Streaming
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -59,8 +60,10 @@ try {
         }
         $pixelJson = Join-Path $out "pixel-$tag.json"
         $pixelLog = Join-Path $out "pixel-$tag.log"
-        & $python (Join-Path $root 'scripts/compare-d3d11-real.py') $inputFile `
-            --mode yuv --out $pixelJson *> $pixelLog
+        $compareArgs = @((Join-Path $root 'scripts/compare-d3d11-real.py'), $inputFile,
+            '--mode', 'yuv', '--out', $pixelJson)
+        if ($Streaming) { $compareArgs += '--streaming' }
+        & $python @compareArgs *> $pixelLog
         if ($LASTEXITCODE) { throw "全30フレームの画素比較に失敗: $tag ($pixelLog)" }
         $pixels = Get-Content -LiteralPath $pixelJson -Raw | ConvertFrom-Json
         $pixelMax = ($pixels.channels | Measure-Object max_abs -Maximum).Maximum

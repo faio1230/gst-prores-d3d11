@@ -28,3 +28,6 @@ __pycache__/
 /results/feature-matrix-2026-09-24/*.mov
 # CSO版へ切り替える前の逐次検査ログ（未完・再現用にローカル保持）。
 /results/profile-422-coefficients-all-2026-09-24/
+# M2の大量な生ログ・フレーム別結果はローカル保持。採用要約と素材ハッシュのみ明示追跡する。
+/results/m2-*
+/results/prores-m2-2026-09-24/

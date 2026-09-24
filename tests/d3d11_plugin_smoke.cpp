@@ -262,8 +262,6 @@ static void injected_error(GstSample* compressed, const char* test) {
     Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! fakesink");
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
     auto* caps = gst_caps_copy(gst_sample_get_caps(compressed));
-    if (std::string(test) == "4444-caps")
-        gst_caps_set_simple(caps, "variant", G_TYPE_STRING, "4444", nullptr);
     gst_app_src_set_caps(GST_APP_SRC(source), caps);
     gst_caps_unref(caps);
     auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
@@ -277,6 +275,11 @@ static void injected_error(GstSample* compressed, const char* test) {
     if (std::string(test) == "interlaced-hidden-in-caps") {
         gst_buffer_extract(input, 20, &byte, 1);
         byte |= 4;
+        gst_buffer_fill(input, 20, &byte, 1);
+    }
+    if (std::string(test) == "invalid-chroma-flags") {
+        gst_buffer_extract(input, 20, &byte, 1);
+        byte &= static_cast<guint8>(~0xc0);
         gst_buffer_fill(input, 20, &byte, 1);
     }
     if (std::string(test) == "oversized-first-dc") {
@@ -537,7 +540,7 @@ static void dynamic_rejected_input(GstSample* compressed, bool unsupported_caps)
 
         if (unsupported_caps) {
             auto* caps = gst_caps_copy(gst_sample_get_caps(compressed));
-            gst_caps_set_simple(caps, "variant", G_TYPE_STRING, "4444", nullptr);
+            gst_caps_set_simple(caps, "variant", G_TYPE_STRING, "unsupported", nullptr);
             gst_app_src_set_caps(GST_APP_SRC(source), caps);
             gst_caps_unref(caps);
         }
@@ -784,7 +787,7 @@ int main(int argc, char** argv) try {
         gst_sample_unref(uhd);
     }
     for (const char* test : {"bad-signature", "alpha-hidden-in-caps",
-                             "interlaced-hidden-in-caps", "4444-caps",
+                             "interlaced-hidden-in-caps", "invalid-chroma-flags",
                              "oversized-first-dc", "ac-run-boundary"})
         injected_error(compressed, test);
     delayed_entropy_error(compressed);

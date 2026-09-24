@@ -72,7 +72,8 @@ void check_frame_bounds(const prores::Frame& frame, std::size_t size) {
     std::uint32_t coefficient_count = 0;
     prores::make_coefficient_jobs(frame, jobs, coefficient_count);
     require(jobs.size() == frame.slices.size() * 3 &&
-            coefficient_count == covered * 512, "coefficient job count differs");
+            coefficient_count == covered * (frame.chroma_shift ? 512u : 768u),
+            "coefficient job count differs");
     for (const auto& job : jobs)
         require(job.data_offset <= size && job.data_size <= size - job.data_offset &&
                 job.output_offset <= coefficient_count &&

@@ -4,7 +4,7 @@
 
 完成形は `video/x-prores → DX11 Compute Shaderによる復号 → video/x-raw(memory:D3D11Memory)`。復号画像をCPUへ読み戻さず、Vulkanに依存しない経路を目指します。現在の `proresvkdec` はFFmpeg Vulkanを使う比較・検証用の中間成果で、最終成果物ではありません。以後の主実装はDX11ネイティブ復号とD3D11Memory出力に置きます。
 
-**progressive ProRes 422 HQ / 10bitに限定した最初の純粋DX11経路が動作していますが、採用完了ではありません。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTを行い、GStreamerの3面D3D11Memoryへ直接出力します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodec、画像のGPU内コピーはありません。RTX 3070で1080p/4Kの全係数がCPU参照と完全一致し、FFmpeg CPU画素との差は最大1でした。EOS、seek、再起動、バッファ寿命、4K 30分、複数instance、D3D11変換・合成も検査済みです。公開カメラ由来1080p実写50フレーム、4K実写129フレーム、4K60実写480フレームの全画素比較も最大差1で通過しましたが、4K実表示にはdropとOS未表示が残り、RGBの採用許容値と他GPUも未確定です。
+**純粋DX11のProRes GPU復号は、alphaなし・progressiveの422/444・10/12bitまで段階的に採用済みです。goal全体は未完了です。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTを行い、GStreamerの3面D3D11Memoryへ直接出力します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodec、画像のGPU内コピーはありません。M2の18素材780枚で係数完全一致・CPU画素との差最大1を確認し、同じ形式をRGB10A2 D3D11Memoryへ変換できました。alpha、インターレース、途中形式変更、他GPU、最後の実表示QoSは未達です。対応範囲と数値は[機能対応表](docs/機能対応表.md)と[444・12bit拡張](docs/444・12bit拡張.md)を参照してください。
 
 ```powershell
 ./scripts/bootstrap.ps1
@@ -33,7 +33,7 @@ GStreamer MSVC x64ランタイムと開発SDKが必要です。[プラグイン�
 
 `prores_bench` は同一FFmpeg SDKでCPU/Vulkanを切り替え、GPU完了待ち、CPU読み戻し、D3D11アップロード、Win32共有テクスチャ、複数層の検証合成を比較します。フレームごとの時刻・所要時間をCSV、初期化・定常速度・CPU・メモリをJSONへ記録します。
 
-`dx11_primitives` はD3D11 Compute Shaderによるビット読み取りと8×8逆DCTの基礎検証です。`prores_dx11_coeff` は固定SDKでMOVから実パケットを取り出し、独立CPU参照とDX11の全係数・画素を比較します。`proresd3d11dec` は同じparser/shaderをGstVideoDecoderとして連続実行し、`I422_10LE(memory:D3D11Memory)` を出力します。検査用CPU読み戻しは通常経路と分離しています。
+`dx11_primitives` はD3D11 Compute Shaderによるビット読み取りと8×8逆DCTの基礎検証です。`prores_dx11_coeff` は固定SDKでMOVから実パケットを取り出し、独立CPU参照とDX11の全係数・画素を比較します。`proresd3d11dec` は同じparser/shaderをGstVideoDecoderとして連続実行し、4種のplanar 422/444 10/12bit formatを`memory:D3D11Memory`で出力します。検査用CPU読み戻しは通常経路と分離しています。
 
 ## 最短の実行
 

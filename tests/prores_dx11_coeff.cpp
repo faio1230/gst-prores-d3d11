@@ -83,6 +83,7 @@ Packet read_video_packet(const char* path, std::size_t target_index) {
 struct CpuFrame {
     int width = 0;
     int height = 0;
+    int chroma_shift = 1;
     std::vector<std::uint16_t> planes[3];
 };
 
@@ -120,13 +121,17 @@ CpuFrame decode_cpu(const Packet& packet) {
     if (avcodec_send_packet(context.get(), objects.packet) < 0 ||
         avcodec_receive_frame(context.get(), objects.frame) < 0)
         throw std::runtime_error("CPU ProRes decode failed");
-    if (objects.frame->format != AV_PIX_FMT_YUV422P10LE)
+    const auto format = static_cast<AVPixelFormat>(objects.frame->format);
+    if (format != AV_PIX_FMT_YUV422P10LE && format != AV_PIX_FMT_YUV444P10LE &&
+        format != AV_PIX_FMT_YUV422P12LE && format != AV_PIX_FMT_YUV444P12LE)
         throw std::runtime_error("unexpected CPU reference format");
     CpuFrame output;
     output.width = objects.frame->width;
     output.height = objects.frame->height;
+    output.chroma_shift = format == AV_PIX_FMT_YUV422P10LE ||
+        format == AV_PIX_FMT_YUV422P12LE ? 1 : 0;
     for (int component = 0; component < 3; ++component) {
-        const int width = component ? output.width / 2 : output.width;
+        const int width = component ? output.width >> output.chroma_shift : output.width;
         output.planes[component].resize(static_cast<std::size_t>(width) * output.height);
         for (int y = 0; y < output.height; ++y)
             std::memcpy(output.planes[component].data() + static_cast<std::size_t>(y) * width,
@@ -269,7 +274,8 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
                                 const char* name) {
         prores::Frame ignored;
         std::string error;
-        if (prores::parse_frame(bytes.data(), bytes.size(), width, height, ignored, error))
+        if (prores::parse_frame(bytes.data(), bytes.size(), width, height, ignored, error,
+                                 parsed.bit_depth))
             throw std::runtime_error(std::string("parser accepted malformed case: ") + name);
         ++rejected;
     };
@@ -280,8 +286,8 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
     mutation[0] ^= 1;
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "frame-size");
     mutation = packet.bytes;
-    mutation[20] = static_cast<std::uint8_t>((mutation[20] & ~0xc0) | 0xc0);
-    expect_rejection(std::move(mutation), parsed.width, parsed.height, "4444");
+    mutation[20] &= static_cast<std::uint8_t>(~0xc0);
+    expect_rejection(std::move(mutation), parsed.width, parsed.height, "invalid-chroma");
     mutation = packet.bytes;
     mutation[20] |= 4;
     expect_rejection(std::move(mutation), parsed.width, parsed.height, "interlace");
@@ -311,7 +317,7 @@ std::size_t verify_parser_rejections(const Packet& packet, const prores::Frame& 
     prores::Frame zero_padded;
     std::string padding_error;
     if (!prores::parse_frame(mutation.data(), mutation.size(), parsed.width,
-                             parsed.height, zero_padded, padding_error))
+                             parsed.height, zero_padded, padding_error, parsed.bit_depth))
         throw std::runtime_error("zero-padded frame rejected: " + padding_error);
     mutation = packet.bytes;
     mutation.push_back(0x7f);
@@ -345,7 +351,7 @@ std::size_t verify_entropy_rejections(const Packet& packet, const prores::Frame&
     prores::Frame reparsed;
     std::string error;
     if (!prores::parse_frame(mutation.data(), mutation.size(), parsed.width,
-                             parsed.height, reparsed, error))
+                             parsed.height, reparsed, error, parsed.bit_depth))
         throw std::runtime_error("entropy mutation failed structural parse: " + error);
     std::vector<prores::CoefficientJob> jobs;
     std::vector<std::int32_t> coefficients;
@@ -372,11 +378,14 @@ int main(int argc, char** argv) try {
         if (consumed != option.size() - 8) throw std::runtime_error("invalid frame index");
     }
     const auto packet = read_video_packet(argv[1], frame_index);
+    const std::uint8_t bit_depth = packet.codec_tag == MKTAG('a','p','4','h') ||
+        packet.codec_tag == MKTAG('a','p','4','x') ? 12 : 10;
     prores::Frame frame;
     std::string parse_error;
     if (!prores::parse_frame(packet.bytes.data(), packet.bytes.size(),
                              static_cast<std::uint16_t>(packet.width),
-                             static_cast<std::uint16_t>(packet.height), frame, parse_error))
+                             static_cast<std::uint16_t>(packet.height), frame, parse_error,
+                             bit_depth))
         throw std::runtime_error("parse: " + parse_error);
     std::vector<prores::CoefficientJob> jobs;
     std::vector<std::int32_t> reference;
@@ -509,14 +518,15 @@ int main(int argc, char** argv) try {
     ComPtr<ID3D11UnorderedAccessView> output_uavs[3];
     for (unsigned component = 0; component < 3; ++component) {
         output_textures[component] = output_texture(device.Get(),
-            component ? frame.width / 2 : frame.width, frame.height);
+            component ? frame.width >> frame.chroma_shift : frame.width, frame.height);
         check(device->CreateUnorderedAccessView(output_textures[component].Get(), nullptr,
                                                 &output_uavs[component]),
               "Create output texture UAV");
         context->ClearUnorderedAccessViewUint(output_uavs[component].Get(), zeros);
     }
     const std::vector<IdctParameters> idct_parameter_values{{
-        static_cast<std::uint32_t>(idct_jobs.size()), frame.width, frame.height}};
+        static_cast<std::uint32_t>(idct_jobs.size()), frame.width, frame.height,
+        static_cast<std::uint32_t>(frame.bit_depth << 8) | frame.chroma_shift}};
     auto idct_parameter_buffer = immutable_buffer(device.Get(), idct_parameter_values,
                                                    D3D11_BIND_CONSTANT_BUFFER);
     ID3D11ShaderResourceView* idct_srvs[] = {
@@ -543,7 +553,7 @@ int main(int argc, char** argv) try {
     ComPtr<ID3D11Texture2D> pixel_staging[3];
     for (unsigned component = 0; component < 3; ++component) {
         pixel_staging[component] = staging_texture(device.Get(),
-            component ? frame.width / 2 : frame.width, frame.height);
+            component ? frame.width >> frame.chroma_shift : frame.width, frame.height);
         context->CopyResource(pixel_staging[component].Get(), output_textures[component].Get());
     }
     D3D11_MAPPED_SUBRESOURCE mapped_coefficients{};
@@ -579,7 +589,8 @@ int main(int argc, char** argv) try {
         D3D11_MAPPED_SUBRESOURCE mapped{};
         check(context->Map(pixel_staging[component].Get(), 0, D3D11_MAP_READ, 0, &mapped),
               "Map output texture");
-        const auto plane_width = static_cast<std::uint32_t>(component ? frame.width / 2 : frame.width);
+        const auto plane_width = static_cast<std::uint32_t>(
+            component ? frame.width >> frame.chroma_shift : frame.width);
         for (std::uint32_t y = 0; y < frame.height; ++y) {
             const auto* gpu_row = reinterpret_cast<const std::uint16_t*>(
                 static_cast<const std::uint8_t*>(mapped.pData) + static_cast<std::size_t>(y) * mapped.RowPitch);

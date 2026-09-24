@@ -119,7 +119,7 @@ struct IdctParameters {
     std::uint32_t block_count;
     std::uint32_t width;
     std::uint32_t height;
-    std::uint32_t reserved = 0;
+    std::uint32_t mode = 0;
 };
 
 struct MemoryUav {
@@ -283,7 +283,7 @@ public:
         mark(&CpuDecodeTiming::cache_ms);
 
         if (gst_buffer_n_memory(output) != 3)
-            throw std::runtime_error("I422_10LE D3D11 output must have three memories");
+            throw std::runtime_error("planar ProRes D3D11 output must have three memories");
         ComPtr<ID3D11UnorderedAccessView> output_uavs[3];
         for (guint component = 0; component < 3; ++component) {
             GstMemory* memory = gst_buffer_peek_memory(output, component);
@@ -295,9 +295,9 @@ public:
             D3D11_TEXTURE2D_DESC desc{};
             if (!gst_d3d11_memory_get_texture_desc(d3d_memory, &desc) ||
                 desc.Format != DXGI_FORMAT_R16_UNORM || !(desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) ||
-                desc.Width != static_cast<UINT>(component ? parsed.width / 2 : parsed.width) ||
+                desc.Width != static_cast<UINT>(component ? parsed.width >> parsed.chroma_shift : parsed.width) ||
                 desc.Height != parsed.height)
-                throw std::runtime_error("unexpected I422_10LE D3D11 texture layout");
+                throw std::runtime_error("unexpected planar ProRes D3D11 texture layout");
             auto* stored = static_cast<MemoryUav*>(
                 gst_d3d11_memory_get_token_data(d3d_memory, token_));
             if (!stored) {
@@ -326,7 +326,8 @@ public:
         const VldParameters vld_parameter_values{
             static_cast<std::uint32_t>(coefficient_jobs.size()), coefficient_count};
         const IdctParameters idct_parameter_values{
-            static_cast<std::uint32_t>(idct_jobs.size()), parsed.width, parsed.height};
+            static_cast<std::uint32_t>(idct_jobs.size()), parsed.width, parsed.height,
+            static_cast<std::uint32_t>(parsed.bit_depth << 8) | parsed.chroma_shift};
         std::vector<std::uint32_t> quant_matrices;
         quant_matrices.reserve(128);
         for (auto value : parsed.luma_quant_matrix) quant_matrices.push_back(value);
@@ -577,6 +578,7 @@ private:
                                     const std::vector<prores::CoefficientJob>& coefficient_jobs) {
         bool same_layout = idct_layout_width_ == parsed.width &&
                            idct_layout_height_ == parsed.height &&
+                           idct_layout_chroma_shift_ == parsed.chroma_shift &&
                            idct_layout_.size() == parsed.slices.size() &&
                            coefficient_jobs.size() == parsed.slices.size() * 3;
         if (same_layout && (idct_layout_.empty() ||
@@ -590,7 +592,8 @@ private:
                     layout.mb_count != slice.mb_count ||
                     layout.job_begin > layout.job_end ||
                     layout.job_end > idct_jobs_.size() ||
-                    layout.job_end - layout.job_begin != static_cast<std::size_t>(slice.mb_count) * 8) {
+                    layout.job_end - layout.job_begin != static_cast<std::size_t>(slice.mb_count) *
+                        (parsed.chroma_shift ? 8 : 12)) {
                     same_layout = false;
                     break;
                 }
@@ -604,13 +607,15 @@ private:
             for (const auto& slice : parsed.slices) {
                 const auto quant_scale = slice.quant_index > 128
                     ? static_cast<std::uint32_t>(slice.quant_index - 96) * 4 : slice.quant_index;
-                const auto job_end = job_begin + static_cast<std::size_t>(slice.mb_count) * 8;
+                const auto job_end = job_begin + static_cast<std::size_t>(slice.mb_count) *
+                    (parsed.chroma_shift ? 8 : 12);
                 idct_layout_.push_back({slice.mb_x, slice.mb_y, slice.mb_count,
                                         quant_scale, job_begin, job_end});
                 job_begin = job_end;
             }
             idct_layout_width_ = parsed.width;
             idct_layout_height_ = parsed.height;
+            idct_layout_chroma_shift_ = parsed.chroma_shift;
             return {true, true, static_cast<std::uint32_t>(parsed.slices.size())};
         }
         IdctJobUpdate update{};
@@ -720,6 +725,7 @@ private:
     std::vector<IdctLayoutSlice> idct_layout_;
     std::uint16_t idct_layout_width_ = 0;
     std::uint16_t idct_layout_height_ = 0;
+    std::uint8_t idct_layout_chroma_shift_ = 1;
 };
 
 }  // namespace
@@ -737,6 +743,7 @@ typedef struct _GstProresD3D11Dec {
     gint color_primaries;
     gint color_trc;
     gint color_matrix;
+    GstVideoFormat output_format;
     gboolean cpu_timing;
     guint64 cpu_timing_sequence;
 } GstProresD3D11Dec;
@@ -749,11 +756,12 @@ enum { PROP_0, PROP_ADAPTER, PROP_SHADER_DIRECTORY };
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
     "sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("video/x-prores, variant=(string){ proxy, lt, standard, hq }, width=(int)[16,8192], "
+    GST_STATIC_CAPS("video/x-prores, variant=(string){ proxy, lt, standard, hq, 4444, 4444xq }, width=(int)[16,8192], "
                     "height=(int)[16,8192], interlace-mode=(string)progressive"));
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src", GST_PAD_SRC, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("video/x-raw(memory:D3D11Memory), format=(string)I422_10LE, "
+    GST_STATIC_CAPS("video/x-raw(memory:D3D11Memory), "
+                    "format=(string){ I422_10LE, Y444_10LE, I422_12LE, Y444_12LE }, "
                     "width=(int)[16,8192], height=(int)[16,8192], "
                     "interlace-mode=(string)progressive"));
 
@@ -824,11 +832,12 @@ static gboolean set_format(GstVideoDecoder* decoder, GstVideoCodecState* state) 
     const int height = GST_VIDEO_INFO_HEIGHT(&state->info);
     if (!variant ||
         (g_strcmp0(variant, "proxy") != 0 && g_strcmp0(variant, "lt") != 0 &&
-         g_strcmp0(variant, "standard") != 0 && g_strcmp0(variant, "hq") != 0) ||
+         g_strcmp0(variant, "standard") != 0 && g_strcmp0(variant, "hq") != 0 &&
+         g_strcmp0(variant, "4444") != 0 && g_strcmp0(variant, "4444xq") != 0) ||
         (interlace && g_strcmp0(interlace, "progressive") != 0) ||
         width < 16 || width > 8192 || height < 16 || height > 8192 || (width & 1)) {
         GST_ELEMENT_ERROR(self, STREAM, FORMAT,
-            ("Only progressive, alpha-free ProRes 422 Proxy/LT/Standard/HQ 10-bit is supported"),
+            ("Only progressive, alpha-free ProRes 422/444 10/12-bit is supported"),
             ("caps: %" GST_PTR_FORMAT, state->caps));
         return FALSE;
     }
@@ -837,11 +846,15 @@ static gboolean set_format(GstVideoDecoder* decoder, GstVideoCodecState* state) 
 }
 
 static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& parsed) {
+    const auto format = parsed.bit_depth == 12
+        ? (parsed.chroma_shift ? GST_VIDEO_FORMAT_I422_12LE : GST_VIDEO_FORMAT_Y444_12LE)
+        : (parsed.chroma_shift ? GST_VIDEO_FORMAT_I422_10LE : GST_VIDEO_FORMAT_Y444_10LE);
     if (self->negotiated && self->color_primaries == parsed.color_primaries &&
         self->color_trc == parsed.transfer_characteristic &&
-        self->color_matrix == parsed.matrix_coefficients) return TRUE;
+        self->color_matrix == parsed.matrix_coefficients &&
+        self->output_format == format) return TRUE;
     auto* decoder = GST_VIDEO_DECODER(self);
-    auto* state = gst_video_decoder_set_output_state(decoder, GST_VIDEO_FORMAT_I422_10LE,
+    auto* state = gst_video_decoder_set_output_state(decoder, format,
                                                       parsed.width, parsed.height, self->input);
     if (!state) return FALSE;
     state->info.interlace_mode = GST_VIDEO_INTERLACE_MODE_PROGRESSIVE;
@@ -869,6 +882,7 @@ static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& p
     self->color_primaries = parsed.color_primaries;
     self->color_trc = parsed.transfer_characteristic;
     self->color_matrix = parsed.matrix_coefficients;
+    self->output_format = format;
     self->negotiated = TRUE;
     return TRUE;
 }
@@ -935,7 +949,12 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
     std::string error;
     const auto expected_width = static_cast<std::uint16_t>(GST_VIDEO_INFO_WIDTH(&self->input->info));
     const auto expected_height = static_cast<std::uint16_t>(GST_VIDEO_INFO_HEIGHT(&self->input->info));
-    if (!prores::parse_frame(input.data, input.size, expected_width, expected_height, parsed, error)) {
+    const char* variant = gst_structure_get_string(gst_caps_get_structure(self->input->caps, 0),
+                                                   "variant");
+    const std::uint8_t bit_depth = g_strcmp0(variant, "4444") == 0 ||
+        g_strcmp0(variant, "4444xq") == 0 ? 12 : 10;
+    if (!prores::parse_frame(input.data, input.size, expected_width, expected_height,
+                             parsed, error, bit_depth)) {
         gst_buffer_unmap(frame->input_buffer, &input);
         self->failed = TRUE;
         GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("Malformed or unsupported ProRes frame"),

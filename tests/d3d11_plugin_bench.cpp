@@ -1,4 +1,4 @@
-// GStreamerのCPU経路と純粋DX11 pluginを同じ素材・I422_10LE条件で測る。
+// GStreamerのCPU経路と純粋DX11 pluginを同じ素材で測る。
 #include <gst/app/gstappsink.h>
 #include <gst/d3d11/gstd3d11memory.h>
 #include <gst/gst.h>
@@ -151,7 +151,11 @@ static StreamContract verify_sample(GstSample* sample, const std::string& mode,
     auto* caps = gst_sample_get_caps(sample);
     GstVideoInfo info{};
     require(gst_video_info_from_caps(&info, caps), "invalid output caps");
-    require(GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_I422_10LE,
+    const auto format = GST_VIDEO_INFO_FORMAT(&info);
+    const bool direct_format = format == GST_VIDEO_FORMAT_I422_10LE ||
+        format == GST_VIDEO_FORMAT_Y444_10LE || format == GST_VIDEO_FORMAT_I422_12LE ||
+        format == GST_VIDEO_FORMAT_Y444_12LE;
+    require(mode == "dx11-direct" ? direct_format : format == GST_VIDEO_FORMAT_I422_10LE,
             "unexpected output format");
     const bool d3d = gst_caps_features_contains(gst_caps_get_features(caps, 0),
                                                 GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY);
