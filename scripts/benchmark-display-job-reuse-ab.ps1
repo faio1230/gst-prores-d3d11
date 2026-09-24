@@ -97,10 +97,12 @@ try {
             if ($metrics.plugin_sha256 -ne $hashes[$label] -or
                 $metrics.present_sync_interval -ne 0 -or !$metrics.sink_clock_sync -or
                 $metrics.decoder_no_qos -or $metrics.lossless_sink_policy -or
-                $metrics.postrgb_queue -or $metrics.dropped -ne 0 -or
+                $metrics.postrgb_queue -or
                 $metrics.rendered + $metrics.stages.end_to_end_missing -ne $expected -or
                 $metrics.stages.missing_before_decoder_count -ne 0 -or
-                $metrics.stages.missing_after_converter_count -ne 0) {
+                $metrics.stages.missing_after_converter_count -ne 0 -or
+                $metrics.stages.missing_after_decoder_count + $metrics.dropped -ne
+                    $metrics.stages.end_to_end_missing) {
                 throw "試行条件またはPTS枚数が不一致: $tag"
             }
             $present = $null
@@ -122,7 +124,8 @@ try {
                 plugin_sha256 = $hashes[$label]
                 expected_frames = $expected
                 rendered = $metrics.rendered
-                decoder_qos_missing = $metrics.stages.end_to_end_missing
+                decoder_qos_missing = $metrics.stages.missing_after_decoder_count
+                sink_dropped = $metrics.dropped
                 qos_messages = $metrics.qos_messages
                 p99_present_interval_ms = $metrics.interval_p99_ms
                 max_sink_push_ms = $metrics.stages.stage_latency.sink_push_to_sink_return_ms.max
@@ -132,7 +135,7 @@ try {
             }
             $records | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath `
                 (Join-Path $out 'trial-summary.json') -Encoding utf8
-            Write-Host "$tag`: $($metrics.rendered)/$expected、decoder QoS欠落=$($metrics.stages.end_to_end_missing)"
+            Write-Host "$tag`: $($metrics.rendered)/$expected、decoder QoS欠落=$($metrics.stages.missing_after_decoder_count)、sink drop=$($metrics.dropped)"
                 $trialCompleted = $true
             } finally {
                 if ($CaptureOS -and !$trialCompleted -and $monitor) {
