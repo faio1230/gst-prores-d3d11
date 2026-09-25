@@ -48,6 +48,19 @@ gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "vide
 
 See [build and execution](docs/ビルドと実行.md), [design](docs/設計.md), and [validation](docs/検証.md).
 
+## Using the release binaries in an application
+
+Each GitHub release has a zip named after its tag (for example `gst-prores-d3d11-v0.1.0-win64-gst1.28.2.zip`). When you bundle it:
+
+- **Placement:** keep `gstproresd3d11.dll` and all `prores_*.cso` files in the same directory. Add that directory to `GST_PLUGIN_PATH`, or copy the files into GStreamer's `lib\gstreamer-1.0`. Do not rename the DLL, because GStreamer derives the plugin entry point from its file name.
+- **Runtime:** the release DLL needs the Microsoft Visual C++ Redistributable x64, version 14.50 or later. GStreamer 1.28.2 does not include it.
+- **Untagged streams:** a stream with no color tags comes out with `colorimetry=2:0:0:0` (limited range, matrix/transfer/primaries unknown), so the downstream converter chooses the matrix. Set colorimetry in your application if you need a fixed conversion.
+- **Interlaced streams:** these are output as interleaved frames with `field-order` set. They are not deinterlaced. Add a deinterlacer (such as `d3d11deinterlace`) if you need progressive frames.
+- **Tested GPUs:** only an NVIDIA RTX 3070 has been tested. AMD and Intel GPUs, and hybrid-GPU selection with `adapter-luid`, are not verified yet.
+
+`proresd3d11dec ! d3d11colorconvert ! "video/x-raw(memory:D3D11Memory),format=BGRA"` has been checked for every output format. Not yet confirmed: whether semi-transparent alpha comes through that BGRA path unchanged. Alpha has been verified through `d3d11convert` to `RGBA64_LE`.
+
+
 ## Accuracy and performance
 
 On the tested streams, every decoded YUV pixel differed from the pinned FFmpeg CPU reference by at most one code value at the source depth; alpha matched at the compared output depth. The native RGB converter differed from an independent BT.709 calculation by at most one RGB10A2 code value. On an RTX 3070, synthetic HQ direct-output throughput was about **436 fps at 1080p** and **258 fps at 4K**. These are decoder throughput measurements without GPU-completion waiting or display timing, not playback guarantees.

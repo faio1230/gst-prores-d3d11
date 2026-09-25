@@ -48,6 +48,19 @@ gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "vide
 
 詳しくは[ビルドと実行](docs/ビルドと実行.md)、[設計](docs/設計.md)、[検証](docs/検証.md)を参照してください。
 
+## リリース版をアプリケーションに組み込む
+
+GitHub Releasesには、タグ名を含むzip（例：`gst-prores-d3d11-v0.1.0-win64-gst1.28.2.zip`）を置いています。組み込むときは次の点に注意してください。
+
+- **配置：** `gstproresd3d11.dll`と`prores_*.cso`をすべて同じフォルダに置き、そのフォルダを`GST_PLUGIN_PATH`に加えるか、GStreamerの`lib\gstreamer-1.0`へコピーしてください。DLLの名前は変えないでください。GStreamerはファイル名からプラグインの入口関数を探します。
+- **ランタイム：** リリース版DLLには、Microsoft Visual C++再頒布可能パッケージ（x64）の14.50以上が必要です。GStreamer 1.28.2には同梱されていません。
+- **色タグのない素材：** `colorimetry=2:0:0:0`（limited range、matrix・transfer・primariesは不明）で出力され、matrixの選択は下流の変換要素に任されます。変換を固定したい場合は、アプリ側でcolorimetryを指定してください。
+- **インターレース：** `field-order`を付けたinterleavedのフレームとして出力し、デインターレースはしません。プログレッシブにしたい場合は`d3d11deinterlace`などを入れてください。
+- **検証済みのGPU：** 確認したのはNVIDIA RTX 3070だけです。AMDとIntelのGPU、ハイブリッドGPU環境での`adapter-luid`による選択は未検証です。
+
+`proresd3d11dec ! d3d11colorconvert ! "video/x-raw(memory:D3D11Memory),format=BGRA"`は全出力形式で確認済みです。ただし、半透明のアルファがこのBGRA経路でそのまま届くかは未確認です（`d3d11convert`から`RGBA64_LE`への経路では確認済み）。
+
+
 ## 精度と性能
 
 検証素材のYUV全画素は、固定FFmpeg SDKのCPU復号結果と元の深度で最大1 codeの差でした。アルファは比較に使った出力深度で一致しています。専用RGB要素も独立したBT.709式との差がRGB10A2で最大1 codeでした。RTX 3070での合成HQ素材のdirect出力は、1080p約**436 fps**、4K約**258 fps**です。GPU完了待ちと表示時間を含めない復号器の供給速度であり、再生速度の保証ではありません。
