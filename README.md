@@ -1,52 +1,61 @@
-# Windows向けGStreamer ProRes GPUデコーダー
+# gst-prores-d3d11
 
-**最終目標は、外部アプリケーションから独立したGStreamer用ProRes GPUデコーダーです。** 純粋なDirect3D 11 Compute ShaderでProResを復号し、復号画像をCPUへ読み戻さず `GstD3D11Memory` のまま出力することを、両立必須の完成条件とします。専用の動画デコード回路を使う方式ではありません。このリポジトリの要件、採用判定、配布物はGStreamerプラグインとその検証に限定し、外部アプリ固有の同期・再生制御・UI・入出力機能を前提にしません。
+A standalone GStreamer ProRes decoder implemented with Direct3D 11 Compute Shaders. It outputs `GstD3D11Memory` without reading decoded images back to the CPU. There is no CPU, Vulkan, or FFmpeg decoding fallback. The CPU validates and prepares compressed packets; the image decoding work runs on the GPU. This is a compute implementation, not a vendor fixed-function ProRes decoder.
 
-完成形は `video/x-prores → DX11 Compute Shaderによる復号 → video/x-raw(memory:D3D11Memory)`。復号画像をCPUへ読み戻さず、Vulkanに依存しない経路を目指します。現在の `proresvkdec` はFFmpeg Vulkanを使う比較・検証用の中間成果で、最終成果物ではありません。以後の主実装はDX11ネイティブ復号とD3D11Memory出力に置きます。
+## Supported input and output
 
-**純粋DX11のProRes GPU復号は、progressiveの422/444・10/12bit・alphaなし/8/16bitまで採用済みです。goal全体は未完了です。** `proresd3d11dec` はCPUで境界を検査し、SM5でVLD・逆スキャン・逆量子化・逆DCTとalphaのエントロピー復号を行います。alphaなしは3面、alpha付きは`AYUV64`の単一`GstD3D11Memory`へ出力し、`proresd3d11rgb`はそれぞれRGB10A2/RGBA64へGPUで変換します。通常経路に画像のCPU復号・読み戻し、Vulkan、libavcodecへのfallbackはありません。M3の24交差条件でalpha差0・YUV差最大1、全条件の4K directは最低84.55 fps。インターレース、途中形式変更、他GPU、最後の実表示QoSは未達です。対応範囲と数値は[機能対応表](docs/機能対応表.md)と[アルファ拡張](docs/アルファ拡張.md)を参照してください。
+| Area | Support |
+| --- | --- |
+| Profiles | Proxy (`apco`), LT (`apcs`), Standard (`apcn`), HQ (`apch`), 4444 (`ap4h`), 4444 XQ (`ap4x`). The picture header, not the FourCC name alone, determines chroma and alpha. |
+| Chroma and depth | 4:2:2 or 4:4:4; 10-bit for `apco`–`apch`, 12-bit for `ap4h`/`ap4x`. Alpha-free output: `I422_10LE`, `Y444_10LE`, `I422_12LE`, or `Y444_12LE`. |
+| Alpha | None, 8-bit, or 16-bit. Alpha-bearing output is standard 16-bit `AYUV64`; 4:2:2 chroma is replicated to adjacent pixels. |
+| Fields | Progressive, top-field-first, and bottom-field-first interlaced frames. Deinterlacing is a downstream operation. |
+| Color | BT.601, BT.709, BT.2020, PQ, and HLG tags are propagated to standard output caps. `proresd3d11rgb` accepts progressive, limited-range BT.709 only. |
+| Dimensions and changes | Non-multiples of 16 are supported; 4:4:4 may have odd width. 4:2:2 requires even width. Color, dimensions, and output format can change within one stream with caps renegotiation. |
+
+See the [feature table](docs/機能対応表.md) for the tested combinations and precise limits.
+
+## Requirements
+
+Windows x64, GStreamer 1.28 or later (tested with 1.28.2), a physical Direct3D 11 GPU with feature level 11_0 or later, PowerShell 7, MSVC C++ Build Tools, Windows SDK (including `fxc.exe`), CMake, and Python. Only an NVIDIA RTX 3070 has been tested; WARP/software adapters are rejected. The build scripts use a pinned FFmpeg SDK for test tools, but the decoder plugin does not link to FFmpeg.
+
+## Build and run
+
+In PowerShell 7, from the repository root:
 
 ```powershell
 ./scripts/bootstrap.ps1
 ./scripts/build.ps1
-./scripts/generate-media.ps1
 . ./scripts/use-d3d11-plugin.ps1
-gst-launch-1.0 -e filesrc location=media/synthetic-1080p60-hq.mov ! qtdemux ! proresd3d11dec ! fakesink sync=false
 ```
 
-GStreamer MSVC x64ランタイムと開発SDKが必要です。[プラグインの実行手順・対応範囲](docs/GStreamerプラグイン.md)を参照してください。比較用の `proresvkdec` はVulkan復号後にCPUへ読み戻しますが、最終経路の `proresd3d11dec` はD3D11Memoryを出力します。
-
-6周×3試行の定常D3D11Memory供給は1080p 293.8 fps、4K 133.1 fps。検査用downloadでGPU完了まで含めても255.7/102.2 fps、p99は4.49/11.63 msでした。4Kの30分・182,520フレーム、起動100回、seek 1000回、2同時decodeに加え、RGB10A2 D3D11Memoryへの変換と2入力d3d11compositorも成功しています。実写1080pとclock同期の実表示まで試した結果・未達項目は[実素材と表示検証](docs/実素材と表示検証.md)に記録しました。Vulkan経路の既知の画素差・初回停止とDX11経路の結果は分けて扱います。
-
-- [調査・方式比較](docs/調査と方式比較.md)
-- [ビルド・実行](docs/ビルドと実行.md)
-- [測定方法・制限](docs/測定仕様.md)
-- [測定結果](docs/測定結果.md)
-- [実素材・色・実表示の検証](docs/実素材と表示検証.md)
-- [DX11ネイティブ実装の検証](docs/DX11実装検証.md)
-- [画素不一致・停止の再現情報](docs/不一致の再現.md)
-- [GStreamerプラグイン化計画](docs/プラグイン化計画.md)
-- [純粋DX11実装の進捗](docs/進捗.md)
-- [GStreamerプラグインと検査結果](docs/GStreamerプラグイン.md)
-
-## 実装済み
-
-`prores_bench` は同一FFmpeg SDKでCPU/Vulkanを切り替え、GPU完了待ち、CPU読み戻し、D3D11アップロード、Win32共有テクスチャ、複数層の検証合成を比較します。フレームごとの時刻・所要時間をCSV、初期化・定常速度・CPU・メモリをJSONへ記録します。
-
-`dx11_primitives` はD3D11 Compute Shaderによるビット読み取りと8×8逆DCTの基礎検証です。`prores_dx11_coeff` は固定SDKでMOVから実パケットを取り出し、独立CPU参照とDX11の全係数・画素を比較します。`proresd3d11dec` は同じparser/shaderをGstVideoDecoderとして連続実行し、4種のplanar 422/444 10/12bit formatを`memory:D3D11Memory`で出力します。検査用CPU読み戻しは通常経路と分離しています。
-
-## 最短の実行
-
-Windows x64、MSVC C++ビルドツール、Windows SDK、CMake、Pythonを使用します。PowerShell 7でリポジトリのルートから実行します。
+`use-d3d11-plugin.ps1` configures the current shell only. Pass `-GStreamerRoot` to the build and setup scripts if GStreamer is not at their default MSVC x64 location. Replace `sample.mov` below with a ProRes MOV file:
 
 ```powershell
-./scripts/bootstrap.ps1
-./scripts/build.ps1
-./scripts/generate-media.ps1
-python scripts/benchmark.py media/synthetic-2160p60-hq.mov --modes cpu-d3d11 interop --layers 4 --loops 12 --repeats 3 --out results/my-run
-./build/vs18/Release/dx11_primitives.exe
-./scripts/test-dx11.ps1
-./scripts/test-d3d11-plugin.ps1
+# Decode to D3D11Memory without a display conversion.
+gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "video/x-raw(memory:D3D11Memory)" ! fakesink sync=false
+
+# Progressive, limited BT.709: GPU RGB conversion and display.
+gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! proresd3d11rgb ! d3d11videosink
+
+# Alpha-bearing ProRes: pass standard AYUV64 directly to the sink.
+gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "video/x-raw(memory:D3D11Memory),format=AYUV64" ! d3d11videosink
 ```
 
-依存物は `tools/` と `external/`、合成素材は `media/` に置き、Gitには含めません。FFmpeg、GStreamer、PATH、ドライバーのシステム設定は変更しません。実機はRTX 3070一台のみで、他GPU・ドライバーの動作は未確認です。
+See [build and execution](docs/ビルドと実行.md), [design](docs/設計.md), and [validation](docs/検証.md).
+
+## Accuracy and performance
+
+On the tested streams, every decoded YUV pixel differed from the pinned FFmpeg CPU reference by at most one code value at the source depth; alpha matched at the compared output depth. The native RGB converter differed from an independent BT.709 calculation by at most one RGB10A2 code value. On an RTX 3070, synthetic HQ direct-output throughput was about **436 fps at 1080p** and **258 fps at 4K**. These are decoder throughput measurements without GPU-completion waiting or display timing, not playback guarantees.
+
+## Known limits
+
+- AMD and Intel GPUs, actual device loss/recovery, and long-running operation on other systems have not been verified.
+- HDR tags are propagated, but HDR-to-RGB numerical accuracy has not been verified. The native RGB element is limited to progressive, limited BT.709.
+- Odd-width 4:2:2 frames are rejected. Interlaced RGB needs a separate deinterlacer; `proresd3d11rgb` does not deinterlace.
+- Corrupt bitstream errors may be reported up to three frames late by the asynchronous GPU error check; an affected image may reach downstream first.
+- The measured decoder QoS result does not establish OS/DWM presentation or display color accuracy. Camera-origin alpha and interlaced footage with clear redistribution rights remains untested.
+
+## License and trademark
+
+Licensed under LGPL-2.1-or-later. The parser and VLD shader contain work derived from FFmpeg's `proresdec.c` (and its related ProRes VLD implementation); their source files carry SPDX notices. ProRes is a trademark of Apple Inc. This project is not affiliated with Apple.

@@ -2,36 +2,7 @@
 /external/
 /build/
 /media/
+/results/
 __pycache__/
 *.raw
 *.yuv
-/results/**/gst-registry.bin
-# 初期試作の表示計測（seek後のsink統計集計前）。正式値はresults/d3d11-display/。
-/results/display-1080.json
-/results/display-1080-present.csv
-/results/display-1080-stderr.log
-# 条件決め用の単発試行。正式な反復記録はresults/d3d11-display-*-repeat/など。
-/results/d3d11-display-stages-pilot/
-/results/d3d11-display-stages-check/
-/results/d3d11-display-dji-preroll-pilot/
-/results/proton-real-rgb-explicit-pilot.*
-# Present同期条件決め用の短時間試行。正式な反復CSVはresults/present-control-*-4k60-2026-09-24/。
-/results/present-control-pilot*/
-/results/present-control-window-state-pilot*/
-/results/present-control-topmost-pilot*/
-/results/present-control-topmost-direct.csv
-/results/present-control-dji-pilot.csv
-/results/present-control-pilot.csv
-# M0の長いFFmpeg診断ログ・一時MD5/MOVはローカルに残し、要約JSONを追跡する。
-/results/feature-matrix-2026-09-24/*.log
-/results/feature-matrix-2026-09-24/*.framemd5
-/results/feature-matrix-2026-09-24/*.mov
-# CSO版へ切り替える前の逐次検査ログ（未完・再現用にローカル保持）。
-/results/profile-422-coefficients-all-2026-09-24/
-# M2の大量な生ログ・フレーム別結果はローカル保持。採用要約と素材ハッシュのみ明示追跡する。
-/results/m2-*
-/results/prores-m2-2026-09-24/
-# AYUV64標準化の途中ログ・全画素の個別結果はローカルのみ保持。採用根拠は明示指定して追跡する。
-/results/alpha-standard-*/
-/results/alpha-standard-*.log
-/results/alpha-standard-*.json
