@@ -1,5 +1,7 @@
 # gst-prores-d3d11
 
+[English](README.md)
+
 GStreamerで単独利用できる、Direct3D 11 Compute Shader製のProResデコーダーです。復号画像をCPUへ読み戻さず`GstD3D11Memory`で出力します。CPU、Vulkan、FFmpegによる復号へのfallbackはありません。CPUは圧縮packetの検査と準備を行い、画像の復号処理はGPUで実行します。GPU専用の固定機能ProResデコーダーを使う方式ではありません。
 
 ## 対応する入力・出力

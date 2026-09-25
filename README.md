@@ -1,5 +1,7 @@
 # gst-prores-d3d11
 
+[日本語](README-ja.md)
+
 A standalone GStreamer ProRes decoder implemented with Direct3D 11 Compute Shaders. It outputs `GstD3D11Memory` without reading decoded images back to the CPU. There is no CPU, Vulkan, or FFmpeg decoding fallback. The CPU validates and prepares compressed packets; the image decoding work runs on the GPU. This is a compute implementation, not a vendor fixed-function ProRes decoder.
 
 ## Supported input and output
