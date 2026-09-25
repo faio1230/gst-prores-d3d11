@@ -911,6 +911,7 @@ typedef struct _GstProresD3D11Dec {
     Dx11Backend* backend;
     gchar* shader_directory;
     gint adapter;
+    gint64 adapter_luid;
     gboolean negotiated;
     gboolean failed;
     gint flushing;
@@ -929,7 +930,7 @@ typedef struct _GstProresD3D11DecClass { GstVideoDecoderClass parent_class; } Gs
 G_DEFINE_TYPE(GstProresD3D11Dec, gst_prores_d3d11_dec, GST_TYPE_VIDEO_DECODER)
 #define SELF(obj) (reinterpret_cast<GstProresD3D11Dec*>(obj))
 
-enum { PROP_0, PROP_ADAPTER, PROP_SHADER_DIRECTORY };
+enum { PROP_0, PROP_ADAPTER, PROP_ADAPTER_LUID, PROP_SHADER_DIRECTORY };
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
     "sink", GST_PAD_SINK, GST_PAD_ALWAYS,
@@ -955,9 +956,16 @@ static gboolean start(GstVideoDecoder* decoder) {
     self->cpu_timing = g_strcmp0(g_getenv("PRORES_DX11_CPU_TIMING"), "1") == 0;
     self->cpu_timing_sequence = 0;
     g_atomic_int_set(&self->flushing, 0);
-    if (!gst_d3d11_ensure_element_data(GST_ELEMENT(self), self->adapter, &self->device)) {
+    // A non-zero LUID pins the device to that exact adapter (hybrid-GPU systems);
+    // it takes precedence over the DXGI index, matching GStreamer's d3d11 decoders.
+    const gboolean ensured = self->adapter_luid != 0
+        ? gst_d3d11_ensure_element_data_for_adapter_luid(GST_ELEMENT(self), self->adapter_luid,
+                                                         &self->device)
+        : gst_d3d11_ensure_element_data(GST_ELEMENT(self), self->adapter, &self->device);
+    if (!ensured) {
         GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("Cannot create D3D11 device"),
-                          ("adapter=%d", self->adapter));
+                          ("adapter=%d adapter-luid=%" G_GINT64_FORMAT, self->adapter,
+                           self->adapter_luid));
         return FALSE;
     }
     try {
@@ -1301,7 +1309,11 @@ static gboolean sink_query(GstVideoDecoder* decoder, GstQuery* query) {
 
 static void set_context(GstElement* element, GstContext* context) {
     auto* self = SELF(element);
-    gst_d3d11_handle_set_context(element, context, self->adapter, &self->device);
+    if (self->adapter_luid != 0)
+        gst_d3d11_handle_set_context_for_adapter_luid(element, context, self->adapter_luid,
+                                                      &self->device);
+    else
+        gst_d3d11_handle_set_context(element, context, self->adapter, &self->device);
     GST_ELEMENT_CLASS(gst_prores_d3d11_dec_parent_class)->set_context(element, context);
 }
 
@@ -1309,6 +1321,7 @@ static void set_property(GObject* object, guint id, const GValue* value, GParamS
     auto* self = SELF(object);
     switch (id) {
         case PROP_ADAPTER: self->adapter = g_value_get_int(value); break;
+        case PROP_ADAPTER_LUID: self->adapter_luid = g_value_get_int64(value); break;
         case PROP_SHADER_DIRECTORY:
             g_free(self->shader_directory);
             self->shader_directory = g_value_dup_string(value);
@@ -1321,6 +1334,17 @@ static void get_property(GObject* object, guint id, GValue* value, GParamSpec* s
     auto* self = SELF(object);
     switch (id) {
         case PROP_ADAPTER: g_value_set_int(value, self->adapter); break;
+        case PROP_ADAPTER_LUID: {
+            // Report the device actually in use once one exists, else the requested LUID.
+            gint64 luid = self->adapter_luid;
+            GstD3D11Device* device = self->device ? GST_D3D11_DEVICE(gst_object_ref(self->device)) : nullptr;
+            if (device) {
+                g_object_get(device, "adapter-luid", &luid, nullptr);
+                gst_object_unref(device);
+            }
+            g_value_set_int64(value, luid);
+            break;
+        }
         case PROP_SHADER_DIRECTORY: g_value_set_string(value, self->shader_directory); break;
         default: G_OBJECT_WARN_INVALID_PROPERTY_ID(object, id, spec); break;
     }
@@ -1346,13 +1370,18 @@ static void gst_prores_d3d11_dec_class_init(GstProresD3D11DecClass* klass) {
     g_object_class_install_property(object, PROP_ADAPTER,
         g_param_spec_int("adapter", "D3D11 adapter", "DXGI adapter index (-1 selects default)",
                          -1, G_MAXINT, -1, flags));
+    g_object_class_install_property(object, PROP_ADAPTER_LUID,
+        g_param_spec_int64("adapter-luid", "Adapter LUID",
+            "DXGI adapter LUID to use (0 = use the adapter index). Reads back the LUID of the "
+            "device in use once the element has one", G_MININT64, G_MAXINT64, 0, flags));
     g_object_class_install_property(object, PROP_SHADER_DIRECTORY,
         g_param_spec_string("shader-directory", "Shader directory",
             "Override directory containing prores_vld.cso and prores_idct_unorm.cso", nullptr, flags));
     auto* element = GST_ELEMENT_CLASS(klass);
     element->set_context = set_context;
     gst_element_class_set_static_metadata(element, "Native D3D11 ProRes decoder",
-        "Codec/Decoder/Video/Hardware", "Progressive ProRes 422 to D3D11Memory without image readback",
+        "Codec/Decoder/Video/Hardware",
+        "ProRes 422/4444 (alpha, interlaced) to D3D11Memory with Direct3D 11 compute shaders",
         "ProRes GPU project");
     gst_element_class_add_static_pad_template(element, &sink_template);
     gst_element_class_add_static_pad_template(element, &src_template);
@@ -1372,6 +1401,7 @@ static void gst_prores_d3d11_dec_class_init(GstProresD3D11DecClass* klass) {
 
 static void gst_prores_d3d11_dec_init(GstProresD3D11Dec* self) {
     self->adapter = -1;
+    self->adapter_luid = 0;
     self->shader_directory = nullptr;
     gst_video_decoder_set_packetized(GST_VIDEO_DECODER(self), TRUE);
     gst_video_decoder_set_needs_format(GST_VIDEO_DECODER(self), TRUE);

@@ -44,6 +44,8 @@ gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! prore
 gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "video/x-raw(memory:D3D11Memory),format=AYUV64" ! d3d11videosink
 ```
 
+`proresd3d11dec`のDirect3D 11デバイスは、`adapter`（DXGIアダプター番号、`-1`で既定）または`adapter-luid`（DXGIアダプターのLUID。0以外を指定すると`adapter`より優先）で選びます。内蔵GPUと外付けGPUが混在する環境では、`adapter-luid`でパイプラインの他の要素と同じGPUを指定してください。デバイス作成後に`adapter-luid`を読むと、実際に使っているデバイスのLUIDが返ります。
+
 詳しくは[ビルドと実行](docs/ビルドと実行.md)、[設計](docs/設計.md)、[検証](docs/検証.md)を参照してください。
 
 ## 精度と性能

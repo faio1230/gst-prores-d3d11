@@ -44,6 +44,8 @@ gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! prore
 gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "video/x-raw(memory:D3D11Memory),format=AYUV64" ! d3d11videosink
 ```
 
+`proresd3d11dec` selects its Direct3D 11 device with `adapter` (DXGI adapter index, `-1` for the default) or `adapter-luid` (DXGI adapter LUID; a non-zero value takes precedence over `adapter`). On hybrid-GPU systems, set `adapter-luid` so the decoder uses the same GPU as the rest of the pipeline. Once the element has a device, reading `adapter-luid` returns that device's LUID.
+
 See [build and execution](docs/ビルドと実行.md), [design](docs/設計.md), and [validation](docs/検証.md).
 
 ## Accuracy and performance
