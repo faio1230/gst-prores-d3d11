@@ -48,6 +48,20 @@ static DecoderGpuCapabilities check_device_capabilities() {
     return {static_cast<unsigned>(level), support};
 }
 
+static void check_dispatch_bounds() {
+    constexpr unsigned limit = D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+    constexpr unsigned macroblocks = (8192 / 16) * (8192 / 16);
+    constexpr unsigned vld_groups = (3 * macroblocks + 63) / 64;
+    constexpr unsigned alpha_groups = (macroblocks + 63) / 64;
+    constexpr unsigned idct_blocks = 12 * macroblocks;
+    constexpr unsigned idct_rows = (idct_blocks + limit - 1) / limit;
+    constexpr unsigned pixel_groups = (8192 + 7) / 8;
+    static_assert(vld_groups == 12288 && alpha_groups == 4096 &&
+                  idct_blocks == 3145728 && idct_rows == 49 && pixel_groups == 1024);
+    require(idct_rows <= limit && vld_groups <= limit && alpha_groups <= limit &&
+            pixel_groups <= limit, "8192-square dispatch exceeds D3D11 limit");
+}
+
 struct Pipeline {
     GstElement* pipe = nullptr;
     GstElement* sink = nullptr;
@@ -136,6 +150,10 @@ struct Pipeline {
                 (expected_code < 0 || error->code == expected_code);
             const bool expected_debug = !expected_debug_text ||
                 (debug && std::strstr(debug, expected_debug_text));
+            if (!expected_type || !expected_debug)
+                std::cerr << "unexpected_error_domain=" << g_quark_to_string(error->domain)
+                          << " code=" << error->code << " debug="
+                          << (debug ? debug : "") << '\n';
             g_error_free(error);
             g_free(debug);
             gst_message_unref(message);
@@ -452,7 +470,7 @@ static void reject_software_device(GstSample* compressed) {
 
     auto* caps = gst_caps_from_string(
         "video/x-raw(memory:D3D11Memory),format=I422_10LE,width=16,height=16,"
-        "framerate=60/1,interlace-mode=progressive,colorimetry=bt709,chroma-site=jpeg");
+        "framerate=60/1,interlace-mode=progressive,colorimetry=bt709,chroma-site=mpeg2");
     GstVideoInfo info{};
     require(caps && gst_video_info_from_caps(&info, caps), "WARP RGB caps invalid");
     auto* pool = gst_d3d11_buffer_pool_new(wrapped);
@@ -540,9 +558,11 @@ static void dynamic_color_caps(GstSample* compressed) {
 
         auto* packet = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
         require(packet != nullptr, "dynamic-color packet copy failed");
-        const guint8 unspecified_color[] = {2, 2, 2};
-        require(gst_buffer_fill(packet, 22, unspecified_color, sizeof(unspecified_color)) ==
-                    sizeof(unspecified_color), "dynamic-color frame tag write failed");
+        const guint8 matrix_fallback_color[] = {2, 2,
+            static_cast<guint8>(index == 1 ? 2 : 0)};
+        require(gst_buffer_fill(packet, 22, matrix_fallback_color,
+                                sizeof(matrix_fallback_color)) ==
+                    sizeof(matrix_fallback_color), "dynamic-color frame tag write failed");
         GST_BUFFER_PTS(packet) = gst_util_uint64_scale(index, GST_SECOND, 60);
         GST_BUFFER_DTS(packet) = GST_BUFFER_PTS(packet);
         GST_BUFFER_DURATION(packet) = gst_util_uint64_scale(1, GST_SECOND, 60);
@@ -570,6 +590,92 @@ static void dynamic_color_caps(GstSample* compressed) {
     require(retained != nullptr && gst_buffer_n_memory(retained) == 3,
             "retained D3D11 buffer invalid after color-only caps changes");
     gst_buffer_unref(retained);
+}
+
+static void idct_refresh_exception_seek(const char* path) {
+    GstClockTime fault_pts = GST_CLOCK_TIME_NONE;
+    guint64 fault_index = 0;
+    std::vector<std::uint8_t> previous_quant;
+    {
+        Pipeline demux("filesrc name=source ! qtdemux ! appsink name=sink sync=false max-buffers=4");
+        demux.file(path);
+        demux.state(GST_STATE_PLAYING);
+        for (guint64 index = 0; index < 180; ++index) {
+            auto* sample = demux.pull();
+            require(sample != nullptr, "IDCT fault fixture ended before quant changed");
+            auto* buffer = gst_sample_get_buffer(sample);
+            GstMapInfo mapped{};
+            require(gst_buffer_map(buffer, &mapped, GST_MAP_READ), "IDCT fault fixture map failed");
+            prores::Frame frame;
+            std::string error;
+            const bool parsed = prores::parse_frame(mapped.data, mapped.size, 0, 0,
+                                                     frame, error);
+            gst_buffer_unmap(buffer, &mapped);
+            require(parsed, "IDCT fault fixture parse failed");
+            std::vector<std::uint8_t> quant;
+            quant.reserve(frame.slices.size());
+            for (const auto& slice : frame.slices) quant.push_back(slice.quant_index);
+            if (!previous_quant.empty() && quant != previous_quant) {
+                fault_pts = GST_BUFFER_PTS(buffer);
+                fault_index = index;
+                gst_sample_unref(sample);
+                break;
+            }
+            previous_quant = std::move(quant);
+            gst_sample_unref(sample);
+        }
+    }
+    require(fault_pts != GST_CLOCK_TIME_NONE && fault_index > 0,
+            "IDCT fault fixture has no quant change");
+
+    GstSample* reference = nullptr;
+    {
+        Pipeline pipeline(direct_pipeline);
+        pipeline.file(path);
+        pipeline.state(GST_STATE_PLAYING);
+        for (guint64 index = 0; index <= fault_index; ++index) {
+            auto* sample = pipeline.pull();
+            require(sample != nullptr, "IDCT fault reference frame missing");
+            if (index == fault_index) reference = sample;
+            else gst_sample_unref(sample);
+        }
+    }
+    require(reference != nullptr && GST_BUFFER_PTS(gst_sample_get_buffer(reference)) == fault_pts,
+            "IDCT fault reference PTS mismatch");
+
+    const auto fault_value = std::to_string(fault_pts);
+    g_setenv("PRORES_DX11_TEST_THROW_AFTER_IDCT_REFRESH_PTS_NS", fault_value.c_str(), TRUE);
+    {
+        Pipeline pipeline("filesrc name=source ! qtdemux name=demux "
+                          "proresd3d11dec name=decoder ! "
+                          "appsink name=sink sync=false max-buffers=1 drop=true");
+        pipeline.file(path);
+        pipeline.state(GST_STATE_PLAYING);
+        pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE,
+                              "injected failure after IDCT job refresh");
+        pipeline.state(GST_STATE_PAUSED);
+        require(gst_element_seek_simple(pipeline.pipe, GST_FORMAT_TIME,
+                    static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
+                    fault_pts), "flushing seek after IDCT exception rejected");
+        pipeline.state(GST_STATE_PLAYING);
+        // The pre-seek streaming task may also have posted a secondary upstream
+        // error. Only the post-seek output proves recovery here.
+        auto* recovered = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline.sink),
+                                                       10 * GST_SECOND);
+        require(recovered != nullptr, "IDCT exception seek produced no frame");
+        require(GST_BUFFER_PTS(gst_sample_get_buffer(recovered)) == fault_pts,
+                "IDCT exception seek PTS mismatch");
+        GstVideoInfo info{};
+        require(gst_video_info_from_caps(&info, gst_sample_get_caps(reference)),
+                "IDCT reference caps invalid");
+        check_same_pixels(info, gst_sample_get_buffer(reference),
+                          gst_sample_get_buffer(recovered),
+                          "IDCT jobs were not uploaded after exception and flushing seek");
+        gst_sample_unref(recovered);
+    }
+    g_unsetenv("PRORES_DX11_TEST_THROW_AFTER_IDCT_REFRESH_PTS_NS");
+    gst_sample_unref(reference);
+    std::cerr << "idct_exception_seek_pts_ns=" << fault_pts << '\n';
 }
 
 static void dynamic_rejected_input(GstSample* compressed, bool unsupported_caps) {
@@ -832,6 +938,7 @@ static void reject_corrupt_second_field(GstSample* compressed) {
 
 int main(int argc, char** argv) try {
     gst_init(&argc, &argv);
+    check_dispatch_bounds();
     require(argc >= 2 && (argc <= 4 || argc == 8),
             "d3d11_plugin_smoke hq.mov [4k.mov] [alpha.mov] [tff.mov bff.mov alpha-tff.mov alpha-bff.mov]");
     const auto capabilities = check_device_capabilities();
@@ -910,6 +1017,7 @@ int main(int argc, char** argv) try {
     known_color(compressed, false);
     known_color(compressed, true);
     dynamic_color_caps(compressed);
+    idct_refresh_exception_seek(argv[1]);
     reject_software_device(compressed);
     dynamic_rejected_input(compressed, false);
     dynamic_rejected_input(compressed, true);
@@ -971,8 +1079,9 @@ int main(int argc, char** argv) try {
     }
 
     std::cout << "{\"passed\":true,\"eos_cycles\":3,\"frames_per_cycle\":180,"
-                 "\"flushing_seeks\":4,\"known_color_cases\":2,"
-                 "\"dynamic_color_caps_changes\":2,"
+                 "\"flushing_seeks\":5,\"idct_exception_seek\":true,"
+                 "\"dispatch_bound_8192\":true,\"known_color_cases\":2,"
+                 "\"dynamic_color_caps_changes\":2,\"matrix_fallback_zero_and_two\":true,"
                  "\"dynamic_rejected_input_cases\":2,"
                  "\"dynamic_caps_changes\":" << (argc >= 3 ? 2 : 0) << ","
                  "\"retained_buffer_after_destroy\":true,\"shared_device_instances\":2,"

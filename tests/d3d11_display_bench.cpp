@@ -492,7 +492,7 @@ int main(int argc, char** argv) try {
     const std::string rgb_caps =
         "video/x-raw(memory:D3D11Memory),format=RGB10A2_LE,colorimetry=1:1:5:1";
     const std::string yuv_caps =
-        "video/x-raw(memory:D3D11Memory),format=I422_10LE,colorimetry=bt709,chroma-site=jpeg";
+        "video/x-raw(memory:D3D11Memory),format=I422_10LE,colorimetry=bt709,chroma-site=mpeg2";
     std::string description;
     if (reference) {
         description = "d3d11testsrc name=source num-buffers=1440 ! "

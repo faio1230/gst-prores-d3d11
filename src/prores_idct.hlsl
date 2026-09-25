@@ -48,8 +48,10 @@ groupshared float column_idct[64];
 
 [numthreads(8, 8, 1)]
 void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID) {
-    if (group_id.x >= block_count) return;
-    IdctBlockJob job = blocks[group_id.x];
+    // Dispatch X is at most 65535 groups; Y carries the remaining block rows.
+    uint block_index = group_id.y * 65535u + group_id.x;
+    if (block_index >= block_count) return;
+    IdctBlockJob job = blocks[block_index];
     uint x = thread_id.x;
     uint y = thread_id.y;
     uint index = y * 8 + x;

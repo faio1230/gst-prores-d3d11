@@ -295,6 +295,8 @@ static gboolean set_caps(GstBaseTransform* transform, GstCaps* input, GstCaps* o
         return FALSE;
     const auto format = GST_VIDEO_INFO_FORMAT(&in);
     const bool alpha = format == GST_VIDEO_FORMAT_AYUV64;
+    const bool subsampled = format == GST_VIDEO_FORMAT_I422_10LE ||
+        format == GST_VIDEO_FORMAT_I422_12LE;
     if ((format != GST_VIDEO_FORMAT_I422_10LE &&
          format != GST_VIDEO_FORMAT_Y444_10LE &&
          format != GST_VIDEO_FORMAT_I422_12LE &&
@@ -306,7 +308,7 @@ static gboolean set_caps(GstBaseTransform* transform, GstCaps* input, GstCaps* o
                             format == GST_VIDEO_FORMAT_I422_12LE)) ||
         in.interlace_mode != GST_VIDEO_INTERLACE_MODE_PROGRESSIVE ||
         out.interlace_mode != GST_VIDEO_INTERLACE_MODE_PROGRESSIVE ||
-        (chroma_site && std::strcmp(chroma_site, "jpeg") != 0) ||
+        (subsampled && (!chroma_site || std::strcmp(chroma_site, "mpeg2") != 0)) ||
         in.colorimetry.range != GST_VIDEO_COLOR_RANGE_16_235 ||
         in.colorimetry.matrix != GST_VIDEO_COLOR_MATRIX_BT709 ||
         in.colorimetry.transfer != GST_VIDEO_TRANSFER_BT709 ||
@@ -423,7 +425,7 @@ static void gst_prores_d3d11_rgb_class_init(GstProresD3D11RgbClass* klass) {
     object->finalize = finalize;
     auto* element = GST_ELEMENT_CLASS(klass);
     gst_element_class_set_static_metadata(element, "Native D3D11 BT.709 RGB converter",
-        "Filter/Converter/Video/Hardware", "planar ProRes 422/444 10/12-bit to RGB10A2_LE D3D11Memory without image readback",
+        "Filter/Converter/Video/Hardware", "ProRes 422/444 10/12-bit and AYUV64 alpha to RGB10A2_LE/RGBA64_LE D3D11Memory without image readback",
         "ProRes GPU project");
     gst_element_class_add_static_pad_template(element, &sink_template);
     gst_element_class_add_static_pad_template(element, &src_template);

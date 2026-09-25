@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [string]$OutDir = 'results/profile-422-expansion-2026-09-24',
+    [string]$FixtureDir = 'results/profile-422-expansion-2026-09-24',
     [string]$FixturesFile = 'fixtures.json',
     [string]$SummaryFile = 'verification-summary.json',
     [switch]$Streaming
@@ -9,7 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $out = Join-Path $root $OutDir
-$fixtures = Join-Path $out $FixturesFile
+$fixtures = Join-Path (Join-Path $root $FixtureDir) $FixturesFile
 $ffmpegBin = Join-Path $root 'tools/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1/bin'
 $ffmpeg = Join-Path $ffmpegBin 'ffmpeg.exe'
 $gstBin = 'C:/Program Files/gstreamer/1.0/msvc_x86_64/bin'

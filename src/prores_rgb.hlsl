@@ -16,10 +16,10 @@ float code_at(Texture2D<float> plane, int2 position) {
     return round(plane.Load(int3(position, 0)) * 65535.0);
 }
 
-float centered_chroma(Texture2D<float> plane, uint x, uint y) {
+float left_cosited_chroma(Texture2D<float> plane, uint x, uint y) {
     if ((mode & 1u) == 0u) return code_at(plane, int2(x, y));
     int max_x = int(output_width / 2) - 1;
-    float location = (float(x) - 0.5) * 0.5;
+    float location = float(x) * 0.5;
     int low = int(floor(location));
     float fraction = location - floor(location);
     int a = clamp(low, 0, max_x);
@@ -31,8 +31,8 @@ float centered_chroma(Texture2D<float> plane, uint x, uint y) {
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= output_width || id.y >= output_height) return;
     float y_code = code_at(luma, int2(id.xy));
-    float cb_code = centered_chroma(cb_plane, id.x, id.y);
-    float cr_code = centered_chroma(cr_plane, id.x, id.y);
+    float cb_code = left_cosited_chroma(cb_plane, id.x, id.y);
+    float cr_code = left_cosited_chroma(cr_plane, id.x, id.y);
     float depth_scale = ((mode >> 8) & 255u) == 12u ? 4.0 : 1.0;
     float yy = (y_code / depth_scale - 64.0) / 876.0;
     float cb = (cb_code / depth_scale - 512.0) / 896.0;

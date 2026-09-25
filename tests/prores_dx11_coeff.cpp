@@ -559,7 +559,14 @@ int main(int argc, char** argv) try {
     context->CSSetShaderResources(0, 3, idct_srvs);
     context->CSSetUnorderedAccessViews(0, 3, idct_uavs, nullptr);
     context->CSSetConstantBuffers(0, 1, idct_constants);
-    context->Dispatch(static_cast<UINT>(idct_jobs.size()), 1, 1);
+    constexpr UINT kMaxDispatchGroups = D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+    const UINT idct_groups_x = static_cast<UINT>(std::min<std::size_t>(
+        idct_jobs.size(), kMaxDispatchGroups));
+    const UINT idct_groups_y = static_cast<UINT>(
+        (idct_jobs.size() + kMaxDispatchGroups - 1) / kMaxDispatchGroups);
+    if (idct_groups_y > kMaxDispatchGroups)
+        throw std::runtime_error("IDCT dispatch Y exceeds D3D11 limit");
+    context->Dispatch(idct_groups_x, idct_groups_y, 1);
     ID3D11UnorderedAccessView* null_idct_uavs[] = {nullptr, nullptr, nullptr};
     ID3D11ShaderResourceView* null_idct_srvs[] = {nullptr, nullptr, nullptr};
     context->CSSetUnorderedAccessViews(0, 3, null_idct_uavs, nullptr);

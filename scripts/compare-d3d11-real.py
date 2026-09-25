@@ -202,7 +202,7 @@ def compare_rgb_formula_streams(yuv_command, rgb_command, width, height, frames,
     scale = 4.0 if 'p12le' in pixel_format else 1.0
     if '422' in pixel_format:
         x = np.arange(width, dtype=np.float32)
-        location = (x - .5) * .5
+        location = x * .5
         base = np.floor(location).astype(np.int32)
         low = np.clip(base, 0, width // 2 - 1)
         high = np.clip(base + 1, 0, width // 2 - 1)
@@ -286,7 +286,7 @@ def compare_formula(yuv_path, rgb_path, width, height, expected_frames):
     stats = [make_stat(name) for name in 'RGBA']
     frame_maxima = []
     x = np.arange(width, dtype=np.float32)
-    location = (x - .5) * .5
+    location = x * .5
     base = np.floor(location).astype(np.int32)
     low = np.clip(base, 0, width // 2 - 1)
     high = np.clip(base + 1, 0, width // 2 - 1)
@@ -454,7 +454,7 @@ def main():
         source_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
     result.update(input=str(source), source_sha256=source_sha256,
                   mode=args.mode, reference=(f'fixed FFmpeg 8.1 CPU {pixel_format}' if args.mode == 'yuv'
-                                            else 'same DX11 I422 + independent BT.709 limited-to-full centered chroma formula'
+                                            else 'same DX11 I422 + independent BT.709 limited-to-full left-cosited chroma formula'
                                             if args.mode in ('rgb_formula', 'rgb_element_formula')
                                             else 'D3D11 decoded I422 + CPU videoconvert BT.709, centered 4:2:2 chroma'),
                   probe=probe, commands=runs)

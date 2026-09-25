@@ -314,6 +314,15 @@ public:
         }
         mark(&CpuDecodeTiming::coefficient_jobs_ms);
         const auto idct_update = refresh_idct_jobs(parsed, coefficient_jobs);
+        // Test-only fault at the vulnerable point: CPU jobs changed, GPU upload not begun.
+        const char* fault_pts = g_getenv("PRORES_DX11_TEST_THROW_AFTER_IDCT_REFRESH_PTS_NS");
+        char* fault_end = nullptr;
+        const auto fault_value = fault_pts ? g_ascii_strtoull(fault_pts, &fault_end, 10) : 0;
+        if (fault_pts && *fault_pts && !test_idct_fault_injected_ && idct_update.dirty &&
+            fault_end != fault_pts && *fault_end == '\0' && pts == fault_value) {
+            test_idct_fault_injected_ = true;
+            throw std::runtime_error("injected failure after IDCT job refresh");
+        }
         if (cpu_timing) {
             cpu_timing->idct_layout_rebuilt = idct_update.layout_rebuilt;
             cpu_timing->idct_quant_slices_changed = idct_update.quant_slices_changed;
@@ -329,7 +338,7 @@ public:
         const auto cache_rebuilt = ensure_cache(parsed, static_cast<UINT>(packet_size),
                      static_cast<UINT>(coefficient_jobs.size()), coefficient_count,
                      static_cast<UINT>(idct_jobs.size()));
-        const auto upload_idct_jobs = idct_update.dirty || cache_rebuilt;
+        const auto upload_idct_jobs = idct_jobs_dirty_ || cache_rebuilt;
         if (cpu_timing) cpu_timing->idct_gpu_upload = upload_idct_jobs;
         mark(&CpuDecodeTiming::cache_ms);
 
@@ -396,9 +405,11 @@ public:
                                     coefficient_jobs.data(), 0, 0);
         context_->UpdateSubresource(cache_.vld_parameters.Get(), 0, nullptr,
                                     &vld_parameter_values, 0, 0);
-        if (upload_idct_jobs)
+        if (upload_idct_jobs) {
             context_->UpdateSubresource(cache_.idct_jobs.Get(), 0, nullptr,
                                         idct_jobs.data(), 0, 0);
+            idct_jobs_dirty_ = false;
+        }
         context_->UpdateSubresource(cache_.quant_matrices.Get(), 0, nullptr,
                                     quant_matrices.data(), 0, 0);
         context_->UpdateSubresource(cache_.idct_parameters.Get(), 0, nullptr,
@@ -450,7 +461,14 @@ public:
         context_->CSSetUnorderedAccessViews(0, 3, idct_uavs, nullptr);
         context_->CSSetConstantBuffers(0, 1, idct_constants);
         if (timing_) context_->End(timing_->idct_begin.Get());
-        context_->Dispatch(static_cast<UINT>(idct_jobs.size()), 1, 1);
+        constexpr UINT kMaxDispatchGroups = D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+        const UINT idct_groups_x = static_cast<UINT>(std::min<std::size_t>(
+            idct_jobs.size(), kMaxDispatchGroups));
+        const UINT idct_groups_y = static_cast<UINT>(
+            (idct_jobs.size() + kMaxDispatchGroups - 1) / kMaxDispatchGroups);
+        if (idct_groups_y > kMaxDispatchGroups)
+            throw std::runtime_error("IDCT job count exceeds D3D11 dispatch dimensions");
+        context_->Dispatch(idct_groups_x, idct_groups_y, 1);
         if (timing_) context_->End(timing_->idct_end.Get());
         ID3D11UnorderedAccessView* null_idct_uavs[] = {nullptr, nullptr, nullptr};
         ID3D11ShaderResourceView* null_idct_srvs[] = {nullptr, nullptr, nullptr};
@@ -718,6 +736,7 @@ private:
             }
         }
         if (!same_layout) {
+            idct_jobs_dirty_ = true;
             prores::make_idct_jobs(parsed, coefficient_jobs, idct_jobs_);
             idct_layout_.clear();
             idct_layout_.reserve(parsed.slices.size());
@@ -745,6 +764,7 @@ private:
                 ? static_cast<std::uint32_t>(quant_index - 96) * 4 : quant_index;
             auto& layout = idct_layout_[i];
             if (layout.quant_scale == quant_scale) continue;
+            idct_jobs_dirty_ = true;
             for (auto job = layout.job_begin; job < layout.job_end; ++job)
                 idct_jobs_[job].quant_scale = quant_scale;
             layout.quant_scale = quant_scale;
@@ -873,6 +893,8 @@ private:
     std::vector<prores::CoefficientJob> coefficient_jobs_;
     std::vector<AlphaJob> alpha_jobs_;
     std::vector<prores::IdctBlockJob> idct_jobs_;
+    bool idct_jobs_dirty_ = false; // CPU変更後、GPUへのUpdateSubresource成功まで保持する。
+    bool test_idct_fault_injected_ = false;
     std::vector<IdctLayoutSlice> idct_layout_;
     std::uint16_t idct_layout_width_ = 0;
     std::uint16_t idct_layout_height_ = 0;
@@ -1021,14 +1043,20 @@ static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& p
         GST_VIDEO_FIELD_ORDER_TOP_FIELD_FIRST : parsed.frame_type ?
         GST_VIDEO_FIELD_ORDER_BOTTOM_FIELD_FIRST : GST_VIDEO_FIELD_ORDER_UNKNOWN;
     state->info.colorimetry.range = GST_VIDEO_COLOR_RANGE_16_235;
-    state->info.colorimetry.matrix = gst_video_color_matrix_from_iso(parsed.matrix_coefficients);
+    if (parsed.chroma_shift && !parsed.alpha_info)
+        state->info.chroma_site = GST_VIDEO_CHROMA_SITE_MPEG2;
+    // ISO 0 is RGB, not a valid matrix for decoded YUV; 2 is unspecified.
+    state->info.colorimetry.matrix = parsed.matrix_coefficients == 0 ||
+        parsed.matrix_coefficients == 2 ? GST_VIDEO_COLOR_MATRIX_UNKNOWN :
+        gst_video_color_matrix_from_iso(parsed.matrix_coefficients);
     state->info.colorimetry.primaries = gst_video_color_primaries_from_iso(parsed.color_primaries);
     state->info.colorimetry.transfer = gst_video_transfer_function_from_iso(parsed.transfer_characteristic);
     GstVideoColorimetry upstream{};
     const char* color = gst_structure_get_string(gst_caps_get_structure(self->input->caps, 0),
                                                   "colorimetry");
     if (color && gst_video_colorimetry_from_string(&upstream, color)) {
-        if (state->info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_UNKNOWN)
+        if (state->info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_UNKNOWN &&
+            upstream.matrix != GST_VIDEO_COLOR_MATRIX_RGB)
             state->info.colorimetry.matrix = upstream.matrix;
         if (state->info.colorimetry.primaries == GST_VIDEO_COLOR_PRIMARIES_UNKNOWN)
             state->info.colorimetry.primaries = upstream.primaries;
@@ -1359,5 +1387,6 @@ static gboolean plugin_init(GstPlugin* plugin) {
 }
 
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, proresd3d11,
-    "Native D3D11 ProRes 422 decoder and RGB converter", plugin_init, "0.1.0", "LGPL",
+    "Native D3D11 ProRes 422/444 10/12-bit and alpha decoder with RGB converter",
+    plugin_init, "0.1.0", "LGPL",
     "prores-gpu-lab", "https://example.invalid/prores-gpu-lab")

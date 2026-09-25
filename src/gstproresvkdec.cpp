@@ -401,7 +401,6 @@ static gboolean plugin_init(GstPlugin* plugin) {
     return gst_element_register(plugin, "proresvkdec", GST_RANK_NONE, gst_prores_vk_dec_get_type());
 }
 
-// 独自コードの公開ライセンス未決定。依存FFmpegのLGPLv3条件は別途適用される。
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, proresvk,
     "Experimental standalone ProRes GPU decoder", plugin_init, "0.1.0", "unknown",
     "prores-gpu-lab", "https://example.invalid/prores-gpu-lab")
