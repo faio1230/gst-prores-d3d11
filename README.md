@@ -54,7 +54,7 @@ Each GitHub release has a zip named after its tag (for example `gst-prores-d3d11
 
 - **Placement:** keep `gstproresd3d11.dll` and all `prores_*.cso` files in the same directory. Add that directory to `GST_PLUGIN_PATH`, or copy the files into GStreamer's `lib\gstreamer-1.0`. Do not rename the DLL, because GStreamer derives the plugin entry point from its file name.
 - **Runtime:** the release DLL needs the Microsoft Visual C++ Redistributable x64, version 14.50 or later. GStreamer 1.28.2 does not include it.
-- **Untagged streams:** a stream with no color tags comes out with `colorimetry=2:0:0:0` (limited range, matrix/transfer/primaries unknown), so the downstream converter chooses the matrix. Set colorimetry in your application if you need a fixed conversion.
+- **Untagged streams:** color components missing from both the ProRes frame header and the input caps are filled with GStreamer's default for caps without colorimetry (BT.601 for SD, BT.709 for larger frames, or BT.2020 when a known component is BT.2020). Output caps therefore always name a full colorimetry, such as `bt709`, and every downstream converter uses the same matrix. Set colorimetry on the input caps if the material needs something else.
 - **Interlaced streams:** these are output as interleaved frames with `field-order` set. They are not deinterlaced. Add a deinterlacer (such as `d3d11deinterlace`) if you need progressive frames.
 - **Tested GPUs:** only an NVIDIA RTX 3070 has been tested. AMD and Intel GPUs, and hybrid-GPU selection with `adapter-luid`, are not verified yet.
 

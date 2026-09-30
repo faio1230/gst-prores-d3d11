@@ -176,12 +176,12 @@ static void check_caps(GstSample* sample, bool full_bt709) {
     require(gst_video_info_from_caps(&info, caps), "invalid video caps");
     require(GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_I422_10LE,
             "unexpected pixel format");
+    // タグが欠けた項目も、GStreamerのHD既定値（BT.709）で埋めて出力する。
+    static_cast<void>(full_bt709);
     require(info.colorimetry.range == GST_VIDEO_COLOR_RANGE_16_235 &&
             info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_BT709 &&
-            info.colorimetry.primaries == (full_bt709 ? GST_VIDEO_COLOR_PRIMARIES_BT709
-                                                       : GST_VIDEO_COLOR_PRIMARIES_UNKNOWN) &&
-            info.colorimetry.transfer == (full_bt709 ? GST_VIDEO_TRANSFER_BT709
-                                                      : GST_VIDEO_TRANSFER_UNKNOWN),
+            info.colorimetry.primaries == GST_VIDEO_COLOR_PRIMARIES_BT709 &&
+            info.colorimetry.transfer == GST_VIDEO_TRANSFER_BT709,
             "color metadata mismatch");
 }
 

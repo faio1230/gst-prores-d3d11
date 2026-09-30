@@ -54,7 +54,7 @@ GitHub Releasesには、タグ名を含むzip（例：`gst-prores-d3d11-v0.1.0-w
 
 - **配置：** `gstproresd3d11.dll`と`prores_*.cso`をすべて同じフォルダに置き、そのフォルダを`GST_PLUGIN_PATH`に加えるか、GStreamerの`lib\gstreamer-1.0`へコピーしてください。DLLの名前は変えないでください。GStreamerはファイル名からプラグインの入口関数を探します。
 - **ランタイム：** リリース版DLLには、Microsoft Visual C++再頒布可能パッケージ（x64）の14.50以上が必要です。GStreamer 1.28.2には同梱されていません。
-- **色タグのない素材：** `colorimetry=2:0:0:0`（limited range、matrix・transfer・primariesは不明）で出力され、matrixの選択は下流の変換要素に任されます。変換を固定したい場合は、アプリ側でcolorimetryを指定してください。
+- **色タグのない素材：** ProResのフレームヘッダーにも入力capsにもない色の項目は、GStreamerがcolorimetryなしのcapsに当てる既定値で埋めます（SDはBT.601、それより大きい画面はBT.709。既知の項目がBT.2020ならBT.2020系）。出力capsには常に`bt709`のような完全なcolorimetryが付くので、下流の変換要素がどれでも同じ行列を使います。素材の実際の色が違う場合は、入力capsにcolorimetryを指定してください。
 - **インターレース：** `field-order`を付けたinterleavedのフレームとして出力し、デインターレースはしません。プログレッシブにしたい場合は`d3d11deinterlace`などを入れてください。
 - **検証済みのGPU：** 確認したのはNVIDIA RTX 3070だけです。AMDとIntelのGPU、ハイブリッドGPU環境での`adapter-luid`による選択は未検証です。
 

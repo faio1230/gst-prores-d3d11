@@ -1020,8 +1020,10 @@ static gboolean start(GstVideoDecoder* decoder) {
             : self->shader_directory && *self->shader_directory
                 ? std::filesystem::u8path(self->shader_directory)
                 : module_directory();
+        // 構築に失敗しても解放済みポインタを残さないよう、完成してから差し替える。
+        auto backend = std::make_unique<Dx11Backend>(self->device, directory);
         delete self->backend;
-        self->backend = new Dx11Backend(self->device, directory);
+        self->backend = backend.release();
         GST_INFO_OBJECT(self, "native D3D11 shaders loaded from %s", directory.u8string().c_str());
     } catch (const UnsupportedDevice& error) {
         GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("D3D11 adapter lacks decoder capabilities"),
@@ -1116,6 +1118,23 @@ static gboolean negotiate_output(GstProresD3D11Dec* self, const prores::Frame& p
         if (state->info.colorimetry.transfer == GST_VIDEO_TRANSFER_UNKNOWN)
             state->info.colorimetry.transfer = upstream.transfer;
     }
+    // ヘッダーと入力capsで決まらない項目は、下流の変換器ごとの推定に任せず、
+    // GStreamerがcolorimetryなしのcapsに当てる既定値（SDはBT.601、HD以上はBT.709）で埋める。
+    // これでGPU経路とavdec_prores+videoconvertのCPU経路が同じ行列を使う。
+    // 既知の項目がBT.2020を示す場合だけ、残りもBT.2020系で埋める。
+    auto& colorimetry = state->info.colorimetry;
+    const bool bt2020 = colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_BT2020 ||
+        colorimetry.primaries == GST_VIDEO_COLOR_PRIMARIES_BT2020;
+    GstVideoInfo size_default;
+    gst_video_info_set_format(&size_default, format, parsed.width, parsed.height);
+    const GstVideoColorimetry fallback = bt2020
+        ? GstVideoColorimetry{GST_VIDEO_COLOR_RANGE_16_235, GST_VIDEO_COLOR_MATRIX_BT2020,
+                              GST_VIDEO_TRANSFER_BT2020_10, GST_VIDEO_COLOR_PRIMARIES_BT2020}
+        : size_default.colorimetry;
+    if (colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_UNKNOWN) colorimetry.matrix = fallback.matrix;
+    if (colorimetry.transfer == GST_VIDEO_TRANSFER_UNKNOWN) colorimetry.transfer = fallback.transfer;
+    if (colorimetry.primaries == GST_VIDEO_COLOR_PRIMARIES_UNKNOWN)
+        colorimetry.primaries = fallback.primaries;
     if (state->caps) gst_caps_unref(state->caps);
     state->caps = gst_video_info_to_caps(&state->info);
     gst_caps_set_features(state->caps, 0,
@@ -1415,6 +1434,22 @@ static void finalize(GObject* object) {
     G_OBJECT_CLASS(gst_prores_d3d11_dec_parent_class)->finalize(object);
 }
 
+template <typename Result, typename Body>
+static Result guard_vfunc(GstVideoDecoder* decoder, const char* name, Result on_error,
+                          Body&& body) noexcept {
+    try {
+        return body();
+    } catch (const std::exception& error) {
+        GST_ELEMENT_ERROR(decoder, CORE, FAILED, ("Internal error in proresd3d11dec %s", name),
+                          ("%s", error.what()));
+    } catch (...) {
+        GST_ELEMENT_ERROR(decoder, CORE, FAILED, ("Internal error in proresd3d11dec %s", name),
+                          ("unknown C++ exception"));
+    }
+    SELF(decoder)->failed = TRUE;
+    return on_error;
+}
+
 static void gst_prores_d3d11_dec_class_init(GstProresD3D11DecClass* klass) {
     auto* object = G_OBJECT_CLASS(klass);
     object->set_property = set_property;
@@ -1441,17 +1476,41 @@ static void gst_prores_d3d11_dec_class_init(GstProresD3D11DecClass* klass) {
     gst_element_class_add_static_pad_template(element, &sink_template);
     gst_element_class_add_static_pad_template(element, &src_template);
     auto* decoder = GST_VIDEO_DECODER_CLASS(klass);
-    decoder->start = start;
-    decoder->stop = stop;
-    decoder->set_format = set_format;
-    decoder->handle_frame = handle_frame;
-    decoder->decide_allocation = decide_allocation;
-    decoder->flush = flush;
-    decoder->finish = finish;
-    decoder->drain = finish;
-    decoder->sink_event = sink_event;
-    decoder->src_query = src_query;
-    decoder->sink_query = sink_query;
+    // C++例外がGStreamer（C）へ抜けるとstd::terminateでプロセスごと落ちるため、
+    // 各vfuncの境界で捕まえて要素のエラーに変える。
+    decoder->start = [](GstVideoDecoder* d) {
+        return guard_vfunc(d, "start", FALSE, [&] { return start(d); });
+    };
+    decoder->stop = [](GstVideoDecoder* d) {
+        return guard_vfunc(d, "stop", FALSE, [&] { return stop(d); });
+    };
+    decoder->set_format = [](GstVideoDecoder* d, GstVideoCodecState* state) {
+        return guard_vfunc(d, "set_format", FALSE, [&] { return set_format(d, state); });
+    };
+    decoder->handle_frame = [](GstVideoDecoder* d, GstVideoCodecFrame* frame) {
+        return guard_vfunc(d, "handle_frame", GST_FLOW_ERROR,
+                           [&] { return handle_frame(d, frame); });
+    };
+    decoder->decide_allocation = [](GstVideoDecoder* d, GstQuery* query) {
+        return guard_vfunc(d, "decide_allocation", FALSE,
+                           [&] { return decide_allocation(d, query); });
+    };
+    decoder->flush = [](GstVideoDecoder* d) {
+        return guard_vfunc(d, "flush", FALSE, [&] { return flush(d); });
+    };
+    decoder->finish = [](GstVideoDecoder* d) {
+        return guard_vfunc(d, "finish", GST_FLOW_ERROR, [&] { return finish(d); });
+    };
+    decoder->drain = decoder->finish;
+    decoder->sink_event = [](GstVideoDecoder* d, GstEvent* event) {
+        return guard_vfunc(d, "sink_event", FALSE, [&] { return sink_event(d, event); });
+    };
+    decoder->src_query = [](GstVideoDecoder* d, GstQuery* query) {
+        return guard_vfunc(d, "src_query", FALSE, [&] { return src_query(d, query); });
+    };
+    decoder->sink_query = [](GstVideoDecoder* d, GstQuery* query) {
+        return guard_vfunc(d, "sink_query", FALSE, [&] { return sink_query(d, query); });
+    };
 }
 
 static void gst_prores_d3d11_dec_init(GstProresD3D11Dec* self) {
