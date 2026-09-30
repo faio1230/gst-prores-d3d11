@@ -1532,5 +1532,5 @@ static gboolean plugin_init(GstPlugin* plugin) {
 
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, proresd3d11,
     "Native D3D11 ProRes 422/444 10/12-bit and alpha decoder with RGB converter",
-    plugin_init, "0.2.0", "LGPL",
+    plugin_init, "0.2.1", "LGPL",
     "prores-gpu-lab", "https://example.invalid/prores-gpu-lab")
