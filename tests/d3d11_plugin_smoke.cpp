@@ -277,7 +277,7 @@ static void check_downloaded_sample(GstSample* sample) {
 }
 
 static void injected_error(GstSample* compressed, const char* test) {
-    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec max-errors=0 ! fakesink");
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
     auto* caps = gst_caps_copy(gst_sample_get_caps(compressed));
     gst_app_src_set_caps(GST_APP_SRC(source), caps);
@@ -363,7 +363,7 @@ static void injected_error(GstSample* compressed, const char* test) {
 
 static void delayed_entropy_error(GstSample* compressed) {
     // EOSを送らず4枚目のring再利用で、1枚目のGPUエラーが伝播することを確認する。
-    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec max-errors=0 ! fakesink");
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
     gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
     pipeline.state(GST_STATE_PLAYING);
@@ -391,8 +391,114 @@ static void delayed_entropy_error(GstSample* compressed) {
                           "GPU entropy decoder rejected job 0 frame=0");
 }
 
+// 既定のmax-errors（-1）で、破損を警告に留めてEOSまで復号を続けることを確認する。
+static void expect_recovery(Pipeline& pipeline, guint expected_frames, const char* expected_warning) {
+    guint frames = 0;
+    while (auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline.sink),
+                                                       15 * GST_SECOND)) {
+        ++frames;
+        gst_sample_unref(sample);
+    }
+    require(gst_app_sink_is_eos(GST_APP_SINK(pipeline.sink)), "recovery pipeline did not reach EOS");
+    bool warned = false;
+    // pop_filteredは対象外のメッセージを捨てるため、ERRORとWARNINGを同じ呼び出しで読む。
+    while (auto* message = gst_bus_pop_filtered(pipeline.bus,
+               static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING))) {
+        GError* warning = nullptr;
+        gchar* debug = nullptr;
+        if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+            gst_message_parse_error(message, &warning, &debug);
+            const std::string text = std::string(warning ? warning->message : "unknown error") +
+                " : " + (debug ? debug : "");
+            g_clear_error(&warning);
+            g_free(debug);
+            gst_message_unref(message);
+            throw std::runtime_error("unexpected error during recovery: " + text);
+        }
+        gst_message_parse_warning(message, &warning, &debug);
+        if (warning && warning->domain == GST_STREAM_ERROR &&
+            warning->code == GST_STREAM_ERROR_DECODE && debug &&
+            std::strstr(debug, expected_warning))
+            warned = true;
+        g_clear_error(&warning);
+        g_free(debug);
+        gst_message_unref(message);
+    }
+    if (frames != expected_frames)
+        std::cerr << "recovery_frames=" << frames << " expected=" << expected_frames << '\n';
+    require(warned, "expected decode warning missing");
+    require(frames == expected_frames, "recovery frame count mismatch");
+}
+
+static void corrupt_frame_recovery(GstSample* compressed) {
+    // 遅れて判明するGPU拒否：破損フレームも出力済みで、後続4枚も復号される。
+    {
+        Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! "
+                          "appsink name=sink sync=false");
+        auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+        gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+        pipeline.state(GST_STATE_PLAYING);
+        for (guint i = 0; i < 5; ++i) {
+            auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+            GST_BUFFER_PTS(input) = i * GST_SECOND / 60;
+            if (i == 0) {
+                GstMapInfo mapped{};
+                require(gst_buffer_map(input, &mapped, GST_MAP_READ), "cannot map recovery mutation");
+                prores::Frame parsed;
+                std::string parse_error;
+                const bool valid = prores::parse_frame(mapped.data, mapped.size, 0, 0,
+                                                        parsed, parse_error);
+                gst_buffer_unmap(input, &mapped);
+                require(valid && !parsed.slices.empty(), "recovery mutation fixture invalid");
+                const guint8 oversized_dc[] = {0x00, 0x1f, 0xff, 0xf0};
+                require(gst_buffer_fill(input, parsed.slices[0].planes[0].offset,
+                                        oversized_dc, sizeof(oversized_dc)) == sizeof(oversized_dc),
+                        "cannot write recovery entropy mutation");
+            }
+            gst_app_src_push_buffer(GST_APP_SRC(source), input);
+        }
+        gst_app_src_end_of_stream(GST_APP_SRC(source));
+        gst_object_unref(source);
+        expect_recovery(pipeline, 5, "GPU entropy decoder rejected job 0 frame=0");
+    }
+    // CPUで判明する破損：該当フレームだけ捨て、前後の4枚を出力する。
+    {
+        Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! "
+                          "appsink name=sink sync=false");
+        auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+        gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+        pipeline.state(GST_STATE_PLAYING);
+        for (guint i = 0; i < 5; ++i) {
+            auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+            GST_BUFFER_PTS(input) = i * GST_SECOND / 60;
+            if (i == 2) {
+                const guint8 byte = 0;
+                gst_buffer_fill(input, 4, &byte, 1);
+            }
+            gst_app_src_push_buffer(GST_APP_SRC(source), input);
+        }
+        gst_app_src_end_of_stream(GST_APP_SRC(source));
+        gst_object_unref(source);
+        expect_recovery(pipeline, 4, "frame size/signature mismatch");
+    }
+    // 最初のフレームから非対応の形式なら、既定設定でも停止する。
+    {
+        Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+        auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+        gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+        auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+        const guint8 invalid_alpha = 3;
+        gst_buffer_fill(input, 25, &invalid_alpha, 1);
+        pipeline.state(GST_STATE_PLAYING);
+        gst_app_src_push_buffer(GST_APP_SRC(source), input);
+        gst_app_src_end_of_stream(GST_APP_SRC(source));
+        gst_object_unref(source);
+        pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT);
+    }
+}
+
 static void alpha_entropy_error(GstSample* compressed) {
-    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec max-errors=0 ! fakesink");
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
     gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
     auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
@@ -418,7 +524,7 @@ static void alpha_entropy_error(GstSample* compressed) {
     pipeline.state(GST_STATE_NULL);
 
     // EOSなしで3スロットを使い切り、4枚目の投入時に初回alpha異常を伝播する。
-    Pipeline delayed("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+    Pipeline delayed("appsrc name=source format=time ! proresd3d11dec max-errors=0 ! fakesink");
     auto* delayed_source = gst_bin_get_by_name(GST_BIN(delayed.pipe), "source");
     gst_app_src_set_caps(GST_APP_SRC(delayed_source), gst_sample_get_caps(compressed));
     delayed.state(GST_STATE_PLAYING);
@@ -681,7 +787,8 @@ static void idct_refresh_exception_seek(const char* path) {
 static void dynamic_rejected_input(GstSample* compressed, bool unsupported_caps) {
     GstSample* retained = nullptr;
     {
-        Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! "
+        // 途中の破損フレームは既定では捨てて続行するため、停止の確認はmax-errors=0で行う。
+        Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec max-errors=0 ! "
                           "appsink name=sink sync=false max-buffers=4");
         auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
         require(source != nullptr, "dynamic-rejection source missing");
@@ -718,7 +825,7 @@ static void dynamic_rejected_input(GstSample* compressed, bool unsupported_caps)
         if (unsupported_caps)
             pipeline.expect_error();
         else
-            pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT);
+            pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE);
         auto* unexpected = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline.sink),
                                                         200 * GST_MSECOND);
         if (unexpected) gst_sample_unref(unexpected);
@@ -926,14 +1033,14 @@ static void reject_corrupt_second_field(GstSample* compressed) {
     const guint8 invalid_header = 0;
     require(gst_buffer_fill(input, second, &invalid_header, 1) == 1,
             "cannot corrupt second picture header");
-    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec ! fakesink");
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec max-errors=0 ! fakesink");
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
     gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
     pipeline.state(GST_STATE_PLAYING);
     gst_app_src_push_buffer(GST_APP_SRC(source), input);
     gst_app_src_end_of_stream(GST_APP_SRC(source));
     gst_object_unref(source);
-    pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT);
+    pipeline.expect_error(GST_STREAM_ERROR, GST_STREAM_ERROR_DECODE);
 }
 
 int main(int argc, char** argv) try {
@@ -1037,6 +1144,7 @@ int main(int argc, char** argv) try {
                              "oversized-first-dc", "ac-run-boundary"})
         injected_error(compressed, test);
     delayed_entropy_error(compressed);
+    corrupt_frame_recovery(compressed);
     gst_sample_unref(compressed);
 
     if (argc >= 4) {
@@ -1088,7 +1196,7 @@ int main(int argc, char** argv) try {
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
                  "\"software_adapter_decoder_rejected\":true,"
-                 "\"software_adapter_rgb_rejected\":true,\"error_cases\":"
+                 "\"software_adapter_rgb_rejected\":true,\"recovery_cases\":3,\"error_cases\":"
               << (argc == 8 ? 17 : argc >= 4 ? 16 : 15) << ",\"interlaced_cases\":"
               << (argc == 8 ? 4 : 0) << ","
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";

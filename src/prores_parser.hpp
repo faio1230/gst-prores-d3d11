@@ -56,10 +56,11 @@ struct Frame {
 // Bit depth comes from the container
 // FourCC; chroma sampling and alpha depth come from the frame header. The
 // Callers must opt in to alpha so legacy alpha-free checks remain explicit.
+// unsupported（任意）は、壊れたデータではなく非対応の形式・寸法で拒否したときにtrueになる。
 bool parse_frame(const std::uint8_t* data, std::size_t size,
                  std::uint16_t expected_width, std::uint16_t expected_height,
                  Frame& output, std::string& error, std::uint8_t bit_depth = 10,
-                 bool allow_alpha = false);
+                 bool allow_alpha = false, bool* unsupported = nullptr);
 
 struct CoefficientJob {
     std::uint32_t data_offset = 0;

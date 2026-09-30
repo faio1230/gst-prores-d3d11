@@ -534,6 +534,19 @@ public:
         while (!pending_errors_.empty()) retire_one(nullptr);
     }
 
+    struct RejectedFrame {
+        std::size_t job;
+        std::uint64_t frame_sequence;
+        GstClockTime pts;
+    };
+
+    // 回収済みのGPUエントロピー拒否を取り出す。該当フレームはすでに下流へ出力済み。
+    std::vector<RejectedFrame> take_rejected() {
+        std::vector<RejectedFrame> rejected;
+        rejected.swap(rejected_);
+        return rejected;
+    }
+
     void discard_errors() {
         // flushing seekでは旧segmentの検査結果を新segmentへ持ち込まない。
         // GPU命令は同じimmediate context上で順序付きなので再利用先のcopyより先に完了する。
@@ -542,6 +555,7 @@ public:
             context_->Flush();
         }
         pending_errors_.clear();
+        rejected_.clear();
         next_staging_index_ = 0;
     }
 
@@ -607,11 +621,9 @@ private:
             std::this_thread::yield();
         }
         pending_errors_.pop_front();
+        // ProResはフレーム内で完結するため、拒否は記録だけして後続フレームの復号を続ける。
         if (failed_job != pending.job_count)
-            throw std::runtime_error("GPU entropy decoder rejected job " +
-                std::to_string(failed_job) + " frame=" +
-                std::to_string(pending.frame_sequence) + " pts_ns=" +
-                std::to_string(pending.pts));
+            rejected_.push_back({failed_job, pending.frame_sequence, pending.pts});
     }
 
     template <typename T>
@@ -888,6 +900,7 @@ private:
     std::unique_ptr<GpuTimingQueries> timing_;
     Cache cache_;
     std::deque<PendingError> pending_errors_;
+    std::vector<RejectedFrame> rejected_;
     std::size_t next_staging_index_ = 0;
     std::uint64_t frame_sequence_ = 0;
     std::vector<prores::CoefficientJob> coefficient_jobs_;
@@ -914,6 +927,7 @@ typedef struct _GstProresD3D11Dec {
     gint64 adapter_luid;
     gboolean negotiated;
     gboolean failed;
+    gboolean frame_decoded;
     gint flushing;
     gint color_primaries;
     gint color_trc;
@@ -947,6 +961,37 @@ static void clear_format(GstProresD3D11Dec* self) {
     if (self->input) gst_video_codec_state_unref(self->input);
     self->input = nullptr;
     self->negotiated = FALSE;
+    self->frame_decoded = FALSE;
+}
+
+// 破損をGstVideoDecoderのmax-errorsに従って報告する。上限を超えればERRORで停止する。
+// 既定（max-errors=-1）では続行し、GST_VIDEO_DECODER_ERRORはバスへ何も出さないため、
+// アプリが検知できるようWARNINGメッセージを別に出す。
+static GstFlowReturn report_corrupt_frame(GstProresD3D11Dec* self, const char* text,
+                                          const std::string& detail) {
+    GstFlowReturn flow = GST_FLOW_OK;
+    GST_VIDEO_DECODER_ERROR(self, 1, STREAM, DECODE, ("%s", text), ("%s", detail.c_str()), flow);
+    if (flow == GST_FLOW_OK)
+        GST_ELEMENT_WARNING(self, STREAM, DECODE, ("%s", text), ("%s", detail.c_str()));
+    else
+        self->failed = TRUE;
+    return flow;
+}
+
+// 遅れて判明したGPUエントロピー拒否を報告する。該当フレームはすでに下流へ出力済み。
+static GstFlowReturn report_rejected_frames(GstProresD3D11Dec* self) {
+    GstFlowReturn flow = GST_FLOW_OK;
+    if (!self->backend) return flow;
+    for (const auto& rejected : self->backend->take_rejected()) {
+        gchar* detail = g_strdup_printf("GPU entropy decoder rejected job %" G_GSIZE_FORMAT
+            " frame=%" G_GUINT64_FORMAT " pts_ns=%" G_GUINT64_FORMAT, rejected.job,
+            rejected.frame_sequence, static_cast<guint64>(rejected.pts));
+        flow = report_corrupt_frame(self,
+            "Corrupt ProRes frame was output before its GPU entropy check completed", detail);
+        g_free(detail);
+        if (flow != GST_FLOW_OK) break;
+    }
+    return flow;
 }
 
 static gboolean start(GstVideoDecoder* decoder) {
@@ -1154,14 +1199,22 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
                                                    "variant");
     const std::uint8_t bit_depth = g_strcmp0(variant, "4444") == 0 ||
         g_strcmp0(variant, "4444xq") == 0 ? 12 : 10;
+    bool unsupported = false;
     if (!prores::parse_frame(input.data, input.size, expected_width, expected_height,
-                             parsed, error, bit_depth, true)) {
+                             parsed, error, bit_depth, true, &unsupported)) {
         gst_buffer_unmap(frame->input_buffer, &input);
-        self->failed = TRUE;
-        GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("Malformed or unsupported ProRes frame"),
-                          ("%s", error.c_str()));
+        if (unsupported && !self->frame_decoded) {
+            // 形式が最初から非対応なら、警告を出し続けずに停止する。
+            self->failed = TRUE;
+            GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("Unsupported ProRes frame"),
+                              ("%s", error.c_str()));
+            gst_video_decoder_drop_frame(decoder, frame);
+            return GST_FLOW_ERROR;
+        }
+        // 壊れたフレームだけを捨てて続ける。停止するかはmax-errorsに従う。
+        const auto flow = report_corrupt_frame(self, "Corrupt ProRes frame dropped", error);
         gst_video_decoder_drop_frame(decoder, frame);
-        return GST_FLOW_ERROR;
+        return flow;
     }
     const auto parse_ms = phase_ms();
     if (!negotiate_output(self, parsed)) {
@@ -1218,7 +1271,9 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
     const auto backend_ms = phase_ms();
     const auto pts = GST_BUFFER_PTS(frame->input_buffer);
     GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT(frame);
+    self->frame_decoded = TRUE;
     flow = gst_video_decoder_finish_frame(decoder, frame);
+    if (flow == GST_FLOW_OK) flow = report_rejected_frames(self);
     const auto finish_ms = phase_ms();
     if (cpu_timing)
         GST_INFO_OBJECT(self, "CPU_STAGE seq=%" G_GUINT64_FORMAT
@@ -1263,7 +1318,7 @@ static GstFlowReturn finish(GstVideoDecoder* decoder) {
     if (self->failed || !self->backend) return GST_FLOW_ERROR;
     try {
         self->backend->drain_errors();
-        return GST_FLOW_OK;
+        return report_rejected_frames(self);
     } catch (const std::exception& error) {
         self->failed = TRUE;
         auto* native = self->device ? gst_d3d11_device_get_device_handle(self->device) : nullptr;
@@ -1418,5 +1473,5 @@ static gboolean plugin_init(GstPlugin* plugin) {
 
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, proresd3d11,
     "Native D3D11 ProRes 422/444 10/12-bit and alpha decoder with RGB converter",
-    plugin_init, "0.1.0", "LGPL",
+    plugin_init, "0.2.0", "LGPL",
     "prores-gpu-lab", "https://example.invalid/prores-gpu-lab")

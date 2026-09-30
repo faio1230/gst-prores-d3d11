@@ -219,11 +219,16 @@ bool decode_plane(const std::uint8_t* data, std::size_t size,
 bool parse_frame(const std::uint8_t* data, std::size_t size,
                  std::uint16_t expected_width, std::uint16_t expected_height,
                  Frame& output, std::string& error, std::uint8_t bit_depth,
-                 bool allow_alpha) {
+                 bool allow_alpha, bool* unsupported) {
     output = {};
     error.clear();
+    if (unsupported) *unsupported = false;
+    const auto reject_unsupported = [&](const char* message) {
+        if (unsupported) *unsupported = true;
+        return fail(error, message);
+    };
     if (bit_depth != 10 && bit_depth != 12)
-        return fail(error, "unsupported ProRes bit depth");
+        return reject_unsupported("unsupported ProRes bit depth");
     output.bit_depth = bit_depth;
     if (!data || size < 28 || size > 128u * 1024u * 1024u)
         return fail(error, "frame size is outside the supported range");
@@ -235,23 +240,23 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     const auto header_size = read_be16(header);
     if (header_size < 20 || header_size > size - 8)
         return fail(error, "invalid frame header size");
-    if (read_be16(header + 2) > 1) return fail(error, "unsupported frame header version");
+    if (read_be16(header + 2) > 1) return reject_unsupported("unsupported frame header version");
     output.width = read_be16(header + 8);
     output.height = read_be16(header + 10);
     if (!output.width || !output.height ||
         (expected_width && output.width != expected_width) ||
         (expected_height && output.height != expected_height))
-        return fail(error, "frame dimensions do not match caps");
+        return reject_unsupported("frame dimensions do not match caps");
     if ((header[12] & 0xc0) != 0x80 && (header[12] & 0xc0) != 0xc0)
-        return fail(error, "unsupported ProRes chroma format");
+        return reject_unsupported("unsupported ProRes chroma format");
     output.chroma_shift = (header[12] & 0xc0) == 0xc0 ? 0 : 1;
     if (output.chroma_shift && (output.width & 1))
-        return fail(error, "odd 4:2:2 frame width is unsupported");
+        return reject_unsupported("odd 4:2:2 frame width is unsupported");
     output.frame_type = (header[12] >> 2) & 3;
     output.alpha_info = header[17] & 0x0f;
-    if (output.alpha_info > 2) return fail(error, "invalid ProRes alpha depth");
+    if (output.alpha_info > 2) return reject_unsupported("invalid ProRes alpha depth");
     if (output.alpha_info && !allow_alpha)
-        return fail(error, "alpha ProRes GPU output is not enabled");
+        return reject_unsupported("alpha ProRes GPU output is not enabled");
     output.color_primaries = header[14];
     output.transfer_characteristic = header[15];
     output.matrix_coefficients = header[16];
@@ -292,7 +297,7 @@ bool parse_frame(const std::uint8_t* data, std::size_t size,
     const unsigned log2_slice_width = picture[7] >> 4;
     const unsigned log2_slice_height = picture[7] & 15;
     if (log2_slice_width > 3 || log2_slice_height)
-        return fail(error, "unsupported slice dimensions");
+        return reject_unsupported("unsupported slice dimensions");
     const std::uint16_t nominal_slice_width = static_cast<std::uint16_t>(1u << log2_slice_width);
     const auto remainder = output.mb_width & (nominal_slice_width - 1);
     const auto slice_count = static_cast<std::size_t>(output.mb_height) *

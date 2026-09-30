@@ -70,7 +70,7 @@ On the tested streams, every decoded YUV pixel differed from the pinned FFmpeg C
 - AMD and Intel GPUs, actual device loss/recovery, and long-running operation on other systems have not been verified.
 - HDR tags are propagated, but HDR-to-RGB numerical accuracy has not been verified. The native RGB element is limited to progressive, limited BT.709.
 - Odd-width 4:2:2 frames are rejected. Interlaced RGB needs a separate deinterlacer; `proresd3d11rgb` does not deinterlace.
-- Corrupt bitstream errors may be reported up to three frames late by the asynchronous GPU error check; an affected image may reach downstream first.
+- Corrupt frames do not stop the pipeline by default. A frame found corrupt on the CPU is dropped. A frame found corrupt by the asynchronous GPU check is reported up to three frames late, after its image has already gone downstream. Both are counted against `GstVideoDecoder`'s `max-errors` (default -1: never stop) and posted as a `STREAM/DECODE` warning. Set `max-errors` to 0 or more to stop instead. A stream that is unsupported from its first frame still stops with `STREAM/FORMAT`.
 - The measured decoder QoS result does not establish OS/DWM presentation or display color accuracy. Camera-origin alpha and interlaced footage with clear redistribution rights remains untested.
 
 ## License and trademark
