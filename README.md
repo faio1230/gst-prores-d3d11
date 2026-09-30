@@ -58,7 +58,7 @@ Each GitHub release has a zip named after its tag (for example `gst-prores-d3d11
 - **Interlaced streams:** these are output as interleaved frames with `field-order` set. They are not deinterlaced. Add a deinterlacer (such as `d3d11deinterlace`) if you need progressive frames.
 - **Tested GPUs:** only an NVIDIA RTX 3070 has been tested. AMD and Intel GPUs, and hybrid-GPU selection with `adapter-luid`, are not verified yet.
 
-`proresd3d11dec ! d3d11colorconvert ! "video/x-raw(memory:D3D11Memory),format=BGRA"` has been checked for every output format. Not yet confirmed: whether semi-transparent alpha comes through that BGRA path unchanged. Alpha has been verified through `d3d11convert` to `RGBA64_LE`.
+`proresd3d11dec ! d3d11colorconvert ! "video/x-raw(memory:D3D11Memory),format=BGRA"` has been checked for every output format. Semi-transparent alpha also comes through that BGRA path. It is straight (not premultiplied) alpha, and it was checked with 4444 and 4444 XQ streams (8- and 16-bit alpha, 3840×2160 and 2560×1536). BGRA A differed from the `avdec_prores ! videoconvert` CPU path by at most 1, and RGB by at most 1 at p99.
 
 
 ## Accuracy and performance

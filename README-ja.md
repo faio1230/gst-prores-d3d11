@@ -58,7 +58,7 @@ GitHub Releasesには、タグ名を含むzip（例：`gst-prores-d3d11-v0.1.0-w
 - **インターレース：** `field-order`を付けたinterleavedのフレームとして出力し、デインターレースはしません。プログレッシブにしたい場合は`d3d11deinterlace`などを入れてください。
 - **検証済みのGPU：** 確認したのはNVIDIA RTX 3070だけです。AMDとIntelのGPU、ハイブリッドGPU環境での`adapter-luid`による選択は未検証です。
 
-`proresd3d11dec ! d3d11colorconvert ! "video/x-raw(memory:D3D11Memory),format=BGRA"`は全出力形式で確認済みです。ただし、半透明のアルファがこのBGRA経路でそのまま届くかは未確認です（`d3d11convert`から`RGBA64_LE`への経路では確認済み）。
+`proresd3d11dec ! d3d11colorconvert ! "video/x-raw(memory:D3D11Memory),format=BGRA"`は全出力形式で確認済みです。半透明のアルファも、このBGRA経路のAチャンネルにそのまま届きます。アルファはRGBに掛け合わせないstraight alphaです。4444と4444 XQ（アルファ8bit／16bit、3840×2160と2560×1536）で確認しました。`avdec_prores ! videoconvert`のCPU経路との差は、BGRAのAで最大1、RGBでp99が1でした。
 
 
 ## 精度と性能
