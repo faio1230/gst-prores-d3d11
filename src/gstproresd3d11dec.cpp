@@ -1215,7 +1215,11 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
         frame_duration = gst_util_uint64_scale(GST_SECOND,
             GST_VIDEO_INFO_FPS_D(&self->input->info), GST_VIDEO_INFO_FPS_N(&self->input->info));
     if (!GST_CLOCK_TIME_IS_VALID(frame_duration)) frame_duration = 20 * GST_MSECOND;
-    if (gst_video_decoder_get_max_decode_time(decoder, frame) <
+    // get_max_decode_time()はGstVideoDecoderの"qos"プロパティを見ないため、
+    // qos=falseのときは事前破棄もしないよう、ここで明示的に確認する。
+    gboolean qos_enabled = TRUE;
+    g_object_get(decoder, "qos", &qos_enabled, nullptr);
+    if (qos_enabled && gst_video_decoder_get_max_decode_time(decoder, frame) <
         -static_cast<GstClockTimeDiff>(frame_duration)) {
         GST_DEBUG_OBJECT(self, "QoS: skipping decode of late frame pts=%" GST_TIME_FORMAT,
                          GST_TIME_ARGS(frame->pts));
@@ -1549,5 +1553,5 @@ static gboolean plugin_init(GstPlugin* plugin) {
 
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, proresd3d11,
     "Native D3D11 ProRes 422/444 10/12-bit and alpha decoder with RGB converter",
-    plugin_init, "0.2.2", "LGPL",
+    plugin_init, "0.2.3", "LGPL",
     "prores-gpu-lab", "https://example.invalid/prores-gpu-lab")

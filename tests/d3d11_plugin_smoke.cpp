@@ -500,9 +500,14 @@ static void corrupt_frame_recovery(GstSample* compressed) {
 // QoSで締切を過ぎたフレームは、GPUへ投入する前（parserより前）に捨てることを確認する。
 // 遅れたフレームを壊しておき、復号されれば出るはずの破損WARNINGが出ないことで判定する。
 // slightly_late=trueでは、締切の超過が1フレーム未満のフレームを復号する（捨てない）ことを確認する。
-static void qos_skip_before_decode(GstSample* compressed, bool slightly_late) {
-    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec name=decoder ! "
-                      "appsink name=sink sync=false");
+// qos_disabled=trueでは、デコーダーのqos=falseで大きく遅れたフレームも事前に捨てないことを確認する。
+static void qos_skip_before_decode(GstSample* compressed, bool slightly_late,
+                                   bool qos_disabled = false) {
+    Pipeline pipeline(qos_disabled
+        ? "appsrc name=source format=time ! proresd3d11dec name=decoder qos=false ! "
+          "appsink name=sink sync=false"
+        : "appsrc name=source format=time ! proresd3d11dec name=decoder ! "
+          "appsink name=sink sync=false");
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
     gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
     pipeline.state(GST_STATE_PLAYING);
@@ -552,7 +557,9 @@ static void qos_skip_before_decode(GstSample* compressed, bool slightly_late) {
         require(!error, "unexpected error during QoS skip");
         parsed_corrupt = true;
     }
-    if (slightly_late)
+    if (qos_disabled)
+        require(parsed_corrupt, "late frame was skipped before decode although qos=false");
+    else if (slightly_late)
         require(parsed_corrupt, "frame late by less than one frame was skipped before decode");
     else
         require(!parsed_corrupt, "late frame was parsed instead of skipped before decode");
@@ -1210,6 +1217,7 @@ int main(int argc, char** argv) try {
     corrupt_frame_recovery(compressed);
     qos_skip_before_decode(compressed, false);
     qos_skip_before_decode(compressed, true);
+    qos_skip_before_decode(compressed, false, true);
     gst_sample_unref(compressed);
 
     if (argc >= 4) {

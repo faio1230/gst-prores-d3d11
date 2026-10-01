@@ -50,7 +50,7 @@ gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "vide
 
 Once the element has a device, reading `adapter-luid` returns that device's LUID, so the application can check that the GPUs match.
 
-When decoding falls behind real time, frames already past their QoS deadline are skipped before any GPU work. GPU load then drops, so playback degrades gradually instead of collapsing.
+When decoding falls behind real time, frames at least one frame duration past their QoS deadline are skipped before any GPU work. GPU load then drops, so playback degrades gradually instead of collapsing. Setting the decoder's standard `qos` property to `false` disables this, as it does GstVideoDecoder's own QoS dropping.
 
 See [build and execution](docs/ビルドと実行.md), [design](docs/設計.md), and [validation](docs/検証.md).
 
