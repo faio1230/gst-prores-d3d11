@@ -2,6 +2,7 @@
 import argparse
 from collections import Counter
 import csv
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -180,6 +181,8 @@ def main():
         probe = json.loads(subprocess.check_output([
             str(SDK / 'ffprobe.exe'), '-v', 'error', '-select_streams', 'v:0',
             '-show_streams', '-of', 'json', str(source)]))['streams'][0]
+        expected_seconds = args.loops * int(probe['nb_frames']) / float(Fraction(probe['r_frame_rate']))
+        trial_timeout_seconds = max(120, math.ceil(expected_seconds * 2 + 60))
         for repeat in range(args.repeats):
             stem = args.out / f'{source.stem}-{repeat}'
             monitor_path = stem.with_suffix('.gpu.csv')
@@ -227,7 +230,7 @@ def main():
                     with stem.with_suffix('.stderr.log').open('w', encoding='utf-8') as errors:
                         process = subprocess.run(command, env=env, text=True,
                                                  stdout=subprocess.PIPE, stderr=errors,
-                                                 timeout=120, check=False)
+                                                 timeout=trial_timeout_seconds, check=False)
                 finally:
                     if monitor is not None:
                         monitor.terminate()
