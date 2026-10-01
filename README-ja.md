@@ -44,7 +44,13 @@ gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! prore
 gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "video/x-raw(memory:D3D11Memory),format=AYUV64" ! d3d11videosink
 ```
 
-`proresd3d11dec`のDirect3D 11デバイスは、`adapter`（DXGIアダプター番号、`-1`で既定）または`adapter-luid`（DXGIアダプターのLUID。0以外を指定すると`adapter`より優先）で選びます。内蔵GPUと外付けGPUが混在する環境では、`adapter-luid`でパイプラインの他の要素と同じGPUを指定してください。デバイス作成後に`adapter-luid`を読むと、実際に使っているデバイスのLUIDが返ります。
+`proresd3d11dec`のDirect3D 11デバイスは、`adapter`（DXGIアダプター番号、`-1`で既定）または`adapter-luid`（DXGIアダプターのLUID。0以外を指定すると`adapter`より優先）で選びます。内蔵GPUと外付けGPUが混在する環境では、パイプラインの**すべての**D3D11要素を同じGPUにそろえてください。そろっていないと、GPU間でD3D11メモリのコピーが発生します。`d3d11colorconvert`などの下流の要素は、通常デコーダーより先にデバイスを作ります。デコーダーにだけ`adapter-luid`を指定すると、下流の要素は既定のアダプター（内蔵GPUのことがあります）を使ったままになり、デコーダーはそのデバイスを受け入れずに、指定されたGPUで別のデバイスを作ります。次のどちらかで、すべての要素をそろえてください。
+- 各D3D11要素に同じ`adapter`番号を指定する（例：`proresd3d11dec adapter=1 ! d3d11colorconvert adapter=1`）
+- アプリケーションが`GstContext`で1つのデバイスを共有する
+
+デバイス作成後に`adapter-luid`を読むと、実際に使っているデバイスのLUIDが返るので、GPUがそろっているかの確認に使えます。
+
+復号が実時間に追いつかないときは、QoSの締切を過ぎたフレームをGPUで処理する前に飛ばします。GPUの負荷が下がるので、再生は一気に崩れず、少しずつ劣化します。
 
 詳しくは[ビルドと実行](docs/ビルドと実行.md)、[設計](docs/設計.md)、[検証](docs/検証.md)を参照してください。
 

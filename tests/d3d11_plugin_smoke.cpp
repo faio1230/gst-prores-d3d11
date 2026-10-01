@@ -497,6 +497,58 @@ static void corrupt_frame_recovery(GstSample* compressed) {
     }
 }
 
+// QoSで締切を過ぎたフレームは、GPUへ投入する前（parserより前）に捨てることを確認する。
+// 遅れたフレームを壊しておき、復号されれば出るはずの破損WARNINGが出ないことで判定する。
+static void qos_skip_before_decode(GstSample* compressed) {
+    Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec name=decoder ! "
+                      "appsink name=sink sync=false");
+    auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
+    gst_app_src_set_caps(GST_APP_SRC(source), gst_sample_get_caps(compressed));
+    pipeline.state(GST_STATE_PLAYING);
+    const auto push = [&](GstClockTime pts, bool corrupt) {
+        auto* input = gst_buffer_copy_deep(gst_sample_get_buffer(compressed));
+        GST_BUFFER_PTS(input) = pts;
+        GST_BUFFER_DURATION(input) = GST_SECOND / 60;
+        if (corrupt) {
+            const guint8 byte = 0;
+            gst_buffer_fill(input, 4, &byte, 1);
+        }
+        require(gst_app_src_push_buffer(GST_APP_SRC(source), input) == GST_FLOW_OK,
+                "QoS input push failed");
+    };
+    push(0, false);
+    auto* first = pipeline.pull();
+    require(first != nullptr, "QoS first frame missing");
+    gst_sample_unref(first);
+    // 下流から「10秒遅れている」と通知し、earliest_timeを約20秒先へ進める。
+    auto* decoder = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "decoder");
+    auto* src = gst_element_get_static_pad(decoder, "src");
+    gst_pad_send_event(src, gst_event_new_qos(GST_QOS_TYPE_UNDERFLOW, 0.5,
+                                              10 * GST_SECOND, 0));
+    gst_object_unref(src);
+    gst_object_unref(decoder);
+    for (guint i = 1; i <= 3; ++i) push(i * GST_SECOND / 60, true);
+    push(30 * GST_SECOND, false);
+    gst_app_src_end_of_stream(GST_APP_SRC(source));
+    gst_object_unref(source);
+    guint frames = 0;
+    while (auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline.sink),
+                                                       15 * GST_SECOND)) {
+        ++frames;
+        gst_sample_unref(sample);
+    }
+    require(gst_app_sink_is_eos(GST_APP_SINK(pipeline.sink)), "QoS pipeline did not reach EOS");
+    while (auto* message = gst_bus_pop_filtered(pipeline.bus,
+               static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING))) {
+        const bool error = GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR;
+        gst_message_unref(message);
+        require(!error, "unexpected error during QoS skip");
+        require(false, "late frame was parsed instead of skipped before decode");
+    }
+    if (frames != 1) std::cerr << "qos_frames=" << frames << '\n';
+    require(frames == 1, "QoS skip frame count mismatch");
+}
+
 static void alpha_entropy_error(GstSample* compressed) {
     Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec max-errors=0 ! fakesink");
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
@@ -1145,6 +1197,7 @@ int main(int argc, char** argv) try {
         injected_error(compressed, test);
     delayed_entropy_error(compressed);
     corrupt_frame_recovery(compressed);
+    qos_skip_before_decode(compressed);
     gst_sample_unref(compressed);
 
     if (argc >= 4) {
@@ -1196,7 +1249,7 @@ int main(int argc, char** argv) try {
                  "\"feature_level\":" << capabilities.feature_level << ","
                  "\"r16_format_support\":" << capabilities.r16_support << ","
                  "\"software_adapter_decoder_rejected\":true,"
-                 "\"software_adapter_rgb_rejected\":true,\"recovery_cases\":3,\"error_cases\":"
+                 "\"software_adapter_rgb_rejected\":true,\"recovery_cases\":3,\"qos_skip_before_decode\":true,\"error_cases\":"
               << (argc == 8 ? 17 : argc >= 4 ? 16 : 15) << ",\"interlaced_cases\":"
               << (argc == 8 ? 4 : 0) << ","
                  "\"output\":\"I422_10LE D3D11Memory (three R16_UNORM UAV textures)\"}\n";

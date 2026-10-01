@@ -1205,6 +1205,15 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
         gst_video_decoder_drop_frame(decoder, frame);
         return GST_FLOW_FLUSHING;
     }
+    // QoSで既に締切を過ぎたフレームは、GPUへ投入する前に捨てる。復号後に捨てると
+    // 過負荷時もGPU仕事が減らず、全フレームが遅れ続けて出力がほぼ止まる。
+    // ProResはフレーム内で完結するため、飛ばしても後続の画像に影響しない。
+    if (gst_video_decoder_get_max_decode_time(decoder, frame) < 0) {
+        GST_DEBUG_OBJECT(self, "QoS: skipping decode of late frame pts=%" GST_TIME_FORMAT,
+                         GST_TIME_ARGS(frame->pts));
+        gst_video_decoder_drop_frame(decoder, frame);
+        return GST_FLOW_OK;
+    }
     GstMapInfo input{};
     if (!gst_buffer_map(frame->input_buffer, &input, GST_MAP_READ)) {
         gst_video_decoder_drop_frame(decoder, frame);
@@ -1532,5 +1541,5 @@ static gboolean plugin_init(GstPlugin* plugin) {
 
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, proresd3d11,
     "Native D3D11 ProRes 422/444 10/12-bit and alpha decoder with RGB converter",
-    plugin_init, "0.2.1", "LGPL",
+    plugin_init, "0.2.2", "LGPL",
     "prores-gpu-lab", "https://example.invalid/prores-gpu-lab")

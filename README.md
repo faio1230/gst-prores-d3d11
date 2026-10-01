@@ -44,7 +44,13 @@ gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! prore
 gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "video/x-raw(memory:D3D11Memory),format=AYUV64" ! d3d11videosink
 ```
 
-`proresd3d11dec` selects its Direct3D 11 device with `adapter` (DXGI adapter index, `-1` for the default) or `adapter-luid` (DXGI adapter LUID; a non-zero value takes precedence over `adapter`). On hybrid-GPU systems, set `adapter-luid` so the decoder uses the same GPU as the rest of the pipeline. Once the element has a device, reading `adapter-luid` returns that device's LUID.
+`proresd3d11dec` selects its Direct3D 11 device with `adapter` (DXGI adapter index, `-1` for the default) or `adapter-luid` (DXGI adapter LUID; a non-zero value takes precedence over `adapter`). On hybrid-GPU systems, **every** D3D11 element must use the same GPU. Otherwise D3D11 memory is copied between GPUs. Downstream elements such as `d3d11colorconvert` usually create their device before the decoder starts. If only the decoder gets `adapter-luid`, those elements stay on the default adapter, which may be the integrated GPU, and the decoder then refuses their device and creates its own on the requested GPU. Avoid this in one of two ways:
+- give each D3D11 element the same `adapter` index, for example `proresd3d11dec adapter=1 ! d3d11colorconvert adapter=1`
+- have the application share one device through a `GstContext`
+
+Once the element has a device, reading `adapter-luid` returns that device's LUID, so the application can check that the GPUs match.
+
+When decoding falls behind real time, frames already past their QoS deadline are skipped before any GPU work. GPU load then drops, so playback degrades gradually instead of collapsing.
 
 See [build and execution](docs/ビルドと実行.md), [design](docs/設計.md), and [validation](docs/検証.md).
 
