@@ -499,7 +499,8 @@ static void corrupt_frame_recovery(GstSample* compressed) {
 
 // QoSで締切を過ぎたフレームは、GPUへ投入する前（parserより前）に捨てることを確認する。
 // 遅れたフレームを壊しておき、復号されれば出るはずの破損WARNINGが出ないことで判定する。
-static void qos_skip_before_decode(GstSample* compressed) {
+// slightly_late=trueでは、締切の超過が1フレーム未満のフレームを復号する（捨てない）ことを確認する。
+static void qos_skip_before_decode(GstSample* compressed, bool slightly_late) {
     Pipeline pipeline("appsrc name=source format=time ! proresd3d11dec name=decoder ! "
                       "appsink name=sink sync=false");
     auto* source = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "source");
@@ -520,14 +521,19 @@ static void qos_skip_before_decode(GstSample* compressed) {
     auto* first = pipeline.pull();
     require(first != nullptr, "QoS first frame missing");
     gst_sample_unref(first);
-    // 下流から「10秒遅れている」と通知し、earliest_timeを約20秒先へ進める。
+    // 大きく遅れた場合：「10秒遅れている」と通知し、earliest_timeを約20秒先へ進める。
+    // 少し遅れた場合：「5ms遅れている」と通知し、earliest_timeを約27ms
+    // （2×5ms＋1フレーム）にする。PTS 20msのフレームは約7msだけ遅れる。
     auto* decoder = gst_bin_get_by_name(GST_BIN(pipeline.pipe), "decoder");
     auto* src = gst_element_get_static_pad(decoder, "src");
     gst_pad_send_event(src, gst_event_new_qos(GST_QOS_TYPE_UNDERFLOW, 0.5,
-                                              10 * GST_SECOND, 0));
+        slightly_late ? 5 * GST_MSECOND : 10 * GST_SECOND, 0));
     gst_object_unref(src);
     gst_object_unref(decoder);
-    for (guint i = 1; i <= 3; ++i) push(i * GST_SECOND / 60, true);
+    if (slightly_late)
+        push(20 * GST_MSECOND, true);
+    else
+        for (guint i = 1; i <= 3; ++i) push(i * GST_SECOND / 60, true);
     push(30 * GST_SECOND, false);
     gst_app_src_end_of_stream(GST_APP_SRC(source));
     gst_object_unref(source);
@@ -538,13 +544,18 @@ static void qos_skip_before_decode(GstSample* compressed) {
         gst_sample_unref(sample);
     }
     require(gst_app_sink_is_eos(GST_APP_SINK(pipeline.sink)), "QoS pipeline did not reach EOS");
+    bool parsed_corrupt = false;
     while (auto* message = gst_bus_pop_filtered(pipeline.bus,
                static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING))) {
         const bool error = GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR;
         gst_message_unref(message);
         require(!error, "unexpected error during QoS skip");
-        require(false, "late frame was parsed instead of skipped before decode");
+        parsed_corrupt = true;
     }
+    if (slightly_late)
+        require(parsed_corrupt, "frame late by less than one frame was skipped before decode");
+    else
+        require(!parsed_corrupt, "late frame was parsed instead of skipped before decode");
     if (frames != 1) std::cerr << "qos_frames=" << frames << '\n';
     require(frames == 1, "QoS skip frame count mismatch");
 }
@@ -1197,7 +1208,8 @@ int main(int argc, char** argv) try {
         injected_error(compressed, test);
     delayed_entropy_error(compressed);
     corrupt_frame_recovery(compressed);
-    qos_skip_before_decode(compressed);
+    qos_skip_before_decode(compressed, false);
+    qos_skip_before_decode(compressed, true);
     gst_sample_unref(compressed);
 
     if (argc >= 4) {

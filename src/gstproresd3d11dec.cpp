@@ -1205,10 +1205,18 @@ static GstFlowReturn handle_frame(GstVideoDecoder* decoder, GstVideoCodecFrame* 
         gst_video_decoder_drop_frame(decoder, frame);
         return GST_FLOW_FLUSHING;
     }
-    // QoSで既に締切を過ぎたフレームは、GPUへ投入する前に捨てる。復号後に捨てると
-    // 過負荷時もGPU仕事が減らず、全フレームが遅れ続けて出力がほぼ止まる。
+    // QoSで締切を1フレーム分以上過ぎたフレームは、GPUへ投入する前に捨てる。復号後に
+    // 捨てると過負荷時もGPU仕事が減らず、全フレームが遅れ続けて出力がほぼ止まる。
+    // 1フレーム未満の遅れは従来どおり復号し、処理能力の境目の手前で余分に捨てない。
     // ProResはフレーム内で完結するため、飛ばしても後続の画像に影響しない。
-    if (gst_video_decoder_get_max_decode_time(decoder, frame) < 0) {
+    GstClockTime frame_duration = frame->duration;
+    if (!GST_CLOCK_TIME_IS_VALID(frame_duration) && self->input &&
+        GST_VIDEO_INFO_FPS_N(&self->input->info) > 0)
+        frame_duration = gst_util_uint64_scale(GST_SECOND,
+            GST_VIDEO_INFO_FPS_D(&self->input->info), GST_VIDEO_INFO_FPS_N(&self->input->info));
+    if (!GST_CLOCK_TIME_IS_VALID(frame_duration)) frame_duration = 20 * GST_MSECOND;
+    if (gst_video_decoder_get_max_decode_time(decoder, frame) <
+        -static_cast<GstClockTimeDiff>(frame_duration)) {
         GST_DEBUG_OBJECT(self, "QoS: skipping decode of late frame pts=%" GST_TIME_FORMAT,
                          GST_TIME_ARGS(frame->pts));
         gst_video_decoder_drop_frame(decoder, frame);
