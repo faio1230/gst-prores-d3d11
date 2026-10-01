@@ -19,7 +19,7 @@ See the [feature table](docs/機能対応表.md) for the tested combinations and
 
 ## Requirements
 
-Windows x64, GStreamer 1.28 or later (tested with 1.28.2), a physical Direct3D 11 GPU with feature level 11_0 or later, PowerShell 7, MSVC C++ Build Tools, Windows SDK (including `fxc.exe`), CMake, and Python. Only an NVIDIA RTX 3070 has been tested; WARP/software adapters are rejected. The build scripts use a pinned FFmpeg SDK for test tools, but the decoder plugin does not link to FFmpeg.
+Windows x64, GStreamer 1.28 or later (tested with 1.28.2), a physical Direct3D 11 GPU with feature level 11_0 or later, PowerShell 7, MSVC C++ Build Tools, Windows SDK (including `fxc.exe`), CMake, and Python. Tested GPUs are an NVIDIA RTX 3070 (desktop) and an RTX 3080 Laptop GPU in a hybrid system with an AMD integrated GPU. WARP/software adapters are rejected. The build scripts use a pinned FFmpeg SDK for test tools, but the decoder plugin does not link to FFmpeg.
 
 ## Build and run
 
@@ -56,24 +56,58 @@ See [build and execution](docs/ビルドと実行.md), [design](docs/設計.md),
 
 ## Using the release binaries in an application
 
-Each GitHub release has a zip named after its tag (for example `gst-prores-d3d11-v0.1.0-win64-gst1.28.2.zip`). When you bundle it:
+Each GitHub release has a zip named after its tag (for example `gst-prores-d3d11-v0.2.2-win64-gst1.28.2.zip`). When you bundle it:
 
 - **Placement:** keep `gstproresd3d11.dll` and all `prores_*.cso` files in the same directory. Add that directory to `GST_PLUGIN_PATH`, or copy the files into GStreamer's `lib\gstreamer-1.0`. Do not rename the DLL, because GStreamer derives the plugin entry point from its file name.
 - **Runtime:** the release DLL needs the Microsoft Visual C++ Redistributable x64, version 14.50 or later. GStreamer 1.28.2 does not include it.
 - **Untagged streams:** color components missing from both the ProRes frame header and the input caps are filled with GStreamer's default for caps without colorimetry (BT.601 for SD, BT.709 for larger frames, or BT.2020 when a known component is BT.2020). Output caps therefore always name a full colorimetry, such as `bt709`, and every downstream converter uses the same matrix. Set colorimetry on the input caps if the material needs something else.
 - **Interlaced streams:** these are output as interleaved frames with `field-order` set. They are not deinterlaced. Add a deinterlacer (such as `d3d11deinterlace`) if you need progressive frames.
-- **Tested GPUs:** only an NVIDIA RTX 3070 has been tested. AMD and Intel GPUs, and hybrid-GPU selection with `adapter-luid`, are not verified yet.
+- **Tested GPUs:**
+  - NVIDIA RTX 3070 (desktop): an application shared its device through a `GstContext` and matched `adapter-luid`.
+  - RTX 3080 Laptop GPU in a hybrid system with an AMD integrated GPU: the RTX was selected by giving the same `adapter` index to `proresd3d11dec` and `d3d11colorconvert`.
+  - Not verified: decoding on AMD or Intel GPUs, and selecting the GPU on a hybrid system with `adapter-luid` plus a shared device.
 
 `proresd3d11dec ! d3d11colorconvert ! "video/x-raw(memory:D3D11Memory),format=BGRA"` has been checked for every output format. Semi-transparent alpha also comes through that BGRA path. It is straight (not premultiplied) alpha, and it was checked with 4444 and 4444 XQ streams (8- and 16-bit alpha, 3840×2160 and 2560×1536). BGRA A differed from the `avdec_prores ! videoconvert` CPU path by at most 1, and RGB by at most 1 at p99.
 
 
 ## Accuracy and performance
 
-On the tested streams, every decoded YUV pixel differed from the pinned FFmpeg CPU reference by at most one code value at the source depth; alpha matched at the compared output depth. The native RGB converter differed from an independent BT.709 calculation by at most one RGB10A2 code value. On an RTX 3070, synthetic HQ direct-output throughput was about **436 fps at 1080p** and **258 fps at 4K**. These are decoder throughput measurements without GPU-completion waiting or display timing, not playback guarantees.
+**Accuracy:** on the tested streams, every decoded YUV pixel differed from the pinned FFmpeg CPU reference by at most one code value at the source depth. Alpha matched at the compared output depth. The native RGB converter differed from an independent BT.709 calculation by at most one RGB10A2 code value.
+
+**Single-stream throughput** (decoding as fast as possible with `sync=false`, without GPU-completion waiting or display timing; not a playback guarantee):
+
+| GPU | 1080p HQ | 4K HQ | 4K 4444 with alpha (about 2 Gbps) |
+| --- | --- | --- | --- |
+| RTX 3070 (desktop), synthetic HQ | about 436 fps | about 258 fps | – |
+| RTX 3080 Laptop GPU, through `d3d11colorconvert` to BGRA | about 404 fps | about 198 fps | about 110–130 fps |
+
+Decoding cost scales mainly with bitrate. For example, a 55 Mbps 4K 4444 stream with alpha, mostly transparent, decoded at about 227 fps on the RTX 3080 Laptop GPU. The CPU path (`avdec_prores ! videoconvert`) decoded 4K HQ at about 14 fps on a Ryzen 9 5900HX.
+
+**Multiple streams on one GPU** (RTX 3080 Laptop GPU; N processes, each `proresd3d11dec adapter=1 ! d3d11colorconvert adapter=1 ! BGRA`; median of two runs):
+
+- **Throughput:** the GPU's total throughput stays roughly constant and is divided among the streams. For 4K HQ it was about 170–197 fps in total from 1 to 8 streams.
+- **Real time:** the largest stream count that played in real time (`sync=true qos=true`) with no dropped frames was:
+
+| Stream | Streams with no dropped frames |
+| --- | --- |
+| 4K HQ 60p | 2 |
+| 4K 4444 30p (about 2 Gbps) | 2–3 |
+| 1080p HQ 59.94p | 4–5 |
+| 1080p 4444 30p | 4 |
+
+- **Beyond capacity:** since v0.2.2, frames at least one frame duration past their QoS deadline are skipped before any GPU work. Playback then degrades to roughly *capacity ÷ streams* instead of collapsing:
+
+| Overload | v0.2.1 | v0.2.2 |
+| --- | --- | --- |
+| 4K HQ × 4 | 1.17 fps per stream, about 1 s between frames | 42.95 fps per stream, at most 67 ms between frames |
+| 4K HQ × 6 | 0.67 fps per stream | 28.05 fps per stream |
+| 1080p HQ × 8 | 1.41 fps per stream | 47.52 fps per stream |
+
+Below capacity, dropped frames were the same as in v0.2.1. See [validation](docs/検証.md) for the conditions and the full results.
 
 ## Known limits
 
-- AMD and Intel GPUs, actual device loss/recovery, and long-running operation on other systems have not been verified.
+- Decoding on AMD and Intel GPUs, actual device loss/recovery, and long-running operation on other systems have not been verified.
 - HDR tags are propagated, but HDR-to-RGB numerical accuracy has not been verified. The native RGB element is limited to progressive, limited BT.709.
 - Odd-width 4:2:2 frames are rejected. Interlaced RGB needs a separate deinterlacer; `proresd3d11rgb` does not deinterlace.
 - Corrupt frames do not stop the pipeline by default. A frame found corrupt on the CPU is dropped. A frame found corrupt by the asynchronous GPU check is reported up to three frames late, after its image has already gone downstream. Both are counted against `GstVideoDecoder`'s `max-errors` (default -1: never stop) and posted as a `STREAM/DECODE` warning. Set `max-errors` to 0 or more to stop instead. A stream that is unsupported from its first frame still stops with `STREAM/FORMAT`.

@@ -19,7 +19,7 @@ GStreamerで単独利用できる、Direct3D 11 Compute Shader製のProResデコ
 
 ## 要件
 
-Windows x64、GStreamer 1.28以降（実機検証は1.28.2）、feature level 11_0以上の物理Direct3D 11 GPU、PowerShell 7、MSVC C++ Build Tools、`fxc.exe`を含むWindows SDK、CMake、Pythonが必要です。GPU検証はNVIDIA RTX 3070のみで、WARPなどのソフトウェアadapterは拒否します。ビルドスクリプトは検査器のため固定FFmpeg SDKを使いますが、デコーダープラグイン自体はFFmpegへリンクしません。
+Windows x64、GStreamer 1.28以降（実機検証は1.28.2）、feature level 11_0以上の物理Direct3D 11 GPU、PowerShell 7、MSVC C++ Build Tools、`fxc.exe`を含むWindows SDK、CMake、Pythonが必要です。検証したGPUは、NVIDIA RTX 3070（デスクトップ）と、AMD内蔵GPUと混在するRTX 3080 Laptop GPUです。WARPなどのソフトウェアadapterは拒否します。ビルドスクリプトは検査器のため固定FFmpeg SDKを使いますが、デコーダープラグイン自体はFFmpegへリンクしません。
 
 ## ビルドと実行
 
@@ -56,24 +56,58 @@ gst-launch-1.0 -e filesrc location=sample.mov ! qtdemux ! proresd3d11dec ! "vide
 
 ## リリース版をアプリケーションに組み込む
 
-GitHub Releasesには、タグ名を含むzip（例：`gst-prores-d3d11-v0.1.0-win64-gst1.28.2.zip`）を置いています。組み込むときは次の点に注意してください。
+GitHub Releasesには、タグ名を含むzip（例：`gst-prores-d3d11-v0.2.2-win64-gst1.28.2.zip`）を置いています。組み込むときは次の点に注意してください。
 
 - **配置：** `gstproresd3d11.dll`と`prores_*.cso`をすべて同じフォルダに置き、そのフォルダを`GST_PLUGIN_PATH`に加えるか、GStreamerの`lib\gstreamer-1.0`へコピーしてください。DLLの名前は変えないでください。GStreamerはファイル名からプラグインの入口関数を探します。
 - **ランタイム：** リリース版DLLには、Microsoft Visual C++再頒布可能パッケージ（x64）の14.50以上が必要です。GStreamer 1.28.2には同梱されていません。
 - **色タグのない素材：** ProResのフレームヘッダーにも入力capsにもない色の項目は、GStreamerがcolorimetryなしのcapsに当てる既定値で埋めます（SDはBT.601、それより大きい画面はBT.709。既知の項目がBT.2020ならBT.2020系）。出力capsには常に`bt709`のような完全なcolorimetryが付くので、下流の変換要素がどれでも同じ行列を使います。素材の実際の色が違う場合は、入力capsにcolorimetryを指定してください。
 - **インターレース：** `field-order`を付けたinterleavedのフレームとして出力し、デインターレースはしません。プログレッシブにしたい場合は`d3d11deinterlace`などを入れてください。
-- **検証済みのGPU：** 確認したのはNVIDIA RTX 3070だけです。AMDとIntelのGPU、ハイブリッドGPU環境での`adapter-luid`による選択は未検証です。
+- **検証済みのGPU：**
+  - NVIDIA RTX 3070（デスクトップ）：アプリケーションが`GstContext`でデバイスを共有し、`adapter-luid`が一致することを確認しました。
+  - AMD内蔵GPUと混在するRTX 3080 Laptop GPU：`proresd3d11dec`と`d3d11colorconvert`に同じ`adapter`番号を指定して、RTXを使いました。
+  - 未検証：AMDやIntelのGPUでの復号と、ハイブリッド環境で`adapter-luid`と共有デバイスを使ってGPUを選ぶ方法。
 
 `proresd3d11dec ! d3d11colorconvert ! "video/x-raw(memory:D3D11Memory),format=BGRA"`は全出力形式で確認済みです。半透明のアルファも、このBGRA経路のAチャンネルにそのまま届きます。アルファはRGBに掛け合わせないstraight alphaです。4444と4444 XQ（アルファ8bit／16bit、3840×2160と2560×1536）で確認しました。`avdec_prores ! videoconvert`のCPU経路との差は、BGRAのAで最大1、RGBでp99が1でした。
 
 
 ## 精度と性能
 
-検証素材のYUV全画素は、固定FFmpeg SDKのCPU復号結果と元の深度で最大1 codeの差でした。アルファは比較に使った出力深度で一致しています。専用RGB要素も独立したBT.709式との差がRGB10A2で最大1 codeでした。RTX 3070での合成HQ素材のdirect出力は、1080p約**436 fps**、4K約**258 fps**です。GPU完了待ちと表示時間を含めない復号器の供給速度であり、再生速度の保証ではありません。
+**精度：** 検証素材のYUV全画素は、固定FFmpeg SDKのCPU復号結果と比べて、元の深度で最大1 codeの差でした。アルファは比較に使った出力深度で一致しています。専用RGB要素と独立したBT.709式との差は、RGB10A2で最大1 codeでした。
+
+**1本の処理能力**（`sync=false`での全力の復号。GPU完了待ちと表示時間は含まないので、再生速度の保証ではありません）
+
+| GPU | 1080p HQ | 4K HQ | 4K 4444 アルファ付き（約2 Gbps） |
+| --- | --- | --- | --- |
+| RTX 3070（デスクトップ）、合成HQ素材 | 約436 fps | 約258 fps | － |
+| RTX 3080 Laptop GPU、`d3d11colorconvert`でBGRAまで | 約404 fps | 約198 fps | 約110〜130 fps |
+
+復号の重さは、主にビットレートで決まります。たとえば55 Mbpsの4K 4444アルファ付き実素材（ほとんど透明）は、RTX 3080 Laptop GPUで約227 fpsでした。CPU経路（`avdec_prores ! videoconvert`）では、Ryzen 9 5900HXで4K HQが約14 fpsでした。
+
+**1つのGPUで複数のストリームを同時に再生した場合**（RTX 3080 Laptop GPU。N個のプロセスでそれぞれ`proresd3d11dec adapter=1 ! d3d11colorconvert adapter=1 ! BGRA`を実行し、2回の中央値を取った）
+
+- **処理能力：** GPU全体の処理能力はほぼ一定で、それを本数で分け合います。4K HQの合計は、1〜8本で約170〜197 fpsでした。
+- **実時間再生：** 実時間再生（`sync=true qos=true`）で、全本数が欠落なく再生できた最大本数は次のとおりです。
+
+| 素材 | 欠落なしで再生できた本数 |
+| --- | --- |
+| 4K HQ 60p | 2 |
+| 4K 4444 30p（約2 Gbps） | 2〜3 |
+| 1080p HQ 59.94p | 4〜5 |
+| 1080p 4444 30p | 4 |
+
+- **処理能力を超えた場合：** v0.2.2からは、QoSの締切を1フレーム分以上過ぎたフレームを、GPUで処理する前に捨てます。そのため再生は崩れず、およそ「処理能力÷本数」まで少しずつ劣化します。
+
+| 過負荷の条件 | v0.2.1 | v0.2.2 |
+| --- | --- | --- |
+| 4K HQ ×4本 | 1本1.17 fps、約1秒に1枚 | 1本42.95 fps、描画の間隔は最大67 ms |
+| 4K HQ ×6本 | 1本0.67 fps | 1本28.05 fps |
+| 1080p HQ ×8本 | 1本1.41 fps | 1本47.52 fps |
+
+処理能力に余裕がある範囲では、欠落はv0.2.1と変わりません。条件と全結果は[検証](docs/検証.md)を参照してください。
 
 ## 既知の制限
 
-- AMD／Intel GPU、実際のdevice lostと復旧、他環境での長時間動作は未検証です。
+- AMD／Intel GPUでの復号、実際のdevice lostと復旧、他環境での長時間動作は未検証です。
 - HDR色タグは伝播しますが、HDR→RGBの数値精度は未検証です。専用RGB要素はprogressive・limited BT.709に限定されます。
 - 奇数幅の4:2:2は拒否します。`proresd3d11rgb`はデインターレースしないため、インターレースのRGB表示には下流の別要素が必要です。
 - 壊れたフレームがあっても、既定ではパイプラインを止めません。CPUで見つかった破損フレームは捨てます。GPUの非同期検査で見つかった破損は最大3フレーム遅れて報告され、その時点で該当画像はすでに下流へ出力済みです。どちらも`GstVideoDecoder`の`max-errors`（既定値-1：止めない）に数えられ、`STREAM/DECODE`の警告としてバスに通知されます。止めたい場合は`max-errors`を0以上にしてください。最初のフレームから非対応の形式の場合は、従来どおり`STREAM/FORMAT`で停止します。
